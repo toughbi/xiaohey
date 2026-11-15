@@ -1,0 +1,32 @@
+[
+  {
+    "id": "I1",
+    "name": "the titlebar shows the new mark in its idle expression",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "I2",
+    "name": "hover switches it to the happy face",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "I3",
+    "name": "pressing pops the surprised face",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "I4",
+    "name": "leaving restores the idle face",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "I5",
+    "name": "the icon set is complete and the ICO holds every size",
+    "status": "pass",
+    "detail": "8 PNGs, ICO 16/32/48/64/128/256"
+  }
+]

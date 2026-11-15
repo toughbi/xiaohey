@@ -1,0 +1,26 @@
+[
+  {
+    "id": "N1",
+    "name": "each row shows the pretty model name and vendor · billing",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "N2",
+    "name": "the toggle disables a model and hides it from the picker",
+    "status": "pass",
+    "detail": "deepseek-flash"
+  },
+  {
+    "id": "N3",
+    "name": "the row menu offers edit and delete, and edit opens the dialog",
+    "status": "pass",
+    "detail": "设为当前 / 编辑 / 删除"
+  },
+  {
+    "id": "N4",
+    "name": "deleting from the row menu removes the model",
+    "status": "pass",
+    "detail": ""
+  }
+]

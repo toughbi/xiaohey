@@ -1,0 +1,83 @@
+{
+  "name": "xiaohey",
+  "version": "0.1.0",
+  "private": true,
+  "description": "xiaohey — a local-first Windows desktop agent workspace",
+  "author": "xiaohey",
+  "type": "module",
+  "main": "dist/main/index.cjs",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "node scripts/build.mjs",
+    "dist": "node scripts/build.mjs && electron-builder --win",
+    "start": "node scripts/start.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "node scripts/test.mjs",
+    "shot": "node scripts/shot.mjs",
+    "icons": "node scripts/icons.mjs"
+  },
+  "build": {
+    "appId": "com.xiaohey.desktop",
+    "productName": "xiaohey",
+    "copyright": "Copyright © 2026 xiaohey",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/**/*",
+      "package.json"
+    ],
+    "asar": true,
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "xiaohey",
+      "artifactName": "xiaohey-${version}-setup.${ext}"
+    },
+    "portable": {
+      "artifactName": "xiaohey-${version}-portable.${ext}"
+    }
+  },
+  "dependencies": {
+    "lucide-react": "^0.545.0",
+    "prismjs": "^1.30.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "@types/prismjs": "^1.26.6",
+    "@types/react": "^19.2.2",
+    "@types/react-dom": "^19.2.2",
+    "@vitejs/plugin-react": "^5.1.0",
+    "electron": "^45.3.2",
+    "electron-builder": "^26.18.0",
+    "esbuild": "^0.27.0",
+    "playwright-core": "^1.58.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.2"
+  }
+}

@@ -1,0 +1,50 @@
+[
+  {
+    "id": "R1",
+    "name": "a running turn is a single status line, not a row list",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "R8",
+    "name": "opening the process mid-run folds again when the turn ends",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "R2",
+    "name": "operations appear as row-by-row Chinese entries",
+    "status": "pass",
+    "detail": "读取文件 README.md 1ms"
+  },
+  {
+    "id": "R3",
+    "name": "thinking rows show 已思考 and expand to the full text",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "R4",
+    "name": "collapsing the turn hides the operations, expanding brings them back",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "R7",
+    "name": "a finished turn shows duration + an operation summary and the answer",
+    "status": "pass",
+    "detail": "已完成 · 用时 2 秒 / 已读取文件"
+  },
+  {
+    "id": "R6",
+    "name": "every finished step carries its own check, not the header",
+    "status": "pass",
+    "detail": "3 checked rows"
+  },
+  {
+    "id": "R5",
+    "name": "the answer stays visible while the process is collapsed",
+    "status": "pass",
+    "detail": "24px"
+  }
+]

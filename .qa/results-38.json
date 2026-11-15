@@ -1,0 +1,20 @@
+[
+  {
+    "id": "G1",
+    "name": "the composer floats in an absolute dock",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "G2",
+    "name": "the composer is frosted glass",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "G3",
+    "name": "popovers share the same material",
+    "status": "pass",
+    "detail": ""
+  }
+]

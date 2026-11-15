@@ -1,0 +1,20 @@
+[
+  {
+    "id": "M1",
+    "name": "the picker groups models under their vendor",
+    "status": "pass",
+    "detail": "DeepSeek / Mimo"
+  },
+  {
+    "id": "M2",
+    "name": "the active model is checked and selecting another switches",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "M3",
+    "name": "the search filters by model and by vendor",
+    "status": "pass",
+    "detail": "2 matches for mimo"
+  }
+]

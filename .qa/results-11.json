@@ -1,0 +1,74 @@
+[
+  {
+    "id": "F1",
+    "name": "the plus menu can reference a workspace file",
+    "status": "pass",
+    "detail": "@README.md "
+  },
+  {
+    "id": "F2",
+    "name": "a file row can be dragged into the composer",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "F3",
+    "name": "sending with @reference stores the file contents for the model",
+    "status": "pass",
+    "detail": "1 reference(s)"
+  },
+  {
+    "id": "F4",
+    "name": "assistant replies expose a copy button that confirms",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "F5",
+    "name": "the session menu copies the transcript as markdown",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "F6",
+    "name": "the session menu exports a markdown file into exports/",
+    "status": "pass",
+    "detail": "把概览页做成设计过的样子-2026-11-15T13-22.md"
+  },
+  {
+    "id": "F7",
+    "name": "a failed turn offers a retry button",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "F8",
+    "name": "the approvals tab lists past decisions",
+    "status": "pass",
+    "detail": "1 row(s)"
+  },
+  {
+    "id": "F9",
+    "name": "memory can be added and edited from the docs panel",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "F10",
+    "name": "the files tab can refresh its listing",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "F11",
+    "name": "shortcuts toggle the rail and open settings",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "F12",
+    "name": "scrolling up exposes a jump-to-latest button",
+    "status": "pass",
+    "detail": "distance 0px"
+  }
+]

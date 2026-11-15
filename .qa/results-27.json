@@ -1,0 +1,26 @@
+[
+  {
+    "id": "V1",
+    "name": "the picker has search, 本机, the default entry, the recent folder and the actions",
+    "status": "pass",
+    "detail": "5 items"
+  },
+  {
+    "id": "V2",
+    "name": "search filters by folder name",
+    "status": "pass",
+    "detail": "third-workspace, 新建工作区, 连接 SSH 主机"
+  },
+  {
+    "id": "V3",
+    "name": "picking a recent folder switches the session workspace",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "V4",
+    "name": "不指定工作区 opens a session that waits for a folder",
+    "status": "pass",
+    "detail": ""
+  }
+]

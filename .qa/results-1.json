@@ -1,0 +1,92 @@
+[
+  {
+    "id": "S1",
+    "name": "fresh install shows the workspace empty state and heatmap",
+    "status": "pass",
+    "detail": "364 heatmap cells"
+  },
+  {
+    "id": "S2",
+    "name": "sidebar can be collapsed and restored",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "S3",
+    "name": "creating one session adds exactly one row",
+    "status": "pass",
+    "detail": "1 row"
+  },
+  {
+    "id": "S4",
+    "name": "composer: empty send is disabled, typing enables it",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "S5",
+    "name": "composer: Shift+Enter inserts a newline",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "S6",
+    "name": "policy dropdown lists three options and persists the choice",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "S7",
+    "name": "composer plus menu opens the files tab",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "S8",
+    "name": "usage popover shows session numbers",
+    "status": "pass",
+    "detail": "轮次 / 步数 / 累计 token / 上下文已用"
+  },
+  {
+    "id": "S9",
+    "name": "user menu toggles theme and returns to light",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "S10",
+    "name": "sign out asks for confirmation and clears the stored key",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "S11",
+    "name": "search filters sessions and restores them when cleared",
+    "status": "pass",
+    "detail": "3 sessions"
+  },
+  {
+    "id": "S12",
+    "name": "rename a session from its row menu",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "S13",
+    "name": "delete a session from its row menu (one step)",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "S14",
+    "name": "sending without an API key surfaces an error, not a hang",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "S15",
+    "name": "sessions, title and theme survive a restart",
+    "status": "pass",
+    "detail": "2 sessions, 你好"
+  }
+]

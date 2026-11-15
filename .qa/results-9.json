@@ -1,0 +1,44 @@
+[
+  {
+    "id": "Z1",
+    "name": "the workspace exposes a draggable separator",
+    "status": "pass",
+    "detail": "docs 372px"
+  },
+  {
+    "id": "Z2",
+    "name": "dragging left widens the docs panel and narrows the conversation",
+    "status": "pass",
+    "detail": "docs 372→512, session 836→696"
+  },
+  {
+    "id": "Z3",
+    "name": "dragging right narrows it again and respects the minimum",
+    "status": "pass",
+    "detail": "512→280 (min 280)"
+  },
+  {
+    "id": "Z4",
+    "name": "double click restores the default width",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "Z5",
+    "name": "the keyboard arrows move the separator",
+    "status": "pass",
+    "detail": "372→396"
+  },
+  {
+    "id": "Z6",
+    "name": "the width survives a restart",
+    "status": "pass",
+    "detail": "396px"
+  },
+  {
+    "id": "Z7",
+    "name": "closing the docs panel keeps the separator out of the way",
+    "status": "pass",
+    "detail": ""
+  }
+]

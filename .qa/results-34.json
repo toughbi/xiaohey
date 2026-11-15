@@ -1,0 +1,20 @@
+[
+  {
+    "id": "L1",
+    "name": "while running, the sentence sits above the running line",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "L2",
+    "name": "thought and tool rows share one icon column",
+    "status": "pass",
+    "detail": "icons at 301"
+  },
+  {
+    "id": "L3",
+    "name": "after finishing, the header comes first and the answer below",
+    "status": "pass",
+    "detail": ""
+  }
+]

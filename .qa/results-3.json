@@ -1,0 +1,56 @@
+[
+  {
+    "id": "U1",
+    "name": "file tab lists workspace entries and descends into folders",
+    "status": "pass",
+    "detail": "3 rows"
+  },
+  {
+    "id": "U2",
+    "name": "opening a file shows the preview and the diff toggle",
+    "status": "pass",
+    "detail": "原文\n改动\n+10 −12"
+  },
+  {
+    "id": "U3",
+    "name": "memory tab lists facts and deletes one",
+    "status": "pass",
+    "detail": "2 -> 2"
+  },
+  {
+    "id": "U4",
+    "name": "checkpoints tab lists snapshots and reverts one",
+    "status": "pass",
+    "detail": "1 snapshots, file restored"
+  },
+  {
+    "id": "U5",
+    "name": "the docs panel can be closed and reopened",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "U6",
+    "name": "demo transcript carries contract, plan, tool, change and compaction cards",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "U7",
+    "name": "tool cards expand and collapse their output",
+    "status": "pass",
+    "detail": "2 expanded blocks"
+  },
+  {
+    "id": "U8",
+    "name": "change cards expose review and revert actions",
+    "status": "pass",
+    "detail": "已编辑 1 个文件 +26 −14 撤销 审查 app/page.tsx +26 −14"
+  },
+  {
+    "id": "U9",
+    "name": "approval history and policy chip are consistent",
+    "status": "pass",
+    "detail": ""
+  }
+]

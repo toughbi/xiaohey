@@ -1,0 +1,32 @@
+[
+  {
+    "id": "G1",
+    "name": "the transcript is announced to assistive tech",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "G2",
+    "name": "the files tab filters names",
+    "status": "pass",
+    "detail": "3 -> 1"
+  },
+  {
+    "id": "G3",
+    "name": "settings search filters model cards",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "G4",
+    "name": "a second instance exits instead of opening another window",
+    "status": "pass",
+    "detail": "exit 0"
+  },
+  {
+    "id": "G5",
+    "name": "a fresh install points at settings when no model exists",
+    "status": "pass",
+    "detail": ""
+  }
+]

@@ -1,0 +1,149 @@
+[
+  {
+    "run": 1,
+    "id": "R1",
+    "name": "行内代码与列表渲染",
+    "status": "pass",
+    "detail": "246 chars · 4s"
+  },
+  {
+    "run": 1,
+    "id": "R2",
+    "name": "表格与引用渲染",
+    "status": "pass",
+    "detail": "9 cells · 3s"
+  },
+  {
+    "run": 1,
+    "id": "R3",
+    "name": "围栏代码块渲染",
+    "status": "pass",
+    "detail": "6 lines · 2s"
+  },
+  {
+    "run": 1,
+    "id": "T1",
+    "name": "创建文件并运行测试",
+    "status": "pass",
+    "detail": "file ok / 浏览目录 查找文件 读取文件 读取文件 读取文件 更新计划 执行命令 写入文件  · 18s"
+  },
+  {
+    "run": 1,
+    "id": "B1",
+    "name": "修复失败测试且不改测试",
+    "status": "pass",
+    "detail": "tests green · 6s"
+  },
+  {
+    "run": 1,
+    "id": "A1",
+    "name": "真实审批：每次询问",
+    "status": "pass",
+    "detail": "1 approval(s) · 9s"
+  },
+  {
+    "run": 1,
+    "id": "M1",
+    "name": "多轮对话的 minimap",
+    "status": "pass",
+    "detail": "3 stripes · 48s"
+  },
+  {
+    "run": 2,
+    "id": "R1",
+    "name": "行内代码与列表渲染",
+    "status": "pass",
+    "detail": "196 chars · 3s"
+  },
+  {
+    "run": 2,
+    "id": "R2",
+    "name": "表格与引用渲染",
+    "status": "pass",
+    "detail": "9 cells · 2s"
+  },
+  {
+    "run": 2,
+    "id": "R3",
+    "name": "围栏代码块渲染",
+    "status": "pass",
+    "detail": "6 lines · 2s"
+  },
+  {
+    "run": 2,
+    "id": "T1",
+    "name": "创建文件并运行测试",
+    "status": "pass",
+    "detail": "file ok / 浏览目录 查找文件 读取文件 读取文件 读取文件 执行命令 更新计划 编辑文件  · 21s"
+  },
+  {
+    "run": 2,
+    "id": "B1",
+    "name": "修复失败测试且不改测试",
+    "status": "pass",
+    "detail": "tests green · 7s"
+  },
+  {
+    "run": 2,
+    "id": "A1",
+    "name": "真实审批：每次询问",
+    "status": "pass",
+    "detail": "1 approval(s) · 10s"
+  },
+  {
+    "run": 2,
+    "id": "M1",
+    "name": "多轮对话的 minimap",
+    "status": "pass",
+    "detail": "3 stripes · 32s"
+  },
+  {
+    "run": 3,
+    "id": "R1",
+    "name": "行内代码与列表渲染",
+    "status": "pass",
+    "detail": "154 chars · 3s"
+  },
+  {
+    "run": 3,
+    "id": "R2",
+    "name": "表格与引用渲染",
+    "status": "pass",
+    "detail": "9 cells · 3s"
+  },
+  {
+    "run": 3,
+    "id": "R3",
+    "name": "围栏代码块渲染",
+    "status": "pass",
+    "detail": "6 lines · 2s"
+  },
+  {
+    "run": 3,
+    "id": "T1",
+    "name": "创建文件并运行测试",
+    "status": "pass",
+    "detail": "file ok / 浏览目录 查找文件 读取文件 读取文件 写入文件 写入文件 执行命令 读取文件 · 14s"
+  },
+  {
+    "run": 3,
+    "id": "B1",
+    "name": "修复失败测试且不改测试",
+    "status": "pass",
+    "detail": "tests green · 7s"
+  },
+  {
+    "run": 3,
+    "id": "A1",
+    "name": "真实审批：每次询问",
+    "status": "pass",
+    "detail": "1 approval(s) · 9s"
+  },
+  {
+    "run": 3,
+    "id": "M1",
+    "name": "多轮对话的 minimap",
+    "status": "pass",
+    "detail": "3 stripes · 25s"
+  }
+]

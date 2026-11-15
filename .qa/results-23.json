@@ -1,0 +1,20 @@
+[
+  {
+    "id": "R1",
+    "name": "inline code in the reply is rendered, not shown as backticks",
+    "status": "pass",
+    "detail": "C:\\Users\\xiaoli\\Documents\\xiaohey"
+  },
+  {
+    "id": "R2",
+    "name": "bold, lists and fenced blocks render as elements",
+    "status": "pass",
+    "detail": "strong + 2 li + pre"
+  },
+  {
+    "id": "R3",
+    "name": "my own message keeps the backticks as typed",
+    "status": "pass",
+    "detail": ""
+  }
+]

@@ -1,0 +1,26 @@
+[
+  {
+    "id": "B1",
+    "name": "the workspace sits at the left end and the counters at the right end",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "B2",
+    "name": "clicking the workspace chip opens the picker next to it",
+    "status": "pass",
+    "detail": "anchored to the chip"
+  },
+  {
+    "id": "B3",
+    "name": "picking a folder from the chip binds it to the waiting session",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "B4",
+    "name": "the chip can switch again after a workspace is set",
+    "status": "pass",
+    "detail": ""
+  }
+]

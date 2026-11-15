@@ -1,0 +1,56 @@
+[
+  {
+    "id": "V1",
+    "name": "a corrupted settings.json falls back to the default model",
+    "status": "pass",
+    "detail": "deepseek-chat"
+  },
+  {
+    "id": "V2",
+    "name": "a legacy single-model settings file is migrated",
+    "status": "pass",
+    "detail": "DeepSeek-Reasoner / auto"
+  },
+  {
+    "id": "V3",
+    "name": "a missing workspace directory is created on boot",
+    "status": "pass",
+    "detail": "created"
+  },
+  {
+    "id": "V4",
+    "name": "rapid double click on 新会话 does not duplicate rows",
+    "status": "pass",
+    "detail": "2 rows / 1 unique titles"
+  },
+  {
+    "id": "V5",
+    "name": "a very long session title truncates without page overflow",
+    "status": "pass",
+    "detail": "overflow 0px"
+  },
+  {
+    "id": "V6",
+    "name": "layout survives a 900x640 window",
+    "status": "pass",
+    "detail": "composer 837px"
+  },
+  {
+    "id": "V7",
+    "name": "deleting the last session returns to the empty state",
+    "status": "pass",
+    "detail": "2 deletions"
+  },
+  {
+    "id": "V8",
+    "name": "new session still works from the empty state after deletions",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "V9",
+    "name": "the docs panel toggle stays consistent after a resize",
+    "status": "pass",
+    "detail": ""
+  }
+]

@@ -1,0 +1,26 @@
+[
+  {
+    "id": "J1",
+    "name": "the composer chip shows the model id",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "J2",
+    "name": "the chip tooltip keeps the friendly name and endpoint",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "J3",
+    "name": "the model menu lists ids first and names second",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "J4",
+    "name": "settings cards title the model id and subtitle the name",
+    "status": "pass",
+    "detail": ""
+  }
+]

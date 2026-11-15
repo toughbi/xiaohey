@@ -1,0 +1,74 @@
+[
+  {
+    "id": "T1",
+    "name": "settings page opens with the four sections",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "T2",
+    "name": "the model list comes from the provider, then adds one profile per pick",
+    "status": "pass",
+    "detail": "3 fetched, 4 cards"
+  },
+  {
+    "id": "T3",
+    "name": "switching the active model from the row menu",
+    "status": "pass",
+    "detail": "stub-alpha"
+  },
+  {
+    "id": "T4",
+    "name": "editing locks provider/type/model and validates the new key",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "T5",
+    "name": "an unreachable provider reports why and falls back to a manual model",
+    "status": "pass",
+    "detail": "fetch: 连不上 http://127.0.0.1:9/v / validate: 连不上 http://127.0.0.1:9/v"
+  },
+  {
+    "id": "T6",
+    "name": "deleting every model shows the empty state and disables sending",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "T7",
+    "name": "adding a model again re-enables the composer",
+    "status": "pass",
+    "detail": "stub-alpha"
+  },
+  {
+    "id": "T8",
+    "name": "appearance page switches theme",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "T9",
+    "name": "usage page renders the heatmap and totals",
+    "status": "pass",
+    "detail": "364 cells"
+  },
+  {
+    "id": "T10",
+    "name": "about page lists local runtime facts",
+    "status": "pass",
+    "detail": "0.1.0"
+  },
+  {
+    "id": "T11",
+    "name": "settings search filters the navigation",
+    "status": "pass",
+    "detail": ""
+  },
+  {
+    "id": "T12",
+    "name": "model list persists across a settings round-trip",
+    "status": "pass",
+    "detail": ""
+  }
+]

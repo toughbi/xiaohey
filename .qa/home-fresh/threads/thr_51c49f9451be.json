@@ -1,0 +1,100 @@
+{
+  "thread": {
+    "id": "thr_51c49f9451be",
+    "title": "你好",
+    "cwd": "E:\\code\\xiaohei\\.qa\\home-fresh\\workspace",
+    "createdAt": 1794589333125,
+    "updatedAt": 1794589395416,
+    "status": "failed",
+    "turnCount": 1,
+    "steps": 1,
+    "totalTokens": 0,
+    "itemCount": 4,
+    "lastPrompt": "你好",
+    "model": "deepseek-chat"
+  },
+  "turn": {
+    "id": "trn_47870c56a285",
+    "threadId": "thr_51c49f9451be",
+    "index": 1,
+    "prompt": "你好",
+    "status": "failed",
+    "startedAt": 1794589395057,
+    "step": 1,
+    "endedAt": 1794589395228,
+    "stopReason": "接口拒绝了这把 key（HTTP 401） — 打开「设置」核对 API Key 与接口地址，key 一般以 sk- 开头。"
+  },
+  "items": [
+    {
+      "id": "itm_5bd9b71e1bb6",
+      "threadId": "thr_51c49f9451be",
+      "turnId": "trn_47870c56a285",
+      "kind": "notice",
+      "at": 1794589395058,
+      "status": "done",
+      "tone": "info",
+      "title": "任务契约已写入",
+      "body": "目标：你好\n验收：The requested behaviour is observable in the workspace · Existing checks still pass"
+    },
+    {
+      "id": "itm_4a1dbad2c5c7",
+      "threadId": "thr_51c49f9451be",
+      "turnId": "trn_47870c56a285",
+      "kind": "message",
+      "at": 1794589395064,
+      "status": "done",
+      "role": "user",
+      "text": "你好"
+    },
+    {
+      "id": "itm_f28412e790d6",
+      "threadId": "thr_51c49f9451be",
+      "turnId": "trn_47870c56a285",
+      "kind": "message",
+      "at": 1794589395065,
+      "status": "error",
+      "role": "assistant",
+      "text": ""
+    },
+    {
+      "id": "itm_38b829a9a113",
+      "threadId": "thr_51c49f9451be",
+      "turnId": "trn_47870c56a285",
+      "kind": "notice",
+      "at": 1794589395228,
+      "status": "done",
+      "tone": "error",
+      "title": "本轮失败",
+      "body": "接口拒绝了这把 key（HTTP 401） — 打开「设置」核对 API Key 与接口地址，key 一般以 sk- 开头。"
+    }
+  ],
+  "state": {
+    "plan": [],
+    "memory": [],
+    "resolution": {
+      "entities": [],
+      "times": [],
+      "events": []
+    },
+    "contract": {
+      "goal": "你好",
+      "acceptance": [
+        "The requested behaviour is observable in the workspace",
+        "Existing checks still pass"
+      ],
+      "nonGoals": [],
+      "forbidden": [],
+      "sourcePrompt": "你好",
+      "createdAt": 1794589395058
+    },
+    "context": {
+      "summary": "",
+      "foldedItems": 0,
+      "compacted": 0,
+      "tokensUsed": 7
+    },
+    "journal": [],
+    "evidence": []
+  },
+  "snapshots": []
+}

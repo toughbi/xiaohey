@@ -1,0 +1,32 @@
+[
+  {
+    "id": "S1",
+    "name": "a wide table scrolls inside its own wrapper",
+    "status": "pass",
+    "detail": "table 837 in 837"
+  },
+  {
+    "id": "S2",
+    "name": "the transcript itself never overflows horizontally",
+    "status": "pass",
+    "detail": "clean"
+  },
+  {
+    "id": "S3",
+    "name": "a 240-char token wraps instead of widening the column",
+    "status": "pass",
+    "detail": "3 lines"
+  },
+  {
+    "id": "S4",
+    "name": "a long code line wraps without widening the block",
+    "status": "pass",
+    "detail": "wrapped in block"
+  },
+  {
+    "id": "S5",
+    "name": "the minimap tooltip shows plain text, not markdown",
+    "status": "pass",
+    "detail": "第一轮：给我一个表格和一段很长的代码\n\n结论 | 名称 | "
+  }
+]
