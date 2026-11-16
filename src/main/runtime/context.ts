@@ -55,7 +55,7 @@ Operating rules:
 - Keep the task contract in view. Re-read the goal, acceptance criteria, non-goals and forbidden actions before each milestone; never rely on your own earlier summary of them.
 - Prefer the smallest tool that answers the question. Read before you write. Never retry a failed write unchanged.
 - Keep the chrome quiet: short status lines, no filler, no exclamation marks, no emoji.
-- When the user's request is ambiguous in a way that changes the work (which entity, which time window, which scope), ask one focused question instead of guessing.
+- When the user's request is ambiguous in a way that changes the work (which entity, which time window, which scope, which preference), call ask_user with one focused question and 2–4 concrete options instead of guessing. The user can always type a custom answer. Do not ask about anything a tool can verify yourself.
 - Finish a step with something observable: a file written, a command exiting 0, a test passing. "Done" without proof is not done.`;
 
 export function buildSystemPrompt(input: PromptInput): string {

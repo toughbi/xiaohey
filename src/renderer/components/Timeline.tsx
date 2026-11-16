@@ -19,6 +19,7 @@ import {
 } from 'lucide-react';
 import { CopyButton } from './CopyButton';
 import { MarkdownText } from './MarkdownText';
+import { QuestionCard } from './QuestionCard';
 import type {
   ApprovalItem,
   CheckpointItem,
@@ -26,6 +27,7 @@ import type {
   Item,
   NoticeItem,
   PlanItem,
+  QuestionItem,
   ReasoningItem,
   ToolCallItem,
   ToolResultItem,
@@ -42,6 +44,7 @@ interface TimelineProps {
   onRevert: (snapshotId: string) => void;
   onOpenPath: (path: string) => void;
   onReview: (path: string) => void;
+  onAnswerQuestion: (questionId: string, answer: string) => Promise<void>;
 }
 
 const TOOL_ICON: Record<string, ReactNode> = {
@@ -66,6 +69,7 @@ const TOOL_LABEL: Record<string, string> = {
   run_shell: '执行命令',
   todo_write: '更新计划',
   memory_write: '写入记忆',
+  ask_user: '向你提问',
 };
 
 function summarizeTools(calls: ToolCallItem[]): string {
@@ -335,6 +339,7 @@ function TurnBlock({
   onRevert,
   onOpenPath,
   onReview,
+  onAnswerQuestion,
 }: {
   turnId: string;
   items: Item[];
@@ -345,6 +350,7 @@ function TurnBlock({
   onRevert: (snapshotId: string) => void;
   onOpenPath: (path: string) => void;
   onReview: (path: string) => void;
+  onAnswerQuestion: (questionId: string, answer: string) => Promise<void>;
 }) {
   const interrupted = items.some(
     (item) => item.kind === 'notice' && item.tone === 'warn' && /中断|退出/.test(item.title),
@@ -355,6 +361,9 @@ function TurnBlock({
   // Errors and warnings are not "process": they stay outside the fold so a
   // failure is never hidden behind a click.
   const alerts = items.filter((item): item is NoticeItem => item.kind === 'notice' && item.tone !== 'info');
+  const questions = items.filter((item): item is QuestionItem => item.kind === 'question');
+  const asking = questions.some((item) => item.status === 'running');
+  const settledQuestions = questions.filter((item) => item.status !== 'running');
 
   // Process is folded by default. If the user opened it during a run, the
   // moment the turn ends it folds back so the answer is what remains.
@@ -371,6 +380,8 @@ function TurnBlock({
     (item) =>
       item.kind !== 'tool_result' &&
       item.kind !== 'message' &&
+      item.kind !== 'question' &&
+      !(item.kind === 'tool_call' && item.name === 'ask_user') &&
       item.id !== finalMessage?.id &&
       !alerts.some((alert) => alert.id === item.id),
   );
@@ -399,7 +410,7 @@ function TurnBlock({
     else if (item.kind === 'compaction') rows.push(<CompactionCard key={item.id} item={item} />);
     else if (item.kind === 'reasoning') rows.push(<ThoughtRow key={item.id} item={item} live={live} />);
   }
-  if (live && streaming === undefined) {
+  if (live && streaming === undefined && !asking) {
     rows.push(
       <div key="waiting" className="step-waiting">
         <Loader2 size={14} strokeWidth={2} className="spin" />
@@ -437,6 +448,7 @@ function TurnBlock({
   }
 
   const hasProcess = rows.length > 0 || toolCount > 0 || processMessages.length > 0;
+  const toolSummary = summarizeTools(processItems.filter((item): item is ToolCallItem => item.kind === 'tool_call'));
 
   const reply = finalMessage ? (
     <article key={finalMessage.id} className="turn turn-reply">
@@ -492,10 +504,12 @@ function TurnBlock({
         <NoticeCard key={item.id} item={item} />
       ))}
 
-      {!open && hasProcess && !live ? (
-        <div className="turn-summary">
-          {summarizeTools(processItems.filter((item): item is ToolCallItem => item.kind === 'tool_call'))}
-        </div>
+      {settledQuestions.map((item) => (
+        <QuestionCard key={item.id} item={item} onAnswer={onAnswerQuestion} />
+      ))}
+
+      {!open && hasProcess && !live && toolSummary ? (
+        <div className="turn-summary">{toolSummary}</div>
       ) : null}
 
       {open && hasProcess ? (
@@ -528,7 +542,7 @@ function TurnBlock({
   );
 }
 
-export function Timeline({ items, turn, running, now, onRevert, onOpenPath, onReview }: TimelineProps) {
+export function Timeline({ items, turn, running, now, onRevert, onOpenPath, onReview, onAnswerQuestion }: TimelineProps) {
   const results = useMemo(() => {
     const map = new Map<string, ToolResultItem>();
     for (const item of items) {
@@ -567,6 +581,7 @@ export function Timeline({ items, turn, running, now, onRevert, onOpenPath, onRe
             onRevert={onRevert}
             onOpenPath={onOpenPath}
             onReview={onReview}
+            onAnswerQuestion={onAnswerQuestion}
           />
         );
       })}

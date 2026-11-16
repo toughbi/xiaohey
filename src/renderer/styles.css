@@ -213,7 +213,7 @@ button {
 }
 
 .brand-cursor {
-  transform-origin: 276px 326px;
+  transform-origin: 161px 256px;
   transition: transform 200ms cubic-bezier(0.2, 0.9, 0.3, 1.3), opacity 160ms ease;
 }
 
@@ -1859,6 +1859,151 @@ button {
 .approval-actions {
   display: flex;
   gap: 8px;
+}
+
+/* ---------- mid-turn clarification ---------- */
+
+.question-card {
+  margin: 12px 0 4px;
+  padding: 14px 16px;
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--panel) 88%, var(--accent-soft));
+}
+
+.question-card.question-pending {
+  border-color: color-mix(in srgb, var(--ink-3) 42%, var(--line-strong));
+  box-shadow: 0 10px 28px -24px rgba(28, 26, 22, 0.45);
+}
+
+.question-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.question-kicker {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--ink-2);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.question-kicker svg {
+  color: var(--ink-3);
+}
+
+.question-state {
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+
+.question-text {
+  margin: 8px 0 12px;
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1.65;
+}
+
+.question-options {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.question-option {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--panel);
+  color: var(--ink);
+  text-align: left;
+  transition: border-color 140ms ease, background 140ms ease, transform 140ms ease;
+}
+
+.question-option:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--ink-3) 55%, var(--line));
+  background: var(--hover);
+}
+
+.question-option:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.question-option:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.question-option-label {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.question-option-desc {
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.question-custom {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.question-custom input {
+  flex: 1;
+  min-width: 0;
+  height: 34px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--panel);
+  color: var(--ink);
+  font-size: 12.5px;
+}
+
+.question-custom input:focus {
+  border-color: color-mix(in srgb, var(--ink-3) 60%, var(--line-strong));
+  outline: none;
+}
+
+.question-answer {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin: 0;
+  padding: 9px 12px;
+  border-radius: 9px;
+  background: var(--inset);
+  color: var(--ink);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.question-answer span {
+  flex: none;
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+
+/* The pending question is magnetised above the composer; answered cards settle
+   back into the transcript. */
+.composer-dock .question-card {
+  width: 100%;
+  margin: 0 0 6px;
+  background: color-mix(in srgb, var(--panel) 82%, transparent);
+  -webkit-backdrop-filter: blur(16px) saturate(120%);
+  backdrop-filter: blur(16px) saturate(120%);
+  box-shadow: 0 14px 34px -28px rgba(24, 20, 14, 0.55);
 }
 
 /* ---------- composer meta (below the input, no divider) ---------- */
@@ -5050,6 +5195,7 @@ body.resizing-rail {
   width: 100%;
   height: 9px;
   pointer-events: auto;
+  cursor: pointer;
 }
 
 .minimap-stripe {
@@ -5067,13 +5213,20 @@ body.resizing-rail {
 }
 
 .minimap-stripe.active {
-  width: 14px;
+  width: 20px;
   background: color-mix(in srgb, var(--ink) 34%, transparent);
 }
 
+/* Hover stretches the dash, but stays second to the turn being read. */
 .minimap-stripe.hovered,
 .minimap-slot:hover .minimap-stripe {
+  width: 16px;
   background: var(--ink-2);
+}
+
+/* The reading dash keeps its full length even while it is the hovered one. */
+.minimap-slot .minimap-stripe.active {
+  width: 20px;
 }
 
 .minimap-tip {
@@ -5253,6 +5406,112 @@ body.resizing-rail {
   color: var(--ink);
 }
 
+/* ---------- live task breakdown, magnetised above the composer ---------- */
+
+.task-panel {
+  width: calc(100% - 32px);
+  max-width: 1180px;
+  margin: 0 auto 6px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--panel) 82%, transparent);
+  -webkit-backdrop-filter: blur(16px) saturate(120%);
+  backdrop-filter: blur(16px) saturate(120%);
+  overflow: hidden;
+}
+
+.task-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 12px;
+  color: var(--ink-2);
+  text-align: left;
+}
+
+.task-head > svg {
+  flex: none;
+  color: var(--ink-3);
+}
+
+.task-name {
+  color: var(--ink-2);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.task-counts {
+  color: var(--ink-3);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.task-chevron {
+  flex: none;
+  margin-left: auto;
+  color: var(--ink-3);
+  transition: transform 120ms ease;
+}
+
+.task-chevron.collapsed {
+  transform: rotate(-90deg);
+}
+
+.task-list {
+  max-height: 176px;
+  margin: 0;
+  padding: 0 6px 6px;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.task-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 7px;
+  color: var(--ink-2);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.task-step.task-active {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.task-step.task-done {
+  color: var(--ink-3);
+}
+
+.task-icon {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 19px;
+  color: var(--ink-3);
+}
+
+.task-step.task-active .task-icon {
+  color: var(--ink-2);
+}
+
+.task-ring {
+  width: 8px;
+  height: 8px;
+  border: 1.5px solid currentColor;
+  border-radius: 50%;
+  opacity: 0.55;
+}
+
+.task-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 
 .cm-workspace {
   border: 0;
@@ -5589,9 +5848,22 @@ body.resizing-rail {
   padding: 0;
 }
 
+/* Cards docked above the input start where the composer's top edge becomes
+   straight: inset by its 16px corner radius on both sides. */
 .composer-dock .workspace-prompt,
-.composer-dock .queue-panel {
-  width: 100%;
+.composer-dock .queue-panel,
+.composer-dock .task-panel,
+.composer-dock .question-card {
+  width: calc(100% - 32px);
+  max-width: none;
+  margin-right: auto;
+  margin-left: auto;
+}
+
+.composer-dock .approval-card {
+  width: auto;
+  margin-right: 16px;
+  margin-left: 16px;
 }
 
 .transcript {
@@ -5720,4 +5992,60 @@ body.resizing-rail {
 
 .composer {
   background: color-mix(in srgb, var(--panel) 38%, transparent);
+}
+
+.hm-tip {
+  position: fixed;
+  z-index: 90;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 120px;
+  padding: 8px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--panel) 78%, transparent);
+  -webkit-backdrop-filter: blur(18px) saturate(120%);
+  backdrop-filter: blur(18px) saturate(120%);
+  box-shadow: 0 14px 34px -20px rgba(20, 18, 14, 0.5);
+  color: var(--ink);
+  font-size: 12px;
+  pointer-events: none;
+}
+
+.hm-tip strong {
+  color: var(--ink-2);
+  font-size: 11.5px;
+  font-weight: 500;
+}
+
+.hm-tip span {
+  font-variant-numeric: tabular-nums;
+}
+
+.hm-total {
+  margin-left: auto;
+  color: var(--ink-3);
+  font-size: 11px;
+}
+
+.hm-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Conversation column lines up with the composer's corner ends (16px dock
+   inset + 16px radius), and its scroll viewport ends at the composer bottom. */
+.session {
+  --dock-bottom: 12px;
+}
+
+.transcript-holder {
+  margin-bottom: var(--dock-gap, 38px);
+}
+
+.transcript {
+  padding-left: 32px;
+  padding-right: 32px;
 }

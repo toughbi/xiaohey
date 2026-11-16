@@ -18,6 +18,7 @@ import type {
   FileEntry,
   Item,
   MemoryFact,
+  PlanItem,
   PlanStep,
   RuntimeEvent,
   RuntimeStatus,
@@ -30,6 +31,8 @@ import type {
 import { call, subscribe } from './lib/client';
 import { HistoryRail } from './components/HistoryRail';
 import { QueuedMessages, type QueuedMessage } from './components/QueuedMessages';
+import { TaskList } from './components/TaskList';
+import { QuestionCard } from './components/QuestionCard';
 import { Timeline } from './components/Timeline';
 import { TurnMinimap } from './components/TurnMinimap';
 import { Composer } from './components/Composer';
@@ -43,6 +46,7 @@ const PHASE_LABEL: Record<RuntimeStatus['phase'], string> = {
   thinking: '思考中',
   tool: '执行工具',
   approval: '等待许可',
+  question: '等待回答',
   compacting: '折叠上下文',
   error: '出错',
 };
@@ -132,6 +136,7 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
   const [workspaceMenuRequest, setWorkspaceMenuRequest] = useState<{ id: number; rect: { left: number; top: number; bottom: number } } | null>(null);
   const dockRef = useRef<HTMLDivElement | null>(null);
   const [dockHeight, setDockHeight] = useState(0);
+  const [dockGap, setDockGap] = useState(38);
 
   useEffect(() => {
     const node = dockRef.current;
@@ -229,6 +234,7 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
       switch (event.type) {
         case 'item/upsert':
           mergeItem(event.item);
+          if (event.item.kind === 'plan') setPlan(event.item.steps);
           break;
         case 'turn/updated':
           setTurn(event.turn);
@@ -358,10 +364,25 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
   useEffect(() => subscribe(handleEvent), [handleEvent]);
 
   useEffect(() => {
-    if (scroller.current && stickToBottom.current) {
-      scroller.current.scrollTop = scroller.current.scrollHeight;
+    const node = scroller.current;
+    if (!node) return;
+    // While a reply streams, keep its tail above the composer even if the
+    // reader scrolled up earlier. Once the turn is idle, scrolling is free and
+    // the glass dock may cover the bottom of the transcript.
+    if (running) {
+      stickToBottom.current = true;
+      node.scrollTop = node.scrollHeight;
+      return;
     }
-  }, [items]);
+    if (stickToBottom.current) node.scrollTop = node.scrollHeight;
+  }, [items, running]);
+
+  // The dock can grow mid-turn (task list, queued messages); keep the tail clear.
+  useEffect(() => {
+    if (!running) return;
+    const node = scroller.current;
+    if (node) node.scrollTop = node.scrollHeight;
+  }, [dockHeight, running]);
 
   const navigate = async (path: string): Promise<void> => {
     if (!activeId) return;
@@ -481,6 +502,15 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
   const approve = async (approvalId: string, decision: 'allow_once' | 'allow_always' | 'deny'): Promise<void> => {
     setApproval(null);
     await call('approval/respond', { approvalId, decision });
+  };
+
+  const answerQuestion = async (questionId: string, answer: string): Promise<void> => {
+    try {
+      const result = await call('question/respond', { questionId, answer });
+      if (!result.ok) setToast('这个问题已经结束，不需要再回答了');
+    } catch (reason) {
+      setError((reason as Error).message);
+    }
   };
 
   const pinThread = async (threadId: string, pinned: boolean): Promise<void> => {
@@ -802,6 +832,28 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
     }).catch(() => undefined);
   }, [thread?.status, thread?.title]);
 
+  // The docked task list only reflects the turn in flight; the fold keeps the
+  // historical plan after the turn ends.
+  const taskSteps = useMemo(() => {
+    if (!running || !turn) return [];
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      const item = items[index];
+      if (item.kind === 'plan' && item.turnId === turn.id) return item.steps;
+    }
+    return [];
+  }, [items, running, turn]);
+
+  // A pending clarification is docked above the composer; once answered it
+  // settles into the transcript.
+  const pendingQuestion = useMemo(() => {
+    if (!running || !turn) return null;
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      const item = items[index];
+      if (item.kind === 'question' && item.status === 'running' && item.turnId === turn.id) return item;
+    }
+    return null;
+  }, [items, running, turn]);
+
   const minimapTurns = useMemo(() => {
     const plain = (text: string): string =>
       text
@@ -1001,7 +1053,7 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
         ) : null}
 
         <section className="panel">
-          <main className="session" style={{ '--dock-h': `${dockHeight}px` } as React.CSSProperties}>
+          <main className="session" style={{ '--dock-h': `${dockHeight}px`, '--dock-gap': `${dockGap}px` } as React.CSSProperties}>
         <header className="session-head">
           <div className="session-head-left">
             {renaming !== null ? (
@@ -1022,39 +1074,6 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
             ) : (
               <h1 onDoubleClick={() => setRenaming(thread?.title ?? '')}>{thread?.title ?? '新会话'}</h1>
             )}
-            <div className="menu-wrap">
-              <button
-                type="button"
-                className="ghost icon"
-                onClick={() => setMenuOpen((value) => !value)}
-                aria-label="更多"
-                title="更多"
-              >
-                <MoreHorizontal size={16} strokeWidth={1.5} />
-              </button>
-              {menuOpen ? (
-                <div className="menu" role="menu">
-                  <button type="button" onClick={() => setRenaming(thread?.title ?? '')}>
-                    重命名
-                  </button>
-                  <button type="button" onClick={() => void copyTranscript()}>
-                    复制为 Markdown
-                  </button>
-                  <button type="button" onClick={() => void exportTranscript()}>
-                    导出 .md 到 exports/
-                  </button>
-                  {confirmDelete ? (
-                    <button type="button" className="danger" onClick={() => void removeThread()}>
-                      确认删除
-                    </button>
-                  ) : (
-                    <button type="button" className="danger" onClick={() => setConfirmDelete(true)}>
-                      删除会话
-                    </button>
-                  )}
-                </div>
-              ) : null}
-            </div>
             {runtime && runtime.phase !== 'idle' ? (
               <span className={`phase ${runtime.phase === 'error' ? 'phase-error' : ''}`}>
                 {runtime.phase === 'error' ? (
@@ -1155,6 +1174,7 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
                 onRevert={(id) => void revert(id)}
                 onOpenPath={(path) => void openFile(path)}
                 onReview={(path) => void openFile(path, activeId, 'diff')}
+                onAnswerQuestion={answerQuestion}
               />
             )}
           </div>
@@ -1201,6 +1221,11 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
           onSendNow={sendQueuedNow}
         />
 
+        <TaskList steps={taskSteps} />
+
+        {pendingQuestion ? <QuestionCard item={pendingQuestion} onAnswer={answerQuestion} /> : null}
+
+
         <Composer
           blocked={(settings?.models.length ?? 0) === 0}
           needsWorkspace={Boolean(thread && !thread.cwd)}
@@ -1214,7 +1239,13 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
             steps: thread?.steps ?? 0,
             tokens: thread?.totalTokens ?? 0,
             percent: contextPercent,
-            workspace: thread ? (thread.cwd ? thread.cwd.split(/[\\/]/).filter(Boolean).pop() ?? '' : '未指定工作区') : workspaceInfo?.name ?? '',
+            workspace: thread
+              ? thread.cwd
+                ? thread.cwd.split(/[\\/]/).filter(Boolean).pop() ?? ''
+                : '未指定工作区'
+              : workspaceInfo?.path
+                ? workspaceInfo.name
+                : '不指定工作区',
             branch: workspaceInfo?.branch ?? null,
           }}
           onSend={(text) => send(text)}

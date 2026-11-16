@@ -14,6 +14,8 @@ import type {
   NoticeItem,
   PlanItem,
   PlanStep,
+  QuestionItem,
+  QuestionOption,
   RuntimeEvent,
   RuntimeStatus,
   Thread,
@@ -60,6 +62,11 @@ interface PendingApproval {
   resolve: (decision: ApprovalDecision) => void;
 }
 
+interface PendingQuestion {
+  threadId: string;
+  resolve: (answer: { answer: string; cancelled: boolean }) => void;
+}
+
 /**
  * The turn engine.
  *
@@ -73,6 +80,7 @@ export class AgentService {
   private readonly checkpoints: Checkpoints;
   private readonly controllers = new Map<string, AbortController>();
   private readonly approvals = new Map<string, PendingApproval>();
+  private readonly questions = new Map<string, PendingQuestion>();
   private readonly allowedCommands = new Map<string, Set<string>>();
   private readonly ledger: RetryLedger = { attempts: new Map() };
   private readonly running = new Set<string>();
@@ -124,6 +132,12 @@ export class AgentService {
    */
   private markInterrupted(doc: ThreadDoc, stopReason: string, title: string, body: string): void {
     const threadId = doc.thread.id;
+    for (const [id, pending] of this.questions) {
+      if (pending.threadId === threadId) {
+        pending.resolve({ answer: '', cancelled: true });
+        this.questions.delete(id);
+      }
+    }
     if (doc.turn) {
       doc.turn.status = 'cancelled';
       doc.turn.endedAt = Date.now();
@@ -134,6 +148,7 @@ export class AgentService {
       item.status = 'cancelled';
       this.emitItem(item);
     }
+    this.deps.store.closeOpenToolCalls(doc);
     doc.thread.status = 'idle';
     this.emitNotice(threadId, { tone: 'warn', title, body });
     if (doc.turn) this.deps.emit({ type: 'turn/updated', turn: doc.turn });
@@ -231,6 +246,12 @@ export class AgentService {
         this.approvals.delete(id);
       }
     }
+    for (const [id, pending] of this.questions) {
+      if (pending.threadId === threadId) {
+        pending.resolve({ answer: '', cancelled: true });
+        this.questions.delete(id);
+      }
+    }
     return true;
   }
 
@@ -248,6 +269,17 @@ export class AgentService {
         this.emitItem(approval);
       }
     }
+    return true;
+  }
+
+  /** Answer a pending clarification question; the waiting tool call then resumes. */
+  respondQuestion(questionId: string, answer: string): boolean {
+    const pending = this.questions.get(questionId);
+    if (!pending) return false;
+    const text = answer.trim().slice(0, 2000);
+    if (!text) return false;
+    this.questions.delete(questionId);
+    pending.resolve({ answer: text, cancelled: false });
     return true;
   }
 
@@ -496,6 +528,11 @@ export class AgentService {
         if (result.reasoning.trim()) doc.state.context.thinking = true;
         this.emitItem(assistantItem);
         doc.thread.totalTokens += result.usage.promptTokens + result.usage.completionTokens;
+        {
+          const now = new Date();
+          const day = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+          this.deps.store.addTokens(day, result.usage.promptTokens + result.usage.completionTokens);
+        }
 
         if (result.reasoning.trim()) {
           push({
@@ -534,7 +571,7 @@ export class AgentService {
             stopReason = 'cancelled by the user';
             break;
           }
-          await this.executeTool(doc, turn, call, step, result.reasoning);
+          await this.executeTool(doc, turn, call, step, result.reasoning, controller.signal);
         }
         await this.deps.store.save(threadId);
         this.emitThread(doc.thread);
@@ -683,7 +720,7 @@ export class AgentService {
     return lines.join('\n');
   }
 
-  private async executeTool(doc: ThreadDoc, turn: Turn, call: ToolCall, step: number, reasoning = ''): Promise<void> {
+  private async executeTool(doc: ThreadDoc, turn: Turn, call: ToolCall, step: number, reasoning: string | undefined, signal: AbortSignal): Promise<void> {
     const threadId = doc.thread.id;
     const tool = toolByName.get(call.function.name);
     const callItem: ToolCallItem = {
@@ -698,7 +735,7 @@ export class AgentService {
       args: {},
       summary: '',
       risk: (tool?.risk ?? 'read') as ToolCallItem['risk'],
-      ...(reasoning.trim() ? { reasoning } : {}),
+      ...(reasoning && reasoning.trim() ? { reasoning } : {}),
     };
     doc.items.push(callItem);
     this.emitItem(callItem);
@@ -735,11 +772,26 @@ export class AgentService {
     this.emitItem(callItem);
 
     const schemaRetries = schemaRetriesLeft(this.ledger, call.id);
-    const context = this.toolContext(doc, turn, step);
+    const context = this.toolContext(doc, turn, step, signal);
 
     const started = Date.now();
     const outcome = await this.invoke(doc, turn, tool, parsed.args, context, call.id);
     const durationMs = Date.now() - started;
+
+    if (signal.aborted) {
+      callItem.status = 'cancelled';
+      callItem.summary = '已中止';
+      this.emitItem(callItem);
+      this.pushResult(
+        doc,
+        turn,
+        call,
+        { ok: false, layer: 'none', summary: '已中止', detail: '用户停止了本轮。', hint: '', retryable: true },
+        durationMs,
+        tool,
+      );
+      return;
+    }
 
     if (!outcome.ok && outcome.layer === 'L2-schema') {
       noteAttempt(this.ledger, call.id);
@@ -759,7 +811,7 @@ export class AgentService {
     await this.deps.store.save(threadId);
   }
 
-  private toolContext(doc: ThreadDoc, turn: Turn, step: number): ToolExecContext {
+  private toolContext(doc: ThreadDoc, turn: Turn, step: number, signal: AbortSignal): ToolExecContext {
     const threadId = doc.thread.id;
     return {
       threadId: doc.thread.id,
@@ -767,18 +819,40 @@ export class AgentService {
       workspace: doc.thread.cwd,
       shell: (command, timeoutMs, cwd) =>
         new Promise((resolvePromise, rejectPromise) => {
+          let settled = false;
+          const finish = (fn: () => void): void => {
+            if (settled) return;
+            settled = true;
+            signal.removeEventListener('abort', onAbort);
+            fn();
+          };
+          const onAbort = (): void => {
+            try {
+              if (process.platform === 'win32') {
+                exec(`taskkill /pid ${child.pid} /T /F`, () => undefined);
+              } else {
+                child.kill('SIGKILL');
+              }
+            } catch {
+              // the process may already be gone
+            }
+            finish(() => rejectPromise(new Error('已中止')));
+          };
           const child = exec(
             command,
             { cwd, timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, windowsHide: true, shell: process.platform === 'win32' ? 'cmd.exe' : '/bin/sh' },
             (error, stdout, stderr) => {
               if (error && (error as NodeJS.ErrnoException).code === 'ETIMEDOUT') {
-                rejectPromise(new Error(`command timed out after ${timeoutMs}ms`));
+                finish(() => rejectPromise(new Error(`command timed out after ${timeoutMs}ms`)));
                 return;
               }
-              resolvePromise({ code: error ? (error.code as number) ?? 1 : 0, stdout: String(stdout), stderr: String(stderr), durationMs: 0 });
+              finish(() =>
+                resolvePromise({ code: error ? (error.code as number) ?? 1 : 0, stdout: String(stdout), stderr: String(stderr), durationMs: 0 }),
+              );
             },
           );
-          void child;
+          if (signal.aborted) onAbort();
+          else signal.addEventListener('abort', onAbort, { once: true });
         }),
       approve: async ({ name, command, reason: rawReason, risk }) => {
         const policy = this.deps.store.getSettings().approval;
@@ -840,6 +914,58 @@ export class AgentService {
         doc.thread.status = 'running';
         this.emitThread(doc.thread);
         return decision;
+      },
+      ask: async ({ header, question, options }) => {
+        if (signal.aborted) return { answer: '', cancelled: true };
+        const id = uid('qst');
+        let settle!: (answer: { answer: string; cancelled: boolean }) => void;
+        const answered = new Promise<{ answer: string; cancelled: boolean }>((resolveAnswer) => {
+          settle = resolveAnswer;
+        });
+        this.questions.set(id, { threadId, resolve: (value) => settle(value) });
+
+        const onAbort = (): void => {
+          this.questions.delete(id);
+          settle({ answer: '', cancelled: true });
+        };
+        if (signal.aborted) onAbort();
+        else signal.addEventListener('abort', onAbort, { once: true });
+
+        const item: QuestionItem = {
+          id,
+          threadId,
+          turnId: turn.id,
+          kind: 'question',
+          at: Date.now(),
+          status: 'running',
+          header,
+          question,
+          options,
+        };
+        doc.items.push(item);
+        this.emitItem(item);
+        this.deps.emit({
+          type: 'runtime/updated',
+          runtime: this.status(threadId, 'question', header),
+          context: this.gauge(doc),
+        });
+        // Persist the pending card so a crash can still explain what was asked.
+        void this.deps.store.save(threadId);
+
+        const answer = await answered;
+        signal.removeEventListener('abort', onAbort);
+        this.questions.delete(id);
+        item.answer = answer.answer;
+        item.status = answer.cancelled ? 'cancelled' : 'done';
+        this.emitItem(item);
+        if (!answer.cancelled) {
+          this.deps.emit({
+            type: 'runtime/updated',
+            runtime: this.status(threadId, 'tool', '收到回答，继续执行'),
+            context: this.gauge(doc),
+          });
+        }
+        return answer;
       },
       remember: async ({ slot, value, scope }) => {
         const result = applyClaim(doc.state.memory, { slot, value, scope: scope as MemoryScope, source: `turn ${turn.index}` });
@@ -1139,6 +1265,7 @@ function hashText(text: string): string {
 
 function summarizeCall(tool: ToolDefinition, args: Record<string, unknown>): string {
   if (tool.name === 'run_shell') return truncate(String(args.command ?? ''), 120);
+  if (tool.name === 'ask_user') return truncate(String(args.question ?? ''), 120);
   if (typeof args.path === 'string') return `${tool.name} ${args.path}`;
   if (typeof args.pattern === 'string') return `${tool.name} /${args.pattern}/`;
   if (tool.name === 'todo_write') return 'plan updated';

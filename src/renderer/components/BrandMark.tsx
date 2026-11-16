@@ -13,8 +13,8 @@ interface BrandMarkProps {
 }
 
 /**
- * The mark is a black tile with a terminal prompt: ">" and a cursor bar.
- * Hover widens the cursor and nudges the chevron, pressing dips the glyph, and
+ * The mark is a black tile with two eyes: a vertical bar and a `<` chevron.
+ * Hover widens the bar and nudges the chevron, pressing dips the glyph, and
  * the bar blinks on its own when the mark is left alone.
  */
 export function BrandMark({ size = 20, className = '', expression, interactive = true, title = 'xiaohey' }: BrandMarkProps) {
@@ -76,21 +76,14 @@ export function BrandMark({ size = 20, className = '', expression, interactive =
         <g className="brand-prompt">
           <path
             className="brand-chevron"
-            d="M164 186 L258 256 L164 326"
+            d="M351 200 L257 256 L351 312"
             fill="none"
             stroke="var(--mark-ink)"
             strokeWidth="48"
             strokeLinecap="round"
             strokeLinejoin="round"
           />
-          <path
-            className="brand-cursor"
-            d="M276 326 H362"
-            fill="none"
-            stroke="var(--mark-ink)"
-            strokeWidth="46"
-            strokeLinecap="round"
-          />
+          <rect className="brand-cursor" x="137" y="176" width="48" height="160" rx="24" fill="var(--mark-ink)" />
         </g>
       </g>
     </svg>

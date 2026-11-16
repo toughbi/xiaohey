@@ -104,8 +104,10 @@ export class AppServer {
       for (const item of doc.items) {
         if (item.status === 'running') item.status = 'cancelled';
       }
+      this.store.closeOpenToolCalls(doc);
     }
     await this.store.flushAll();
+    await this.store.saveIndex();
   }
 
   async request<K extends RequestName>(method: K, params: RequestParams<K>): Promise<RequestResult<K>> {
@@ -226,6 +228,11 @@ export class AppServer {
       case 'approval/respond': {
         const { approvalId, decision } = params as { approvalId: string; decision: 'allow_once' | 'allow_always' | 'deny' };
         return { ok: this.agent.respondApproval(approvalId, decision) } as RequestResult<K>;
+      }
+
+      case 'question/respond': {
+        const { questionId, answer } = params as { questionId: string; answer: string };
+        return { ok: this.agent.respondQuestion(questionId, answer) } as RequestResult<K>;
       }
 
       case 'context/get': {
@@ -378,6 +385,7 @@ export class AppServer {
           const doc = await this.store.load(threadId);
           if (doc) path = doc.thread.cwd;
         }
+        if (!path) return { path: '', name: '', branch: null } as RequestResult<K>;
         return { path, name: basename(path), branch: await this.gitBranch(path) } as RequestResult<K>;
       }
 
@@ -489,10 +497,12 @@ export class AppServer {
       }
     }
 
+    const tokensByDay = this.store.tokenDays();
     const days: ActivityDay[] = [];
     for (const cursor = new Date(start); cursor <= today; cursor.setDate(cursor.getDate() + 1)) {
       const key = dayKey(cursor);
-      days.push({ date: key, count: counts.get(key) ?? 0 });
+      const demoBoost = this.demo ? (counts.get(key) ?? 0) * 900 : 0;
+      days.push({ date: key, count: counts.get(key) ?? 0, tokens: (tokensByDay[key] ?? 0) + demoBoost });
     }
     const records = days.reduce((sum, day) => sum + day.count, 0);
     const activeDays = days.filter((day) => day.count > 0).length;
@@ -650,6 +660,14 @@ export class AppServer {
       }
       if (item.kind === 'approval') {
         lines.push('- 审批：`' + item.command + '` → ' + (item.decision ?? 'pending'));
+        continue;
+      }
+      if (item.kind === 'question') {
+        lines.push('### 问题 · ' + (item.header || '需要澄清'), '', item.question, '');
+        for (const option of item.options) {
+          lines.push('- ' + option.label + (option.description ? ' — ' + option.description : ''));
+        }
+        lines.push('', item.answer ? '回答：' + item.answer : '回答：未回答', '');
         continue;
       }
       if (item.kind === 'checkpoint') {

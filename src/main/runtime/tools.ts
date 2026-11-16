@@ -1,14 +1,14 @@
 import { exec } from 'node:child_process';
 import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { dirname, join, relative } from 'node:path';
-import type { ApprovalDecision, PlanStep, ToolRisk } from '../../shared/types.js';
+import type { ApprovalDecision, PlanStep, QuestionOption, ToolRisk } from '../../shared/types.js';
 import type { MemoryScope } from './memory.js';
 import { domainFailure, readDomainFailure, transientFailure, type ToolOutcome } from './toolerrors.js';
 import type { ToolSchema } from './validate.js';
 import { resolveInside } from '../util.js';
 
 /**
- * The tool set. Nine tools, one job each, with routing-oriented descriptions:
+ * The tool set. One job each, with routing-oriented descriptions:
  * `Use when` / `Do NOT use when` is what keeps a model from oscillating between
  * two similar tools. Overlapping capabilities are folded into one tool with a
  * mode argument rather than exposed as siblings.
@@ -27,6 +27,8 @@ export interface ToolExecContext {
   workspace: string;
   shell: (command: string, timeoutMs: number, cwd: string) => Promise<ShellRun>;
   approve: (request: { name: string; command: string; reason: string; risk: ToolRisk }) => Promise<ApprovalDecision>;
+  /** Show a clarification card and resolve with the user's answer. */
+  ask: (request: { header: string; question: string; options: QuestionOption[] }) => Promise<{ answer: string; cancelled: boolean }>;
   remember: (claim: { slot: string; value: string; scope: MemoryScope }) => Promise<{ kind: string; note: string }>;
   setPlan: (steps: PlanStep[]) => Promise<void>;
   markTouched: (files: string[]) => void;
@@ -462,6 +464,61 @@ export const tools: ToolDefinition[] = [
       const scope: MemoryScope = String(args.scope ?? 'workspace') === 'global' ? { kind: 'global' } : { kind: 'workspace' };
       const result = await ctx.remember({ slot: String(args.slot), value: String(args.value), scope });
       return { ok: true, summary: `memory · ${result.kind}`, output: result.note };
+    },
+  },
+  {
+    name: 'ask_user',
+    risk: 'read',
+    mutating: false,
+    summary: 'Ask the user one focused question with 2–4 options; they can also type their own answer.',
+    useWhen:
+      'The request is ambiguous in a way that changes the work (which entity, which time window, which scope, which preference), and no tool can settle it.',
+    avoidWhen:
+      'A read_file, grep_text, glob_files or list_dir call can answer it — check first. Do not ask about trivial defaults you can state and proceed with.',
+    schema: {
+      type: 'object',
+      properties: {
+        header: { type: 'string', description: 'Short label for the card, 2–8 chars, e.g. 选择范围' },
+        question: { type: 'string', description: 'One focused question, plain text, no markdown' },
+        options: {
+          type: 'array',
+          items: { type: 'object' },
+          description: '2–4 options as {label, description?}; label is the short answer sent back',
+        },
+      },
+      required: ['question', 'options'],
+      additionalProperties: false,
+    },
+    async run(ctx, args) {
+      const question = String(args.question ?? '').trim().slice(0, 500);
+      if (!question) return domainFailure('question is empty', 'Pass one focused question in `question`.');
+      const raw = Array.isArray(args.options) ? args.options : [];
+      const options: QuestionOption[] = [];
+      for (const entry of raw) {
+        const value = typeof entry === 'string' ? { label: entry } : entry && typeof entry === 'object' ? (entry as Record<string, unknown>) : null;
+        if (!value) continue;
+        const label = String(value.label ?? '').trim().slice(0, 120);
+        if (!label || options.some((option) => option.label === label)) continue;
+        const description = String(value.description ?? '').trim().slice(0, 200);
+        options.push({ label, ...(description ? { description } : {}) });
+        if (options.length === 4) break;
+      }
+      if (options.length < 2) {
+        return domainFailure(
+          '需要 2–4 个选项',
+          'Pass `options` as 2–4 {label, description?} objects. Labels are the short answers, e.g. "方案 A".',
+        );
+      }
+      const header = String(args.header ?? '').trim().slice(0, 24) || '需要你确认';
+      const answer = await ctx.ask({ header, question, options });
+      if (answer.cancelled) {
+        return { ok: false, layer: 'none', summary: '问题已取消', detail: '用户中止了本轮，问题没有回答。', hint: '', retryable: true };
+      }
+      return {
+        ok: true,
+        summary: `用户已回答 · ${answer.answer.slice(0, 60)}`,
+        output: `用户回答：${answer.answer}`,
+      };
     },
   },
 ];

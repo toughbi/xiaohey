@@ -32,6 +32,8 @@ export interface AppIndex {
   workspaceRoot: string;
   activeThreadId: string | null;
   threadOrder: string[];
+  /** Tokens spent per local day, `YYYY-MM-DD` → total. */
+  tokenDays?: Record<string, number>;
 }
 
 export const DEFAULT_PROFILE = {
@@ -46,8 +48,8 @@ export const DEFAULT_PROFILE = {
 } as const;
 
 export const DEFAULT_SETTINGS: Settings = {
-  models: [{ ...DEFAULT_PROFILE }],
-  activeModelId: DEFAULT_PROFILE.id,
+  models: [],
+  activeModelId: '',
   approval: 'ask',
   allowedCommands: [],
 };
@@ -143,6 +145,7 @@ export class Store {
   private settings: Settings;
   readonly docs = new Map<string, ThreadDoc>();
   private saveTimers = new Map<string, NodeJS.Timeout>();
+  private indexTimer: NodeJS.Timeout | null = null;
 
   constructor(readonly home: string, workspaceRoot: string) {
     this.settingsFile = join(home, 'settings.json');
@@ -166,7 +169,6 @@ export class Store {
       await writeJsonAtomic(this.settingsFile, this.settings);
     }
     this.index = await readJson(join(this.home, 'index.json'), this.index);
-    if (!this.index.workspaceRoot) this.index.workspaceRoot = process.cwd();
   }
 
   get workspaceRoot(): string {
@@ -206,6 +208,46 @@ export class Store {
 
   async saveIndex(): Promise<void> {
     await writeJsonAtomic(this.indexFile, this.index);
+  }
+
+  tokenDays(): Record<string, number> {
+    return this.index.tokenDays ?? {};
+  }
+
+  /** Accumulate tokens for one local day; the index is flushed shortly after. */
+  addTokens(date: string, tokens: number): void {
+    if (!Number.isFinite(tokens) || tokens <= 0) return;
+    const days = this.index.tokenDays ?? (this.index.tokenDays = {});
+    days[date] = (days[date] ?? 0) + Math.round(tokens);
+    if (this.indexTimer) clearTimeout(this.indexTimer);
+    this.indexTimer = setTimeout(() => {
+      this.indexTimer = null;
+      void this.saveIndex();
+    }, 600);
+  }
+
+  /** Give every unanswered tool call an explicit interrupted result. */
+  closeOpenToolCalls(doc: ThreadDoc): void {
+    const answered = new Set(doc.items.filter((item) => item.kind === 'tool_result').map((item) => item.callId));
+    for (const item of doc.items) {
+      if (item.kind !== 'tool_call' || answered.has(item.callId)) continue;
+      doc.items.push({
+        id: uid('itm'),
+        threadId: doc.thread.id,
+        turnId: item.turnId,
+        at: Date.now(),
+        status: 'done',
+        kind: 'tool_result',
+        callId: item.callId,
+        name: item.name,
+        ok: false,
+        summary: '已中断',
+        output: '应用退出，工具没有返回结果。',
+        layer: 'none',
+        retryable: true,
+      });
+      answered.add(item.callId);
+    }
   }
 
   activeThreadId(): string | null {
@@ -252,6 +294,7 @@ export class Store {
       for (const item of doc.items) {
         if (item.status === 'running') item.status = 'cancelled';
       }
+      this.closeOpenToolCalls(doc);
       await this.saveNow(thread.id);
     }
   }

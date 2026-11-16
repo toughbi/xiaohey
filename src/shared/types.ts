@@ -60,7 +60,8 @@ export type ItemKind =
   | 'notice'
   | 'compaction'
   | 'checkpoint'
-  | 'approval';
+  | 'approval'
+  | 'question';
 
 export type ItemStatus = 'running' | 'done' | 'error' | 'cancelled';
 
@@ -169,6 +170,22 @@ export interface ApprovalItem extends ItemBase {
   decision?: ApprovalDecision;
 }
 
+export interface QuestionOption {
+  /** Short answer; this label is what the model receives back. */
+  label: string;
+  description?: string;
+}
+
+/** One clarification question the assistant asked mid-turn. */
+export interface QuestionItem extends ItemBase {
+  kind: 'question';
+  header: string;
+  question: string;
+  options: QuestionOption[];
+  /** The chosen option label, or the user's free-form answer. */
+  answer?: string;
+}
+
 export type Item =
   | MessageItem
   | ReasoningItem
@@ -178,7 +195,8 @@ export type Item =
   | NoticeItem
   | CompactionItem
   | CheckpointItem
-  | ApprovalItem;
+  | ApprovalItem
+  | QuestionItem;
 
 export type ThreadStatus = 'idle' | 'running' | 'waiting_approval' | 'failed';
 
@@ -227,7 +245,7 @@ export interface ContextGauge {
 export interface RuntimeStatus {
   threadId: string | null;
   turnId: string | null;
-  phase: 'idle' | 'thinking' | 'tool' | 'approval' | 'compacting' | 'error';
+  phase: 'idle' | 'thinking' | 'tool' | 'approval' | 'question' | 'compacting' | 'error';
   detail: string;
   adapters: { llm: boolean; shell: boolean; editor: boolean };
 }
@@ -305,6 +323,8 @@ export interface ActivityDay {
   date: string;
   /** Messages + tool calls that day. */
   count: number;
+  /** Prompt + completion tokens spent that day. */
+  tokens: number;
 }
 
 export interface ActivityResult {
@@ -375,6 +395,7 @@ export interface RequestMap {
   'fs/attach': { params: { threadId: string; name: string; data: string }; result: { path: string } };
   'turn/cancel': { params: { threadId: string }; result: { ok: boolean } };
   'approval/respond': { params: { approvalId: string; decision: ApprovalDecision }; result: { ok: boolean } };
+  'question/respond': { params: { questionId: string; answer: string }; result: { ok: boolean } };
   'context/get': { params: { threadId: string }; result: ContextGauge };
   'tools/list': { params: Record<string, never>; result: ToolDescriptor[] };
   'memory/list': { params: { threadId: string }; result: MemoryFact[] };

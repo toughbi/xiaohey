@@ -142,13 +142,16 @@ export function HistoryRail({
   const workspaceCandidates = [workspacePath, defaultWorkspace, ...workspaces]
     .filter((entry, index, list) => entry && list.indexOf(entry) === index);
   const initial = (user.trim()[0] ?? 'x').toUpperCase();
+  // The rail is a view of one workspace: switching workspaces must not look
+  // like the old sessions moved into the new folder.
+  const scoped = workspacePath ? threads.filter((thread) => thread.cwd === workspacePath) : threads;
   const ordered = useMemo(() => {
-    const base = pinnedOnly ? threads.filter((thread) => thread.pinned) : threads;
+    const base = pinnedOnly ? scoped.filter((thread) => thread.pinned) : scoped;
     const list = query.trim()
       ? base.filter((thread) => `${thread.title} ${thread.lastPrompt}`.toLowerCase().includes(query.toLowerCase()))
       : base;
     return [...list].sort((a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)) || b.updatedAt - a.updatedAt);
-  }, [threads, query, pinnedOnly]);
+  }, [scoped, query, pinnedOnly]);
 
   const closeMenu = (): void => {
     setUserMenu(false);
@@ -232,7 +235,7 @@ export function HistoryRail({
             </button>
           </div>
         </div>
-        {threads.length === 0 ? (
+        {threads.length === 0 && !workspacePath ? (
           <p className="rail-empty-state">暂无任务数据 :)</p>
         ) : (
           <>
@@ -405,6 +408,9 @@ export function HistoryRail({
                 </div>
               </>
             ) : null}
+            {ordered.length === 0 ? (
+              <p className="rail-empty-state">暂无任务数据 :)</p>
+            ) : (
             <ul className="thread-list">
               {ordered.map((thread) => (
                 <li key={thread.id} className="thread-item">
@@ -478,6 +484,7 @@ export function HistoryRail({
                 </li>
               ))}
             </ul>
+            )}
           </>
         )}
       </div>

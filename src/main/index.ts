@@ -3,6 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { AppServer } from './server.js';
+import { DEFAULT_PROFILE } from './store.js';
 import { buildDemoDoc, applyDemoEdits, captureDemoSnapshot, seedDemoWorkspace } from './demo.js';
 import type { RuntimeEvent } from '../shared/types.js';
 
@@ -26,7 +27,7 @@ function resolveWorkspace(home: string): string {
   if (flag) return flag.slice('--workspace='.length).replace(/^"|"$/g, '');
   if (process.env.XIAOHEY_WORKSPACE) return process.env.XIAOHEY_WORKSPACE;
   if (DEMO) return join(home, 'demo-workspace');
-  return join(app.getPath('documents'), 'xiaohey');
+  return '';
 }
 
 async function bootstrap(): Promise<void> {
@@ -39,12 +40,18 @@ async function bootstrap(): Promise<void> {
     app.setPath('userData', profile);
   }
   const workspace = resolveWorkspace(home);
-  await mkdir(workspace, { recursive: true });
+  if (workspace) await mkdir(workspace, { recursive: true });
 
   server = new AppServer(home, workspace, send, DEMO);
   await server.init();
 
   if (DEMO) {
+    // Demo mode is a showcase, not a fresh install: give it a profile so the
+    // composer is usable even though the key is empty.
+    const current = server.store.getSettings();
+    if (current.models.length === 0) {
+      await server.store.setSettings({ ...current, models: [{ ...DEFAULT_PROFILE }], activeModelId: DEFAULT_PROFILE.id });
+    }
     await seedDemoWorkspace(workspace);
     const existing = await server.store.listThreads();
     if (!existing.some((thread) => thread.id === 'thr_demo_northwind')) {

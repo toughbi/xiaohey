@@ -1,6 +1,6 @@
 /**
- * Render the app icon set from one SVG: a black tile whose eyes carry the face.
- * Run with:  node scripts/icons.mjs
+ * Render the app icon set from one SVG: a black tile with two cream eyes,
+ * a vertical bar and a `<` chevron. Run with:  node scripts/icons.mjs
  */
 import { _electron } from 'playwright-core';
 import { mkdir, writeFile } from 'node:fs/promises';
@@ -12,8 +12,12 @@ const outDir = pjoin(root, 'build', 'icons');
 const SIZES = [16, 24, 32, 48, 64, 128, 256, 512];
 
 function iconSvg(size) {
-  const stroke = size <= 32 ? 56 : 48;
-  const cursor = size <= 32 ? 52 : 46;
+  const small = size <= 32;
+  const stroke = small ? 56 : 48;
+  const barWidth = small ? 56 : 48;
+  const barHeight = small ? 168 : 160;
+  const barX = 161 - barWidth / 2;
+  const barY = 256 - barHeight / 2;
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 512 512">
   <defs>
     <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
@@ -28,10 +32,8 @@ function iconSvg(size) {
   </defs>
   <rect width="512" height="512" rx="104" fill="url(#tile)"/>
   <rect width="512" height="512" rx="104" fill="url(#sheen)"/>
-  <g fill="none" stroke="#f7ead9" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M164 186 L258 256 L164 326" stroke-width="${stroke}"/>
-    <path d="M276 326 H362" stroke-width="${cursor}"/>
-  </g>
+  <rect x="${barX}" y="${barY}" width="${barWidth}" height="${barHeight}" rx="${barWidth / 2}" fill="#f7ead9"/>
+  <path d="M351 200 L257 256 L351 312" fill="none" stroke="#f7ead9" stroke-width="${stroke}" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>`;
 }
 

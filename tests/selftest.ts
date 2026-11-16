@@ -183,6 +183,7 @@ async function main(): Promise<void> {
       workspace: dir,
       shell: async () => ({ code: 0, stdout: 'ok', stderr: '', durationMs: 1 }),
       approve: async () => 'allow_once' as const,
+      ask: async () => ({ answer: 'ok', cancelled: false }),
       remember: async () => ({ kind: 'distinct', note: '' }),
       setPlan: async () => undefined,
       markTouched: () => undefined,
@@ -206,6 +207,7 @@ async function main(): Promise<void> {
       threadId: 'thr', turnId: 'trn', workspace: dir,
       shell: async () => ({ code: 0, stdout: '', stderr: '', durationMs: 1 }),
       approve: async () => 'allow_once' as const,
+      ask: async () => ({ answer: 'ok', cancelled: false }),
       remember: async () => ({ kind: 'distinct', note: '' }),
       setPlan: async () => undefined, markTouched: () => undefined, evidence: () => undefined,
     };
@@ -226,7 +228,39 @@ async function main(): Promise<void> {
     assert.equal(failure?.layer, 'L2-schema');
     assert.match(failure!.hint, /path/);
     assert.match(failure!.hint, /One valid example/);
-    assert.ok(tools.length >= 9);
+    assert.ok(tools.length >= 10);
+  });
+
+  await test('ask_user normalizes options and returns the answer to the model', async () => {
+    const dir = await workspace();
+    const asked: Array<{ question: string; options: Array<{ label: string; description?: string }> }> = [];
+    const ctx = {
+      threadId: 'thr', turnId: 'trn', workspace: dir,
+      shell: async () => ({ code: 0, stdout: '', stderr: '', durationMs: 1 }),
+      approve: async () => 'allow_once' as const,
+      ask: async (request: { header: string; question: string; options: Array<{ label: string; description?: string }> }) => {
+        asked.push(request);
+        return { answer: '方案 B', cancelled: false };
+      },
+      remember: async () => ({ kind: 'distinct', note: '' }),
+      setPlan: async () => undefined, markTouched: () => undefined, evidence: () => undefined,
+    };
+    const tool = toolByName.get('ask_user')!;
+    const outcome = await tool.run(ctx, {
+      header: '选择方案',
+      question: '用哪个方案？',
+      options: ['方案 A', { label: '方案 B', description: '更稳' }, '方案 B'],
+    });
+    assert.equal(outcome.ok, true);
+    assert.equal(asked.length, 1);
+    assert.equal(asked[0].question, '用哪个方案？');
+    assert.deepEqual(asked[0].options, [{ label: '方案 A' }, { label: '方案 B', description: '更稳' }]);
+    assert.match(outcome.ok ? outcome.output : '', /方案 B/);
+
+    const tooFew = await tool.run(ctx, { question: '选一个', options: ['只有一个'] });
+    assert.equal(tooFew.ok, false);
+    if (!tooFew.ok) assert.match(tooFew.summary, /2–4/);
+    await rm(dir, { recursive: true, force: true });
   });
 
   await test('broken JSON arguments are repaired or reported as L1', () => {
