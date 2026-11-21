@@ -1,9 +1,9 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
-import type { Item, Thread } from '../shared/types.js';
+import type { ChangeStats, Item, Thread } from '../shared/types.js';
 import type { ThreadDoc } from './store.js';
-import { Checkpoints } from './runtime/checkpoint.js';
+import { Checkpoints, countLineDiff } from './runtime/checkpoint.js';
 import { buildContract } from './runtime/contract.js';
 import { emptyState } from './store.js';
 import { uid } from './util.js';
@@ -154,6 +154,16 @@ export async function applyDemoEdits(workspace: string): Promise<void> {
   }
 }
 
+/** Same line-count rule the runtime uses, so the demo card and the diff agree. */
+function demoChangeStats(): ChangeStats {
+  const { additions, deletions } = countLineDiff(FILES['app/page.tsx'], AFTER['app/page.tsx']);
+  return {
+    additions,
+    deletions,
+    files: [{ path: 'app/page.tsx', additions, deletions }],
+  };
+}
+
 export async function buildDemoDoc(home: string, workspace: string): Promise<ThreadDoc> {
   const now = Date.now();
   const thread: Thread = {
@@ -236,11 +246,7 @@ export async function buildDemoDoc(home: string, workspace: string): Promise<Thr
   push({
     id: uid('itm'), threadId: thread.id, turnId, kind: 'checkpoint', at: at(30), status: 'done', step: 4,
     label: 'edit_file app/page.tsx', snapshotId: 'step-004', filesTouched: ['app/page.tsx'], additiveOnly: false,
-    changeStats: {
-      additions: 26,
-      deletions: 14,
-      files: [{ path: 'app/page.tsx', additions: 26, deletions: 14 }],
-    },
+    changeStats: demoChangeStats(),
   });
 
   push({
@@ -367,11 +373,7 @@ export async function captureDemoSnapshot(home: string, doc: ThreadDoc): Promise
   doc.snapshots = [
     {
       ...meta,
-      changeStats: {
-        additions: 26,
-        deletions: 14,
-        files: [{ path: 'app/page.tsx', additions: 26, deletions: 14 }],
-      },
+      changeStats: demoChangeStats(),
     },
   ];
 }

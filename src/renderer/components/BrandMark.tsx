@@ -15,7 +15,7 @@ interface BrandMarkProps {
 /**
  * The mark is a black tile with two eyes: a vertical bar and a `<` chevron.
  * Hover widens the bar and nudges the chevron, pressing dips the glyph, and
- * the bar blinks on its own when the mark is left alone.
+ * the chevron blinks on its own at random intervals when the mark is left alone.
  */
 export function BrandMark({ size = 20, className = '', expression, interactive = true, title = 'xiaohey' }: BrandMarkProps) {
   const [hover, setHover] = useState(false);
@@ -25,12 +25,19 @@ export function BrandMark({ size = 20, className = '', expression, interactive =
 
   useEffect(() => {
     if (!interactive || expression) return;
+    // Uneven beats: a quick double-take now and then, a longer pause later.
+    const pause = (): number => {
+      const roll = Math.random();
+      if (roll < 0.35) return 1800 + Math.random() * 1400;
+      if (roll < 0.8) return 3200 + Math.random() * 3300;
+      return 6500 + Math.random() * 5500;
+    };
     const schedule = (): void => {
       timer.current = window.setTimeout(() => {
         setBlink(true);
-        window.setTimeout(() => setBlink(false), 520);
+        window.setTimeout(() => setBlink(false), 360 + Math.random() * 320);
         schedule();
-      }, 3600 + Math.random() * 2600);
+      }, pause());
     };
     schedule();
     return () => {

@@ -31,7 +31,15 @@ interface SettingsViewProps {
   onClose: () => void;
   onSave: (settings: Settings) => Promise<void>;
   onTest: (model: ModelProfile) => Promise<{ ok: boolean; detail: string; latencyMs: number }>;
-  onListModels: (baseUrl: string, apiKey: string) => Promise<{ ok: boolean; models: string[]; detail: string }>;
+  onListModels: (
+    baseUrl: string,
+    apiKey: string,
+  ) => Promise<{
+    ok: boolean;
+    models: string[];
+    limits: Record<string, { contextWindow?: number; maxOutputTokens?: number }>;
+    detail: string;
+  }>;
   onOpenExternal: (url: string) => void;
   onTheme: (theme: 'dark' | 'light') => void;
 }

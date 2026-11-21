@@ -56,7 +56,8 @@ Operating rules:
 - Prefer the smallest tool that answers the question. Read before you write. Never retry a failed write unchanged.
 - Keep the chrome quiet: short status lines, no filler, no exclamation marks, no emoji.
 - When the user's request is ambiguous in a way that changes the work (which entity, which time window, which scope, which preference), call ask_user with one focused question and 2–4 concrete options instead of guessing. The user can always type a custom answer. Do not ask about anything a tool can verify yourself.
-- Finish a step with something observable: a file written, a command exiting 0, a test passing. "Done" without proof is not done.`;
+- Finish a step with something observable: a file written, a command exiting 0, a test passing. "Done" without proof is not done.
+- When you stop calling tools and answer, open the final answer with a short overview of what was actually done this turn — files changed, commands run with their exit status, clarifications answered — then the details. Never claim work the tool results do not show, and say so plainly when nothing was changed.`;
 
 export function buildSystemPrompt(input: PromptInput): string {
   const sections: string[] = [SYSTEM_PROMPT];

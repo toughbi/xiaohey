@@ -43,8 +43,9 @@ export const DEFAULT_PROFILE = {
   apiKey: '',
   model: 'deepseek-chat',
   temperature: 0.4,
-  maxOutputTokens: 4096,
-  contextWindow: 131_072,
+  maxOutputTokens: 0,
+  contextWindow: 0,
+  reasoningEffort: 'default',
 } as const;
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -91,14 +92,26 @@ export function normalizeSettings(raw: unknown): Settings {
       model: typeof profile.model === 'string' && profile.model.trim() ? profile.model : DEFAULT_PROFILE.model,
       temperature: typeof profile.temperature === 'number' ? profile.temperature : DEFAULT_PROFILE.temperature,
       maxOutputTokens:
-        typeof profile.maxOutputTokens === 'number' ? profile.maxOutputTokens : DEFAULT_PROFILE.maxOutputTokens,
+        typeof profile.maxOutputTokens === 'number' && profile.maxOutputTokens > 0 ? profile.maxOutputTokens : 0,
       contextWindow:
-        typeof profile.contextWindow === 'number' ? profile.contextWindow : DEFAULT_PROFILE.contextWindow,
+        typeof profile.contextWindow === 'number' && profile.contextWindow > 0 ? profile.contextWindow : 0,
+      reasoningEffort:
+        profile.reasoningEffort === 'low' ||
+        profile.reasoningEffort === 'medium' ||
+        profile.reasoningEffort === 'high'
+          ? profile.reasoningEffort
+          : 'default',
       ...(typeof profile.provider === 'string' && profile.provider.trim()
         ? { provider: profile.provider.trim() }
         : {}),
       ...(typeof profile.enabled === 'boolean' ? { enabled: profile.enabled } : {}),
       ...(profile.billing === 'plan' || profile.billing === 'payg' ? { billing: profile.billing } : {}),
+      ...(profile.contextWindowSource === 'metadata' || profile.contextWindowSource === 'user'
+        ? { contextWindowSource: profile.contextWindowSource }
+        : {}),
+      ...(profile.maxOutputTokensSource === 'metadata' || profile.maxOutputTokensSource === 'user'
+        ? { maxOutputTokensSource: profile.maxOutputTokensSource }
+        : {}),
     };
   };
 

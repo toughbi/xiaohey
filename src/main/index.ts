@@ -69,7 +69,7 @@ async function bootstrap(): Promise<void> {
     minWidth: 1120,
     minHeight: 700,
     show: false,
-    backgroundColor: '#f7f3ec',
+    backgroundColor: '#fdfefd',
     autoHideMenuBar: true,
     title: 'xiaohey',
     frame: false,
@@ -127,7 +127,7 @@ ipcMain.handle('xiaohey:request', async (_event, method: string, params: unknown
 /** Keep the caption-button strip in the same tone as the canvas. */
 ipcMain.handle('xiaohey:theme', (_event, theme: 'light' | 'dark') => {
   if (!win || win.isDestroyed()) return { ok: false };
-  win.setBackgroundColor(theme === 'dark' ? '#141210' : '#f7f3ec');
+  win.setBackgroundColor(theme === 'dark' ? '#141210' : '#fdfefd');
   return { ok: true };
 });
 

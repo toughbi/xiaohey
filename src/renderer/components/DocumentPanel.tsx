@@ -190,7 +190,7 @@ export function DocumentPanel(props: DocumentPanelProps) {
                   <CopyButton text={doc.content} label="复制文件内容" className="tiny-copy" />
                 </span>
               </div>
-              {diff && (diff.additions > 0 || diff.deletions > 0) ? (
+              {diff && (view === 'diff' || diff.additions > 0 || diff.deletions > 0) ? (
                 <div className="segmented">
                   <button type="button" className={view === 'source' ? 'active' : ''} onClick={() => onView('source')}>
                     原文

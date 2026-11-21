@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
-  CircleAlert,
   Loader2,
   MoreHorizontal,
   PanelLeft,
   PanelRight,
   RotateCcw,
+  TriangleAlert,
 } from 'lucide-react';
 import type {
   ActivityResult,
@@ -18,6 +18,7 @@ import type {
   FileEntry,
   Item,
   MemoryFact,
+  ModelProfile,
   PlanItem,
   PlanStep,
   RuntimeEvent,
@@ -48,7 +49,7 @@ const PHASE_LABEL: Record<RuntimeStatus['phase'], string> = {
   approval: '等待许可',
   question: '等待回答',
   compacting: '折叠上下文',
-  error: '出错',
+  error: '失败',
 };
 
 /** Splitter bounds: the docs panel may shrink to a rail, never below a readable column. */
@@ -71,6 +72,10 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [gauge, setGauge] = useState<ContextGauge | null>(null);
   const [approval, setApproval] = useState<ApprovalRequest | null>(null);
+  /** Approvals belong to a thread; switching away must not lose the request. */
+  const pendingApprovals = useRef<Record<string, ApprovalRequest>>({});
+  /** Threads we asked to stop; late approval events must not reopen the card. */
+  const stopping = useRef<Set<string>>(new Set());
 
   const [tab, setTab] = useState<DocTab>('files');
   const [dir, setDir] = useState('.');
@@ -135,6 +140,9 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
   const [queueMode, setQueueMode] = useState<'queue' | 'insert'>('queue');
   const [workspaceMenuRequest, setWorkspaceMenuRequest] = useState<{ id: number; rect: { left: number; top: number; bottom: number } } | null>(null);
   const dockRef = useRef<HTMLDivElement | null>(null);
+  /** A revert reloads the thread; sending before it lands would race it. */
+  const openingThread = useRef<Promise<boolean> | null>(null);
+  const reverting = useRef<Promise<void> | null>(null);
   const [dockHeight, setDockHeight] = useState(0);
   const [dockGap, setDockGap] = useState(38);
 
@@ -233,34 +241,60 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
     (event: RuntimeEvent) => {
       switch (event.type) {
         case 'item/upsert':
+          // A turn in another thread keeps emitting while we look at this one.
+          // Its items must never leak into the open transcript.
+          if (event.item.threadId !== activeId) return;
           mergeItem(event.item);
           if (event.item.kind === 'plan') setPlan(event.item.steps);
           break;
         case 'turn/updated':
+          if (event.turn.status !== 'running') {
+            stopping.current.delete(event.turn.threadId);
+            delete pendingApprovals.current[event.turn.threadId];
+            if (event.turn.threadId === activeId) setApproval(null);
+          }
+          if (event.turn.threadId !== activeId) return;
           setTurn(event.turn);
           if (event.turn.status !== 'running') {
-            setApproval(null);
+            if (event.turn.status === 'cancelled') {
+              setItems((current) =>
+                current.map((item) => {
+                  if (item.turnId !== event.turn.id || item.status !== 'running') return item;
+                  if (item.kind === 'approval') return { ...item, status: 'cancelled', decision: 'deny' };
+                  if (item.kind === 'tool_call' || item.kind === 'question') return { ...item, status: 'cancelled' };
+                  return item;
+                }),
+              );
+            }
             window.setTimeout(() => void refreshSide(), 250);
           }
           break;
         case 'thread/updated':
-          setThread((current) => (current && current.id === event.thread.id ? event.thread : current));
           setThreads((current) => current.map((entry) => (entry.id === event.thread.id ? event.thread : entry)));
+          if (event.thread.id === activeId) setThread(event.thread);
           break;
         case 'thread/list':
           setThreads(event.threads);
           break;
         case 'runtime/updated':
+          if (event.runtime.threadId !== activeId) return;
           setRuntime(event.runtime);
           setGauge(event.context);
           break;
         case 'approval/requested':
-          setApproval(event.approval);
+          if (stopping.current.has(event.approval.threadId)) {
+            void call('approval/respond', { approvalId: event.approval.id, decision: 'deny' }).catch(() => undefined);
+            return;
+          }
+          pendingApprovals.current[event.approval.threadId] = event.approval;
+          if (event.approval.threadId === activeId) setApproval(event.approval);
           break;
         case 'memory/updated':
+          if (event.threadId !== activeId) return;
           setMemory(event.facts);
           break;
         case 'snapshot/updated':
+          if (event.threadId !== activeId) return;
           setSnapshots(event.snapshots);
           break;
         case 'settings/updated':
@@ -270,15 +304,21 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
           break;
       }
     },
-    [mergeItem, refreshSide],
+    [activeId, mergeItem, refreshSide],
   );
 
-  const openFile = async (path: string, threadId = activeId, mode: 'source' | 'diff' = 'source'): Promise<void> => {
+  const openFile = async (
+    path: string,
+    threadId = activeId,
+    mode: 'source' | 'diff' = 'source',
+    snapshotId?: string,
+    quiet = false,
+  ): Promise<void> => {
     if (!threadId) return;
     try {
       const [document, delta] = await Promise.all([
         call('fs/read', { threadId, path }),
-        call('fs/diff', { threadId, path }).catch(() => null),
+        call('fs/diff', { threadId, path, ...(snapshotId ? { snapshotId } : {}) }).catch(() => null),
       ]);
       setDoc(document);
       setDiff(delta);
@@ -286,18 +326,25 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
       setTab('preview');
       setDocsOpen(true);
     } catch (reason) {
-      setError((reason as Error).message);
+      const message = (reason as Error).message;
+      // The thread can be deleted while its document request is in flight, and
+      // a best-effort auto-open of the last touched file can point at a file
+      // that has since been moved or deleted. Neither should raise a banner.
+      if (!quiet && !/unknown thread|unknown session/i.test(message)) {
+        setError(/ENOENT/i.test(message) ? `文件不存在或已被移动：${path}` : message);
+      }
     }
   };
 
-  const openThread = async (threadId: string): Promise<void> => {
+  const openThreadInner = async (threadId: string): Promise<boolean> => {
     try {
       const opened = await call('thread/open', { threadId });
       setActiveId(threadId);
       setThread(opened.thread);
       setItems(opened.items);
+      stickToBottom.current = true;
       setTurn(opened.turn ?? null);
-      setApproval(null);
+      setApproval(pendingApprovals.current[threadId] ?? null);
       setError(null);
       setRuntime(null);
       setContract(opened.contract);
@@ -323,11 +370,30 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
           .reverse()
           .find((item) => item.kind === 'tool_result' && item.files && item.files.length > 0);
         if (lastFile && lastFile.kind === 'tool_result' && lastFile.files?.[0]) {
-          void openFile(lastFile.files[0], threadId);
+          void openFile(lastFile.files[0], threadId, 'source', undefined, true);
         }
       }
+      return true;
     } catch (reason) {
-      setError((reason as Error).message);
+      const message = (reason as Error).message;
+      // A thread can disappear between listing it and opening it (deletion
+      // racing a click). Prune the stale row instead of showing an error.
+      if (/unknown thread|unknown session/i.test(message)) {
+        setThreads((current) => current.filter((entry) => entry.id !== threadId));
+        return false;
+      }
+      setError(message);
+      return false;
+    }
+  };
+
+  const openThread = async (threadId: string): Promise<boolean> => {
+    const run = openThreadInner(threadId);
+    openingThread.current = run;
+    try {
+      return await run;
+    } finally {
+      if (openingThread.current === run) openingThread.current = null;
     }
   };
 
@@ -363,26 +429,48 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
 
   useEffect(() => subscribe(handleEvent), [handleEvent]);
 
+  useLayoutEffect(() => {
+    const node = scroller.current;
+    if (!node) return;
+    // Never fight the reader: once they scroll up, new deltas keep arriving
+    // below the viewport until they return to the bottom (or press 回到最新).
+    // Layout effect so the scroll lands before the new frame is painted; a
+    // post-paint scroll makes every delta flash the previous position.
+    if (stickToBottom.current) node.scrollTop = node.scrollHeight;
+    // `turn` rides along because the close of a turn rewrites the block (the
+    // status row settles, narration folds) without touching `items`.
+  }, [items, turn]);
+
+  // The dock can grow mid-turn (task list, queued messages) or just after a
+  // turn ends (the plan arrives on the last step). Keep the tail clear only
+  // when the reader is still anchored to the bottom.
+  useLayoutEffect(() => {
+    const node = scroller.current;
+    if (!node) return;
+    if (stickToBottom.current) node.scrollTop = node.scrollHeight;
+  }, [dockHeight]);
+
+  // A reflow makes the content taller without touching `items` or `dockHeight`:
+  // the window resizes, the docs panel takes width away, a font swaps in. The
+  // old scrollTop then sits above the new bottom and the answer's tail slides
+  // under the glass dock — the one case the item/dock effects cannot see.
+  // Watch the scroller's own box only: its width/height changes exactly when a
+  // reflow can move the tail, while expanding a fold (height-only content
+  // change) must not scroll the reader away.
   useEffect(() => {
     const node = scroller.current;
     if (!node) return;
-    // While a reply streams, keep its tail above the composer even if the
-    // reader scrolled up earlier. Once the turn is idle, scrolling is free and
-    // the glass dock may cover the bottom of the transcript.
-    if (running) {
-      stickToBottom.current = true;
-      node.scrollTop = node.scrollHeight;
-      return;
-    }
-    if (stickToBottom.current) node.scrollTop = node.scrollHeight;
-  }, [items, running]);
-
-  // The dock can grow mid-turn (task list, queued messages); keep the tail clear.
-  useEffect(() => {
-    if (!running) return;
-    const node = scroller.current;
-    if (node) node.scrollTop = node.scrollHeight;
-  }, [dockHeight, running]);
+    const stick = (): void => {
+      if (stickToBottom.current) node.scrollTop = node.scrollHeight;
+    };
+    const observer = new ResizeObserver(stick);
+    observer.observe(node);
+    window.addEventListener('resize', stick);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('resize', stick);
+    };
+  }, []);
 
   const navigate = async (path: string): Promise<void> => {
     if (!activeId) return;
@@ -426,7 +514,11 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
         threadId = created.id;
       }
       const attachments = [...text.matchAll(/@([^\s@]+)/g)].map((match) => match[1]);
-      await call('turn/start', { threadId, prompt: text, ...(attachments.length > 0 ? { attachments } : {}) });
+      if (reverting.current) await reverting.current;
+      if (openingThread.current) await openingThread.current;
+      const started = await call('turn/start', { threadId, prompt: text, ...(attachments.length > 0 ? { attachments } : {}) });
+      stopping.current.delete(threadId);
+      setTurn(started);
       return true;
     } catch (reason) {
       setError((reason as Error).message);
@@ -443,10 +535,19 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
    */
   const stopTurn = async (): Promise<void> => {
     if (!activeId) return;
+    const threadId = activeId;
+    stopping.current.add(threadId);
+    delete pendingApprovals.current[threadId];
+    setApproval(null);
+    window.setTimeout(() => stopping.current.delete(threadId), 8000);
     try {
-      const result = await call('turn/cancel', { threadId: activeId });
-      if (!result.ok) await openThread(activeId);
+      const result = await call('turn/cancel', { threadId });
+      if (!result.ok) {
+        stopping.current.delete(threadId);
+        await openThread(threadId);
+      }
     } catch (reason) {
+      stopping.current.delete(threadId);
       setError((reason as Error).message);
     }
   };
@@ -500,6 +601,7 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
   };
 
   const approve = async (approvalId: string, decision: 'allow_once' | 'allow_always' | 'deny'): Promise<void> => {
+    if (approval) delete pendingApprovals.current[approval.threadId];
     setApproval(null);
     await call('approval/respond', { approvalId, decision });
   };
@@ -523,7 +625,7 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
     }
   };
 
-  /** Open (or create) a folder as a workspace and start a session inside it. */
+  /** Open a workspace that is already in history: its latest session, or a new one. */
   const openWorkspace = async (path: string): Promise<void> => {
     try {
       // A session created with "不指定工作区" adopts the first folder picked.
@@ -532,10 +634,6 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
         setThreads((current) => current.map((entry) => (entry.id === updated.id ? updated : entry)));
         setThread(updated);
         setWorkspacePrompt(false);
-        if (settings) {
-          const recent = [path, ...(settings.recentWorkspaces ?? []).filter((entry) => entry !== path)].slice(0, 8);
-          setSettings(await call('settings/set', { ...settings, recentWorkspaces: recent }));
-        }
         setToast(`已选择工作区：${path.split(/[\\/]/).filter(Boolean).pop() ?? path}`);
         return;
       }
@@ -544,21 +642,45 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
         .sort((left, right) => right.updatedAt - left.updatedAt)[0];
       if (existing) {
         await openThread(existing.id);
-        if (settings) {
-          const recent = [path, ...(settings.recentWorkspaces ?? []).filter((entry) => entry !== path)].slice(0, 8);
-          setSettings(await call('settings/set', { ...settings, recentWorkspaces: recent }));
-        }
         setToast(`已切换到：${path.split(/[\\/]/).filter(Boolean).pop() ?? path}`);
         return;
       }
       const created = await call('thread/create', { title: 'New session', workspace: path });
       setThreads((current) => (current.some((entry) => entry.id === created.id) ? current : [created, ...current]));
       await openThread(created.id);
-      if (settings) {
-        const recent = [path, ...(settings.recentWorkspaces ?? []).filter((entry) => entry !== path)].slice(0, 8);
-        setSettings(await call('settings/set', { ...settings, recentWorkspaces: recent }));
-      }
       setToast(`已打开工作区：${path.split(/[\\/]/).filter(Boolean).pop() ?? path}`);
+    } catch (reason) {
+      setError((reason as Error).message);
+    }
+  };
+
+  /**
+   * "新建工作区" means a new entry in the workspace history. Picking a folder
+   * opens a fresh session there instead of reusing the session the old
+   * workspace happened to be showing, so the rail gains a row rather than just
+   * swapping its label.
+   */
+  const createWorkspace = async (path: string): Promise<void> => {
+    try {
+      if (thread && !thread.cwd) {
+        // The current session is still waiting for a folder; bind it instead of
+        // leaving an empty session behind.
+        await openWorkspace(path);
+        return;
+      }
+      const created = await call('thread/create', { title: 'New session', workspace: path });
+      setThreads((current) => (current.some((entry) => entry.id === created.id) ? current : [created, ...current]));
+      await openThread(created.id);
+      setToast(`已新建工作区：${path.split(/[\\/]/).filter(Boolean).pop() ?? path}`);
+    } catch (reason) {
+      setError((reason as Error).message);
+    }
+  };
+
+  const pickNewWorkspace = async (): Promise<void> => {
+    try {
+      const picked = await call('workspace/pick', {});
+      if (picked.path) await createWorkspace(picked.path);
     } catch (reason) {
       setError((reason as Error).message);
     }
@@ -579,7 +701,7 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
   const newSessionInWorkspace = async (path: string): Promise<void> => {
     try {
       if (!path) {
-        await pickWorkspace();
+        await newSession();
         return;
       }
       const created = await call('thread/create', { title: 'New session', workspace: path });
@@ -609,16 +731,41 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
     }
   };
 
-  const forgetWorkspace = async (path: string): Promise<void> => {
+  const deleteWorkspace = async (path: string): Promise<void> => {
+    try {
+      const activeHere = Boolean(thread && thread.cwd === path);
+      const result = await call('workspace/delete', { path });
+      const remaining = threads.filter((entry) => entry.cwd !== path);
+      if (activeHere) {
+        setThreads(remaining);
+        if (remaining[0]) {
+          await openThread(remaining[0].id);
+        } else {
+          setActiveId(null);
+          setThread(null);
+          setItems([]);
+          setTurn(null);
+          setPlan([]);
+          setDoc(null);
+          setDiff(null);
+          setRuntime(null);
+          setWorkspacePrompt(false);
+        }
+      }
+      setToast(result.deleted > 0 ? `已删除工作区及 ${result.deleted} 个会话` : '已删除工作区');
+    } catch (reason) {
+      setError((reason as Error).message);
+    }
+  };
+
+  const updateModel = async (id: string, patch: Partial<ModelProfile>): Promise<void> => {
     try {
       const current = settings ?? (await call('settings/get', {}));
-      setSettings(
-        await call('settings/set', {
-          ...current,
-          recentWorkspaces: (current.recentWorkspaces ?? []).filter((entry) => entry !== path),
-        }),
-      );
-      setToast('已从工作区列表移除');
+      const saved = await call('settings/set', {
+        ...current,
+        models: current.models.map((model) => (model.id === id ? { ...model, ...patch } : model)),
+      });
+      setSettings(saved);
     } catch (reason) {
       setError((reason as Error).message);
     }
@@ -679,7 +826,7 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
     await send(thread.lastPrompt);
   };
 
-  const revert = async (snapshotId: string): Promise<void> => {
+  const revertInner = async (snapshotId: string): Promise<void> => {
     if (!activeId) return;
     const result = await call('snapshot/revert', { threadId: activeId, snapshotId });
     if (!result.ok) {
@@ -692,6 +839,16 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
     requestAnimationFrame(() => {
       if (scroller.current) scroller.current.scrollTop = scroller.current.scrollHeight;
     });
+  };
+
+  const revert = async (snapshotId: string): Promise<void> => {
+    const run = revertInner(snapshotId);
+    reverting.current = run;
+    try {
+      await run;
+    } finally {
+      if (reverting.current === run) reverting.current = null;
+    }
   };
 
   const deleteMemory = async (slot: string): Promise<void> => {
@@ -755,18 +912,35 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
 
   const removeThread = async (threadId: string | null = activeId): Promise<void> => {
     if (!threadId) return;
-    await call('thread/delete', { threadId });
+    try {
+      await call('thread/delete', { threadId });
+    } catch (reason) {
+      setError((reason as Error).message);
+      return;
+    }
     setConfirmDelete(false);
     setMenuOpen(false);
-    const remaining = threads.filter((entry) => entry.id !== threadId);
+    let remaining: Thread[];
+    try {
+      remaining = (await call('thread/list', {})).filter((entry) => entry.id !== threadId);
+    } catch {
+      remaining = threads.filter((entry) => entry.id !== threadId);
+    }
     setThreads(remaining);
     if (threadId !== activeId) return;
-    if (remaining[0]) await openThread(remaining[0].id);
-    else {
-      setActiveId(null);
-      setThread(null);
-      setItems([]);
+    // Open the first survivor that still exists; a stale row is pruned by
+    // openThread and the loop moves on.
+    for (const entry of remaining) {
+      if (await openThread(entry.id)) return;
     }
+    setActiveId(null);
+    setThread(null);
+    setItems([]);
+    setTurn(null);
+    setPlan([]);
+    setDoc(null);
+    setDiff(null);
+    setRuntime(null);
   };
 
   /** Rename from the rail: bring the thread into view, then edit its title. */
@@ -832,17 +1006,8 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
     }).catch(() => undefined);
   }, [thread?.status, thread?.title]);
 
-  // The docked task list only reflects the turn in flight; the fold keeps the
-  // historical plan after the turn ends.
-  const taskSteps = useMemo(() => {
-    if (!running || !turn) return [];
-    for (let index = items.length - 1; index >= 0; index -= 1) {
-      const item = items[index];
-      if (item.kind === 'plan' && item.turnId === turn.id) return item.steps;
-    }
-    return [];
-  }, [items, running, turn]);
-
+  // The docked task list reflects the thread's latest plan and stays until the
+  // user opens another conversation; only the spinner depends on the live turn.
   // A pending clarification is docked above the composer; once answered it
   // settles into the transcript.
   const pendingQuestion = useMemo(() => {
@@ -853,6 +1018,17 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
     }
     return null;
   }, [items, running, turn]);
+
+  // A plan belongs to the turn that produced it. A new turn hides the previous
+  // list until this turn's todo_write arrives.
+  const taskSteps = useMemo(() => {
+    if (!turn) return [];
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      const item = items[index];
+      if (item.kind === 'plan' && item.turnId === turn.id) return item.steps;
+    }
+    return [];
+  }, [items, turn]);
 
   const minimapTurns = useMemo(() => {
     const plain = (text: string): string =>
@@ -973,8 +1149,7 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
           width={railWidth}
           threads={threads}
           activeId={activeId}
-          workspace={workspace}
-          workspacePath={thread ? thread.cwd : workspaceInfo?.path ?? workspace}
+          workspacePath={thread ? thread.cwd : ''}
           workspaces={settings?.recentWorkspaces ?? []}
           defaultWorkspace={defaultWorkspace}
           onOpenDefault={() => void openNoWorkspace()}
@@ -982,8 +1157,8 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
           onNewInWorkspace={(path) => void newSessionInWorkspace(path)}
           onRenameWorkspace={(path, name) => void renameWorkspace(path, name)}
           onRevealWorkspace={(path) => void revealWorkspace(path)}
-          onForgetWorkspace={(path) => void forgetWorkspace(path)}
-          onPickWorkspace={() => void pickWorkspace()}
+          onDeleteWorkspace={(path) => void deleteWorkspace(path)}
+          onNewWorkspace={() => void pickNewWorkspace()}
           onOpenWorkspace={(path) => void openWorkspace(path)}
           model={activeModel?.model ?? '—'}
           user={user || '本机用户'}
@@ -1077,7 +1252,7 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
             {runtime && runtime.phase !== 'idle' ? (
               <span className={`phase ${runtime.phase === 'error' ? 'phase-error' : ''}`}>
                 {runtime.phase === 'error' ? (
-                  <CircleAlert size={12} strokeWidth={1.8} />
+                  <TriangleAlert size={12} strokeWidth={1.8} />
                 ) : (
                   <Loader2 size={12} strokeWidth={2} className="spin" />
                 )}
@@ -1126,7 +1301,7 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
 
         {error ? (
           <div className="banner">
-            <CircleAlert size={15} strokeWidth={1.6} />
+            <TriangleAlert size={15} strokeWidth={1.6} />
             <span>{error}</span>
             <button type="button" className="ghost small" onClick={() => setError(null)}>
               知道了
@@ -1143,7 +1318,7 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
             onScroll={(event) => {
               const node = event.currentTarget;
               const distance = node.scrollHeight - node.scrollTop - node.clientHeight;
-              stickToBottom.current = distance < 80;
+              stickToBottom.current = distance < 32;
               setShowJump(distance > 240);
             }}
           >
@@ -1173,7 +1348,7 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
                 now={now}
                 onRevert={(id) => void revert(id)}
                 onOpenPath={(path) => void openFile(path)}
-                onReview={(path) => void openFile(path, activeId, 'diff')}
+                onReview={(path, snapshotId) => void openFile(path, activeId, 'diff', snapshotId)}
                 onAnswerQuestion={answerQuestion}
               />
             )}
@@ -1221,7 +1396,11 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
           onSendNow={sendQueuedNow}
         />
 
-        <TaskList steps={taskSteps} />
+        <TaskList
+          key={`${activeId ?? 'none'}:${turn?.id ?? 'none'}`}
+          steps={taskSteps}
+          live={Boolean(running)}
+        />
 
         {pendingQuestion ? <QuestionCard item={pendingQuestion} onAnswer={answerQuestion} /> : null}
 
@@ -1262,6 +1441,7 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
           threadId={activeId}
           onPolicy={(policy) => void changePolicy(policy)}
           onSelectModel={(id) => void selectModel(id)}
+          onUpdateModel={(id, patch) => void updateModel(id, patch)}
           onOpenFiles={() => {
             setTab('files');
             setDocsOpen(true);

@@ -1,10 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Check, ChevronDown, Eye, EyeOff, Loader2, Maximize2, Minimize2, RefreshCw, X } from 'lucide-react';
 import type { ModelProfile } from '../../shared/types';
-import { BILLING_TYPES, PROVIDER_GROUPS, providerById, type BillingType, type ModelProvider } from '../lib/providers';
+import { PROVIDER_GROUPS, providerById, type ModelProvider } from '../lib/providers';
 import { billingLabel, effectiveProvider, modelTitle } from '../lib/modelLabel';
 
-type ListModels = (baseUrl: string, apiKey: string) => Promise<{ ok: boolean; models: string[]; detail: string }>;
+type ListModels = (
+  baseUrl: string,
+  apiKey: string,
+) => Promise<{
+  ok: boolean;
+  models: string[];
+  limits: Record<string, { contextWindow?: number; maxOutputTokens?: number }>;
+  detail: string;
+}>;
 
 interface ModelEditorProps {
   mode: 'add' | 'edit';
@@ -21,18 +29,35 @@ function newId(index: number): string {
   return `m-${Date.now().toString(36)}-${index}`;
 }
 
-function draftsFrom(provider: ModelProvider, baseUrl: string, models: string[], apiKey: string): ModelProfile[] {
-  return models.map((model, index) => ({
-    id: newId(index),
-    name: model,
-    provider: provider.id,
-    baseUrl: baseUrl || provider.baseUrl,
-    apiKey,
-    model,
-    temperature: 0.4,
-    maxOutputTokens: provider.maxOutputTokens ?? 4096,
-    contextWindow: provider.contextWindow ?? 131_072,
-  }));
+function limitLabel(value: number): string {
+  if (value >= 1_048_576) return `${Math.round((value / 1_048_576) * 10) / 10}M`;
+  return `${Math.round(value / 1024)}K`;
+}
+
+function draftsFrom(
+  provider: ModelProvider,
+  baseUrl: string,
+  models: string[],
+  apiKey: string,
+  limits: Record<string, { contextWindow?: number; maxOutputTokens?: number }> = {},
+): ModelProfile[] {
+  return models.map((model, index) => {
+    const meta = limits[model];
+    return {
+      id: newId(index),
+      name: model,
+      provider: provider.id,
+      baseUrl: baseUrl || provider.baseUrl,
+      apiKey,
+      model,
+      temperature: 0.4,
+      maxOutputTokens: meta?.maxOutputTokens ?? 0,
+      contextWindow: meta?.contextWindow ?? 0,
+      ...(meta?.contextWindow ? { contextWindowSource: 'metadata' as const } : {}),
+      ...(meta?.maxOutputTokens ? { maxOutputTokensSource: 'metadata' as const } : {}),
+      reasoningEffort: 'default',
+    };
+  });
 }
 
 export function ModelEditor({
@@ -49,7 +74,6 @@ export function ModelEditor({
 
   const [providerId, setProviderId] = useState('deepseek');
   const provider = useMemo(() => providerById(providerId), [providerId]);
-  const [billing, setBilling] = useState<BillingType>(BILLING_TYPES[0]);
   const [apiKey, setApiKey] = useState(profile?.apiKey ?? '');
   const [showKey, setShowKey] = useState(false);
   const [customBaseUrl, setCustomBaseUrl] = useState('');
@@ -57,9 +81,9 @@ export function ModelEditor({
   const [collapsed, setCollapsed] = useState(false);
 
   const [providerOpen, setProviderOpen] = useState(false);
-  const [billingOpen, setBillingOpen] = useState(false);
   const [modelsOpen, setModelsOpen] = useState(false);
   const [models, setModels] = useState<string[] | null>(null);
+  const [limits, setLimits] = useState<Record<string, { contextWindow?: number; maxOutputTokens?: number }>>({});
   const [loading, setLoading] = useState(false);
   const [listError, setListError] = useState<string | null>(null);
   const [selected, setSelected] = useState<string[]>([]);
@@ -78,8 +102,9 @@ export function ModelEditor({
         apiKey: '',
         model: '',
         temperature: 0.4,
-        maxOutputTokens: 4096,
-        contextWindow: 65536,
+        maxOutputTokens: 0,
+        contextWindow: 0,
+        reasoningEffort: 'default',
       }
     );
   });
@@ -90,14 +115,12 @@ export function ModelEditor({
 
   const baseUrl = provider.id === 'custom' ? customBaseUrl.trim() : provider.baseUrl;
   const needsKey = provider.id !== 'custom';
-  const billingUrl = provider.id === 'custom' ? '' : billing === 'Token plan' ? provider.billingUrl : provider.apiKeyUrl;
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent): void => {
       if (event.key !== 'Escape') return;
-      if (providerOpen || billingOpen || modelsOpen) {
+      if (providerOpen || modelsOpen) {
         setProviderOpen(false);
-        setBillingOpen(false);
         setModelsOpen(false);
       } else {
         onCancel();
@@ -105,11 +128,12 @@ export function ModelEditor({
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [onCancel, providerOpen, billingOpen, modelsOpen]);
+  }, [onCancel, providerOpen, modelsOpen]);
 
   // A different provider, key or address makes the old list stale.
   useEffect(() => {
     setModels(null);
+    setLimits({});
     setSelected([]);
     setListError(null);
     setModelsOpen(false);
@@ -138,6 +162,7 @@ export function ModelEditor({
         return null;
       }
       setModels(response.models);
+      setLimits(response.limits ?? {});
       setSelected((current) => current.filter((id) => response.models.includes(id)));
       return response.models;
     } catch (error) {
@@ -192,11 +217,10 @@ export function ModelEditor({
     setResult(null);
   };
 
-  const candidates: ModelProfile[] = draftsFrom(provider, baseUrl, chosen, apiKey).map((entry) => ({
+  const candidates: ModelProfile[] = draftsFrom(provider, baseUrl, chosen, apiKey, limits).map((entry) => ({
     ...entry,
     name: customName.trim() || chosen[0],
     enabled: true,
-    billing: billing === 'Token plan' ? 'plan' : 'payg',
   }));
 
   const canSave = editing
@@ -274,7 +298,7 @@ export function ModelEditor({
         </header>
 
         {collapsed ? null : (
-          <div className="dialog-body">
+          <div className={`dialog-body${providerOpen || modelsOpen ? ' menu-open' : ''}`}>
             {editing ? (
               <>
                 <div className="field">
@@ -333,6 +357,57 @@ export function ModelEditor({
                   </div>
                 </div>
 
+                <div className="field">
+                  <span>推理等级</span>
+                  <select
+                    className="field-select"
+                    value={draft.reasoningEffort ?? 'default'}
+                    onChange={(event) =>
+                      editUpdate('reasoningEffort', event.target.value as ModelProfile['reasoningEffort'])
+                    }
+                  >
+                    <option value="default">默认</option>
+                    <option value="low">低</option>
+                    <option value="medium">中</option>
+                    <option value="high">高</option>
+                  </select>
+                  <em>非默认值时作为 reasoning_effort 发送；不支持该参数的接口请保持「默认」。</em>
+                </div>
+
+                {draft.contextWindow > 0 && draft.contextWindowSource ? (
+                  <div className="field">
+                    <span>上下文窗口</span>
+                    <input
+                      type="number"
+                      min={1024}
+                      step={1024}
+                      value={draft.contextWindow}
+                      onChange={(event) => {
+                        editUpdate('contextWindow', Math.max(1024, Number(event.target.value) || 1024));
+                        editUpdate('contextWindowSource', 'user');
+                      }}
+                    />
+                    <em>用于上下文占用和自动折叠的预算，不改变模型本身的上限。</em>
+                  </div>
+                ) : null}
+
+                {draft.maxOutputTokens > 0 && draft.maxOutputTokensSource ? (
+                  <div className="field">
+                    <span>输出上限</span>
+                    <input
+                      type="number"
+                      min={256}
+                      step={256}
+                      value={draft.maxOutputTokens}
+                      onChange={(event) => {
+                        editUpdate('maxOutputTokens', Math.max(256, Number(event.target.value) || 256));
+                        editUpdate('maxOutputTokensSource', 'user');
+                      }}
+                    />
+                    <em>本次请求的 max_tokens，包含推理内容；具体最大值以供应商为准。</em>
+                  </div>
+                ) : null}
+
                 {result && !result.ok ? (
                   <div className="validate-error">
                     <p>{result.detail}</p>
@@ -359,7 +434,6 @@ export function ModelEditor({
                       className="select"
                       onClick={() => {
                         setProviderOpen((open) => !open);
-                        setBillingOpen(false);
                         setModelsOpen(false);
                       }}
                       aria-haspopup="listbox"
@@ -397,55 +471,6 @@ export function ModelEditor({
                             ))}
                           </div>
                         ))}
-                      </div>
-                    ) : null}
-                  </div>
-                </div>
-
-                <div className="field">
-                  <div className="field-head">
-                    <span>类型</span>
-                    {billingUrl ? (
-                      <button type="button" className="field-link" onClick={() => onOpenExternal(billingUrl)}>
-                        {billing === 'Token plan' ? '购买 Token Plan' : '查看计费'}
-                        <span aria-hidden="true">↗</span>
-                      </button>
-                    ) : null}
-                  </div>
-                  <div className="select-wrap">
-                    <button
-                      type="button"
-                      className="select"
-                      onClick={() => {
-                        setBillingOpen((open) => !open);
-                        setProviderOpen(false);
-                        setModelsOpen(false);
-                      }}
-                      aria-haspopup="listbox"
-                      aria-expanded={billingOpen}
-                    >
-                      {billing}
-                      <ChevronDown size={14} strokeWidth={1.7} className="select-chevron" />
-                    </button>
-                    {billingOpen ? (
-                      <div className="select-menu" role="listbox" aria-label="类型">
-                        {BILLING_TYPES.map((option) => (
-                          <button
-                            key={option}
-                            type="button"
-                            role="option"
-                            aria-selected={billing === option}
-                            className={`select-item ${billing === option ? 'active' : ''}`}
-                            onClick={() => {
-                              setBilling(option);
-                              setBillingOpen(false);
-                            }}
-                          >
-                            {option}
-                            {billing === option ? <Check size={14} strokeWidth={1.8} className="select-check" /> : null}
-                          </button>
-                        ))}
-                        <p className="select-note">本机只保存 API Key，计费在供应商那边结算。</p>
                       </div>
                     ) : null}
                   </div>
@@ -530,6 +555,13 @@ export function ModelEditor({
                         </button>
                         {filtered.map((id) => {
                           const checked = selected.includes(id);
+                          const limit = limits[id];
+                          const limitText = [
+                            limit?.contextWindow ? `${limitLabel(limit.contextWindow)} 上下文` : '',
+                            limit?.maxOutputTokens ? `${limitLabel(limit.maxOutputTokens)} 输出` : '',
+                          ]
+                            .filter(Boolean)
+                            .join(' · ');
                           return (
                             <button
                               key={id}
@@ -543,6 +575,7 @@ export function ModelEditor({
                                 {checked ? <Check size={11} strokeWidth={2.4} /> : null}
                               </span>
                               <span className="mono">{id}</span>
+                              {limitText ? <span className="model-limit-hint">{limitText}</span> : null}
                             </button>
                           );
                         })}

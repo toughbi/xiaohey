@@ -1,16 +1,18 @@
 import { useState } from 'react';
-import { ChevronDown, CircleCheck, ListChecks, Loader2 } from 'lucide-react';
+import { ChevronDown, CircleCheck, CircleDot, ListChecks, Loader2 } from 'lucide-react';
 import type { PlanStep } from '../../shared/types';
 
 interface TaskListProps {
   steps: PlanStep[];
+  live: boolean;
 }
 
 /**
- * The live task breakdown, docked right above the composer while a turn runs.
- * Hidden when the model did not split the work into steps.
+ * The task breakdown persists for the thread once the model has produced it:
+ * it stays docked above the composer after the turn ends, until the user opens
+ * another conversation. Only the active-step spinner depends on the live turn.
  */
-export function TaskList({ steps }: TaskListProps) {
+export function TaskList({ steps, live }: TaskListProps) {
   const [collapsed, setCollapsed] = useState(false);
   const visible = steps.filter((step) => step.status !== 'dropped');
   if (visible.length < 2) return null;
@@ -20,7 +22,7 @@ export function TaskList({ steps }: TaskListProps) {
   const pending = visible.filter((step) => step.status === 'pending').length;
   const counts = [
     done > 0 ? `${done} 已完成` : '',
-    active > 0 ? `${active} 进行中` : '',
+    active > 0 ? `${active} ${live ? '进行中' : '未完成'}` : '',
     pending > 0 ? `${pending} 待处理` : '',
   ]
     .filter(Boolean)
@@ -43,7 +45,11 @@ export function TaskList({ steps }: TaskListProps) {
                 {step.status === 'done' ? (
                   <CircleCheck size={13} strokeWidth={1.7} />
                 ) : step.status === 'active' ? (
-                  <Loader2 size={13} strokeWidth={2} className="spin" />
+                  live ? (
+                    <Loader2 size={13} strokeWidth={2} className="spin" />
+                  ) : (
+                    <CircleDot size={13} strokeWidth={1.8} />
+                  )
                 ) : (
                   <span className="task-ring" />
                 )}

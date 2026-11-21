@@ -1,32 +1,34 @@
-/* xiaohey: paper and ink, taken from the app tile (black, cream prompt).
-   Warm neutral ramp, hairline borders, one ink action with cream on top. */
+/* xiaohey: a pale mist canvas with one verdigris action, hairlines, and the
+   wider Monet hues kept for code and data. */
 
 :root {
   color-scheme: light;
-  --canvas: #f7f3ec;
-  --panel: #fffdf9;
+  --canvas: #fdfefd;
+  --panel: #ffffff;
   --rail: transparent;
-  --inset: #f2ece1;
-  --inset-2: #eae3d5;
-  --active: #efe7d7;
-  --hover: #f1ebdf;
-  --ink: #1c1a16;
-  --ink-2: #5c564c;
-  --ink-3: #8d8577;
-  --line: #e8e1d3;
-  --line-strong: #dbd3c2;
-  --accent: #2b2721;
-  --accent-ink: #1e1b16;
-  --accent-soft: #f0e7d6;
-  --accent-deep: #1f1c17;
-  --on-accent: #f7efdf;
-  --add: #2e7d4f;
-  --del: #c0453a;
-  --warn: #8a6418;
-  --warn-soft: #fbf4e6;
-  --danger: #b23a2e;
-  --danger-soft: #fbeeec;
-  --shadow: 0 12px 32px -18px rgba(20, 20, 20, 0.28);
+  --inset: #f8fbf9;
+  --inset-2: #f0f6f2;
+  --active: #f5faf7;
+  --hover: #fbfdfc;
+  --ink: #2b3e34;
+  --ink-2: #5b6d63;
+  --ink-3: #687b70;
+  --line: #f5f9f6;
+  --line-strong: #ecf3ee;
+  --accent: #6fb39a;
+  --accent-ink: #3e7c6a;
+  --accent-soft: #f2f9f5;
+  --accent-deep: #3e7c6a;
+  --action: #c9ecdf;
+  --on-accent: #1e4639;
+  --bubble: color-mix(in srgb, var(--accent) 9%, var(--panel));
+  --add: #3d8150;
+  --del: #b45650;
+  --warn: #8c6c26;
+  --warn-soft: #fbf6ea;
+  --danger: #ae4b44;
+  --danger-soft: #fbf2f0;
+  --shadow: 0 12px 32px -18px rgba(18, 38, 32, 0.08);
   --font-ui: "Segoe UI Variable Text", "Segoe UI", "Alibaba PuHuiTi 3", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
   --font-mono: "SF Mono", "JetBrains Mono", "Fira Code", "Cascadia Code", "Cascadia Mono", Consolas, "Alibaba PuHuiTi 3", "Microsoft YaHei UI", "Microsoft YaHei", monospace;
   --radius-sm: 6px;
@@ -71,7 +73,9 @@
   --accent-ink: #f1e6d2;
   --accent-soft: #2a251d;
   --accent-deep: #e8dcc4;
+  --action: #e8dcc4;
   --on-accent: #1b1712;
+  --bubble: color-mix(in srgb, var(--accent-deep) 7%, var(--inset));
   --add: #6fc28f;
   --del: #e08074;
   --warn: #d7a04a;
@@ -109,10 +113,9 @@ button {
   background: none;
 }
 
+:focus,
 :focus-visible {
-  outline: 2px solid color-mix(in srgb, var(--accent) 50%, transparent);
-  outline-offset: 1px;
-  border-radius: 4px;
+  outline: none;
 }
 
 .mono {
@@ -129,13 +132,22 @@ button {
   color: var(--warn);
 }
 
+.text-danger {
+  color: var(--danger);
+}
+
 .text-ok {
   color: var(--accent-ink);
 }
 
-.live {
+.thread-running {
+  display: inline-flex;
+  align-items: center;
   color: var(--accent-ink);
-  font-size: 11px;
+}
+
+.thread-running svg {
+  display: block;
 }
 
 .warn {
@@ -209,7 +221,7 @@ button {
 }
 
 .brand-chevron {
-  transition: transform 220ms cubic-bezier(0.2, 0.9, 0.3, 1.15);
+  transition: transform 220ms cubic-bezier(0.2, 0.9, 0.3, 1.15), opacity 160ms ease;
 }
 
 .brand-cursor {
@@ -237,7 +249,7 @@ button {
   transform: scaleX(0.8);
 }
 
-.brand-mark-blink .brand-cursor {
+.brand-mark-blink .brand-chevron {
   opacity: 0.3;
 }
 
@@ -465,17 +477,21 @@ button {
   transform: scale(0.92);
 }
 
-.rail-add:focus-visible {
-  outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent);
-  outline-offset: 1px;
-}
-
 .rail-empty-state {
   margin: 0;
   padding: 30px 8px;
   color: var(--ink-3);
   font-size: 12.5px;
   text-align: center;
+}
+
+.workspace-empty-state {
+  margin: 0 0 5px;
+  padding: 4px 8px 4px 31px;
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: left;
 }
 
 .workspace-row {
@@ -620,6 +636,16 @@ button {
   flex: none;
   color: var(--ink-3);
   font-size: 10.5px;
+}
+
+.thread-failed {
+  display: inline-flex;
+  align-items: center;
+  color: var(--danger);
+}
+
+.thread-failed svg {
+  display: block;
 }
 
 .rail-empty {
@@ -937,6 +963,11 @@ button {
   flex: 1;
 }
 
+.banner > svg {
+  flex: none;
+  color: var(--danger);
+}
+
 .transcript {
   flex: 1;
   min-height: 0;
@@ -952,7 +983,6 @@ button {
 
 .turn {
   margin-bottom: 18px;
-  animation: rise 180ms ease both;
 }
 
 @keyframes rise {
@@ -986,7 +1016,7 @@ button {
   margin: 0;
   padding: 10px 14px;
   border-radius: 14px 14px 5px 14px;
-  background: color-mix(in srgb, var(--accent-deep) 7%, var(--inset));
+  background: var(--bubble);
   font-size: 13.5px;
   line-height: 1.7;
   white-space: pre-wrap;
@@ -1292,6 +1322,18 @@ button {
 
 .notice-error {
   background: var(--danger-soft);
+}
+
+.notice-error svg {
+  color: var(--danger);
+}
+
+.notice-stopped {
+  background: var(--inset);
+}
+
+.notice-stopped svg {
+  color: var(--ink-3);
 }
 
 .notice-info {
@@ -1784,13 +1826,13 @@ button {
   width: 32px;
   height: 32px;
   border-radius: 10px;
-  background: var(--accent-deep);
+  background: var(--action);
   color: var(--on-accent);
   transition: background 110ms ease, opacity 110ms ease;
 }
 
 .send:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--accent-deep) 85%, #000);
+  background: color-mix(in srgb, var(--action) 88%, #10352a);
 }
 
 .send:disabled {
@@ -1800,12 +1842,12 @@ button {
 }
 
 .stop-mode {
-  background: var(--accent-deep);
-  color: #ffffff;
+  background: var(--action);
+  color: var(--on-accent);
 }
 
 .stop-mode:hover {
-  background: color-mix(in srgb, var(--accent-deep) 84%, #000);
+  background: color-mix(in srgb, var(--action) 86%, #10352a);
 }
 
 .stop-square {
@@ -1816,7 +1858,7 @@ button {
 }
 
 .stop-mode:hover {
-  background: color-mix(in srgb, var(--accent-deep) 88%, #000000);
+  background: color-mix(in srgb, var(--action) 90%, #10352a);
 }
 
 .approval-card {
@@ -1873,7 +1915,7 @@ button {
 
 .question-card.question-pending {
   border-color: color-mix(in srgb, var(--ink-3) 42%, var(--line-strong));
-  box-shadow: 0 10px 28px -24px rgba(28, 26, 22, 0.45);
+  box-shadow: 0 10px 28px -24px rgba(20, 38, 32, 0.45);
 }
 
 .question-head {
@@ -2003,7 +2045,7 @@ button {
   background: color-mix(in srgb, var(--panel) 82%, transparent);
   -webkit-backdrop-filter: blur(16px) saturate(120%);
   backdrop-filter: blur(16px) saturate(120%);
-  box-shadow: 0 14px 34px -28px rgba(24, 20, 14, 0.55);
+  box-shadow: 0 14px 34px -28px rgba(20, 38, 32, 0.55);
 }
 
 /* ---------- composer meta (below the input, no divider) ---------- */
@@ -2081,7 +2123,6 @@ button {
 }
 
 .panel-splitter:hover::after,
-.panel-splitter:focus-visible::after,
 body.resizing-docs .panel-splitter::after {
   background: var(--line-strong);
 }
@@ -2559,36 +2600,36 @@ body.resizing-docs {
   font-size: 10.5px;
 }
 
-/* Prism token ink: one role per hue, muted for cream paper. Comments stay
+/* Prism token ink: one role per hue, muted for mist paper. Comments stay
    upright because many of them are Chinese, where a synthetic italic reads as
    a rendering glitch rather than emphasis. */
 .token.comment,
 .token.prolog,
 .token.doctype,
 .token.cdata {
-  color: #746a5c;
+  color: #6c7d73;
   font-style: normal;
 }
 
 .token.punctuation {
-  color: #6f675b;
+  color: #566a60;
 }
 
 .token.tag,
 .token.selector,
 .token.deleted {
-  color: #a84a32;
+  color: #a85149;
 }
 
 .token.property,
 .token.constant,
 .token.symbol {
-  color: #8a5a1e;
+  color: #80602e;
 }
 
 .token.boolean,
 .token.number {
-  color: #97601f;
+  color: #8c5e26;
 }
 
 .token.string,
@@ -2596,18 +2637,18 @@ body.resizing-docs {
 .token.attr-value,
 .token.regex,
 .token.inserted {
-  color: #2f6b46;
+  color: #2d6e52;
 }
 
 .token.builtin,
 .token.class-name {
-  color: #3f5f8a;
+  color: #456e92;
 }
 
 .token.keyword,
 .token.atrule,
 .token.important {
-  color: #a03a5b;
+  color: #71558a;
 }
 
 .token.function {
@@ -2893,14 +2934,14 @@ body.resizing-docs {
   height: 30px;
   padding: 0 14px;
   border-radius: var(--radius-sm);
-  background: var(--accent-deep);
+  background: var(--action);
   color: var(--on-accent);
   font-size: 12.5px;
   transition: background 110ms ease;
 }
 
 .primary:hover {
-  background: color-mix(in srgb, var(--accent-deep) 85%, #000);
+  background: color-mix(in srgb, var(--action) 88%, #10352a);
 }
 
 .primary.small {
@@ -3167,12 +3208,12 @@ body.resizing-docs {
 }
 
 .theme-card.light .theme-preview {
-  background: #ffffff;
+  background: #fdfefd;
 }
 
 .theme-card.dark .theme-preview {
-  background: #1b1b1b;
-  border-color: #2b2b2b;
+  background: #141210;
+  border-color: #2c2822;
 }
 
 .theme-preview-rail {
@@ -3180,11 +3221,11 @@ body.resizing-docs {
 }
 
 .theme-card.light .theme-preview-rail {
-  background: #f6f6f6;
+  background: #fdfefd;
 }
 
 .theme-card.dark .theme-preview-rail {
-  background: #141414;
+  background: #141210;
 }
 
 .theme-preview-panel {
@@ -3195,12 +3236,12 @@ body.resizing-docs {
 
 .theme-card.light .theme-preview-panel {
   background: #ffffff;
-  box-shadow: inset 0 0 0 1px #e6e6e6;
+  box-shadow: inset 0 0 0 1px #f5f9f6;
 }
 
 .theme-card.dark .theme-preview-panel {
-  background: #1b1b1b;
-  box-shadow: inset 0 0 0 1px #2b2b2b;
+  background: #1b1815;
+  box-shadow: inset 0 0 0 1px #2c2822;
 }
 
 .theme-name {
@@ -3278,9 +3319,25 @@ body.resizing-docs {
 }
 
 .select-wrap {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+/* Dropdowns in the model dialog float over the form instead of pushing the
+   dialog taller every time a list opens. */
+.select-wrap > .select-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  left: 0;
+  z-index: 70;
+  max-height: min(185px, 40vh);
+}
+
+.dialog-body.menu-open {
+  overflow: visible;
 }
 
 .dialog-head-actions {
@@ -3506,12 +3563,12 @@ body.resizing-docs {
   border: 1px solid var(--line-strong);
   border-radius: 4px;
   background: var(--panel);
-  color: #ffffff;
+  color: var(--on-accent);
 }
 
 .checkbox.on {
-  border-color: var(--accent-deep);
-  background: var(--accent-deep);
+  border-color: var(--action);
+  background: var(--action);
 }
 
 .model-hint {
@@ -3584,6 +3641,13 @@ body.resizing-docs {
 .check-count {
   margin-left: auto;
   font-size: 10.5px;
+}
+
+.model-limit-hint {
+  margin-left: auto;
+  color: var(--ink-3);
+  font-size: 10.5px;
+  white-space: nowrap;
 }
 
 /* ---------- empty ---------- */
@@ -3708,7 +3772,7 @@ body.resizing-docs {
   width: 100%;
   height: auto;
   border-radius: 2px;
-  background: var(--inset-2);
+  background: color-mix(in srgb, var(--accent) 7%, var(--panel));
 }
 
 .hm-cell.future {
@@ -3716,15 +3780,15 @@ body.resizing-docs {
 }
 
 .hm-cell.l1 {
-  background: color-mix(in srgb, var(--accent) 26%, var(--panel));
+  background: color-mix(in srgb, var(--accent) 22%, var(--panel));
 }
 
 .hm-cell.l2 {
-  background: color-mix(in srgb, var(--accent) 48%, var(--panel));
+  background: color-mix(in srgb, var(--accent) 42%, var(--panel));
 }
 
 .hm-cell.l3 {
-  background: color-mix(in srgb, var(--accent) 72%, var(--panel));
+  background: color-mix(in srgb, var(--accent) 66%, var(--panel));
 }
 
 .hm-cell.l4 {
@@ -3746,19 +3810,19 @@ body.resizing-docs {
   width: 9px;
   height: 9px;
   border-radius: 2px;
-  background: var(--inset-2);
+  background: color-mix(in srgb, var(--accent) 7%, var(--panel));
 }
 
 .hm-legend i.l1 {
-  background: color-mix(in srgb, var(--accent) 26%, var(--panel));
+  background: color-mix(in srgb, var(--accent) 22%, var(--panel));
 }
 
 .hm-legend i.l2 {
-  background: color-mix(in srgb, var(--accent) 48%, var(--panel));
+  background: color-mix(in srgb, var(--accent) 42%, var(--panel));
 }
 
 .hm-legend i.l3 {
-  background: color-mix(in srgb, var(--accent) 72%, var(--panel));
+  background: color-mix(in srgb, var(--accent) 66%, var(--panel));
 }
 
 .hm-legend i.l4 {
@@ -3898,6 +3962,22 @@ body.resizing-docs {
   border-color: color-mix(in srgb, var(--accent) 45%, var(--line-strong));
 }
 
+.field-select {
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  color: var(--ink);
+  font: inherit;
+  font-size: 12.5px;
+}
+
+.field-select:focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line-strong));
+}
+
 .input-row {
   display: flex;
   align-items: center;
@@ -3991,10 +4071,10 @@ body.resizing-docs {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 22px;
-  height: 22px;
+  width: 26px;
+  height: 26px;
   flex: none;
-  border-radius: 6px;
+  border-radius: 7px;
   color: var(--ink-3);
   opacity: 0;
   transition: opacity 110ms ease, background 110ms ease, color 110ms ease;
@@ -4011,6 +4091,7 @@ body.resizing-docs {
 }
 
 .turn:hover .copy-btn,
+.turn-block:hover .copy-btn,
 .copy-btn:focus-visible,
 .tool-card:hover .tool-copy,
 .docs-path:hover .copy-btn {
@@ -4034,8 +4115,7 @@ body.resizing-docs {
 }
 
 .turn-user:hover .message-actions,
-.message-actions:focus-within,
-.reply-block:hover .reply-actions {
+.message-actions:focus-within {
   opacity: 1;
 }
 
@@ -4272,8 +4352,9 @@ body.resizing-docs {
 }
 
 .tiny-copy {
-  width: 20px;
-  height: 20px;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
 }
 
 .docs-search {
@@ -4425,6 +4506,28 @@ body.resizing-docs {
   color: var(--ink-2);
 }
 
+/* A turn with nothing to fold still keeps its row (so the answer never jumps
+   when it closes), but it must not pretend to be a control. */
+.turn-head:disabled {
+  cursor: default;
+}
+
+.turn-head:disabled:hover {
+  background: transparent;
+  color: var(--ink-3);
+}
+
+/* The status row is a button, but a focus ring around it reads as a box drawn
+   around the prose. Keep keyboard focus visible as a hover-like surface. */
+.turn-head:focus {
+  outline: none;
+}
+
+.turn-head:focus-visible {
+  background: var(--hover);
+  color: var(--ink-2);
+}
+
 .turn-head .chev.open {
   transform: rotate(90deg);
 }
@@ -4432,6 +4535,10 @@ body.resizing-docs {
 .turn-head-label {
   color: var(--ink-2);
   font-weight: 500;
+}
+
+.turn-head-failed {
+  color: var(--danger);
 }
 
 .turn-head-meta {
@@ -4539,14 +4646,16 @@ body.resizing-docs {
   overflow: auto;
 }
 
-.process-text {
-  color: var(--ink-2);
-  font-size: 13px;
-  line-height: 1.72;
-}
-
-.process-text p {
-  margin: 0 0 7px;
+/* Narration a tool-calling step emitted before it moved on. */
+.process-note {
+  margin: 2px 0;
+  padding: 2px 8px;
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  max-height: 160px;
+  overflow: auto;
 }
 
 .caret {
@@ -4633,14 +4742,8 @@ body.resizing-docs {
   color: var(--danger);
 }
 
-.turn-summary {
-  align-self: flex-start;
-  margin-left: 1px;
-  padding: 3px 10px;
-  border-radius: 7px;
-  background: var(--inset);
-  color: var(--ink-2);
-  font-size: 12px;
+.step-stopped {
+  color: var(--ink-3);
 }
 
 .turn-head-activity {
@@ -4653,6 +4756,16 @@ body.resizing-docs {
   font-size: 12px;
 }
 
+.turn-head-summary {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+
 .turn-head-clock {
   margin-left: 8px;
   flex: none;
@@ -4660,6 +4773,40 @@ body.resizing-docs {
 
 .turn-head {
   max-width: 100%;
+}
+
+/* outputs and clarifications stack in the order they happened, under the one
+   process row */
+.reply-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.reply-block .turn {
+  margin-bottom: 0;
+}
+
+.turn-reply:hover .message-actions,
+.turn-reply:focus-within .message-actions {
+  opacity: 1;
+}
+
+/* The turn's one action row: it is the last child of the block, so result
+   cards, question cards and notices never push the copy button above them. */
+.turn-actions {
+  margin-top: 0;
+}
+
+.turn-actions .copy-btn {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+}
+
+.turn-block:hover .turn-actions,
+.turn-actions:focus-within {
+  opacity: 1;
 }
 
 /* resizable workspace rail */
@@ -4698,8 +4845,7 @@ body.resizing-docs {
   transition: background 120ms ease;
 }
 
-.rail-splitter:hover::after,
-.rail-splitter:focus-visible::after {
+.rail-splitter:hover::after {
   background: var(--line-strong);
 }
 
@@ -4752,6 +4898,124 @@ body.resizing-rail {
   padding: 12px 9px;
   color: var(--ink-3);
   font-size: 12px;
+}
+
+/* first level: model summary + settings rows; subviews are model/list/options */
+.model-menu-root {
+  padding: 6px;
+}
+
+.model-setting {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 34px;
+  padding: 0 8px;
+  border-radius: 7px;
+  color: var(--ink-2);
+  font-size: 12.5px;
+  text-align: left;
+}
+
+.model-setting:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.model-setting-label {
+  flex: none;
+  color: var(--ink-2);
+}
+
+.model-setting-value {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 12px;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-setting > svg {
+  flex: none;
+  color: var(--ink-3);
+}
+
+.model-menu-sub {
+  padding: 6px;
+}
+
+.model-sub-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0 2px 4px;
+  padding-bottom: 5px;
+  border-bottom: 1px solid var(--line);
+  color: var(--ink-3);
+  font-size: 11px;
+}
+
+.model-back {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 5px;
+  color: var(--ink-3);
+}
+
+.model-back:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.model-options {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  max-height: 260px;
+  overflow-y: auto;
+  padding: 2px;
+}
+
+.model-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 8px;
+  border-radius: 6px;
+  color: var(--ink-2);
+  font-size: 12.5px;
+  text-align: left;
+}
+
+.model-option:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.model-option.active {
+  background: var(--accent-soft);
+  color: var(--ink);
+}
+
+.model-option svg {
+  flex: none;
+  color: var(--accent-deep);
+}
+
+.model-sub-note {
+  margin: 4px 6px 4px;
+  color: var(--ink-3);
+  font-size: 10px;
+  line-height: 1.5;
 }
 
 /* ---------- settings: model rows ---------- */
@@ -5049,18 +5313,6 @@ body.resizing-rail {
   background: var(--hover);
 }
 
-.workspace-chevron {
-  margin-left: auto;
-  color: var(--ink-3);
-  opacity: 0;
-  transition: opacity 120ms ease;
-}
-
-.workspace-row:hover .workspace-chevron,
-.workspace-row.open .workspace-chevron {
-  opacity: 1;
-}
-
 .workspace-menu {
   position: fixed;
   z-index: 80;
@@ -5155,6 +5407,39 @@ body.resizing-rail {
 .workspace-menu button svg {
   flex: none;
   color: var(--ink-3);
+}
+
+/* workspace history: every opened folder keeps a row, the active one opens its
+   sessions underneath */
+.workspace-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.workspace-entry {
+  position: relative;
+}
+
+.workspace-pick .workspace-name {
+  flex: 1;
+  min-width: 0;
+}
+
+.workspace-pick .workspace-folder-active {
+  color: var(--accent-deep);
+}
+
+.workspace-more.open {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.workspace-entry > .thread-list {
+  margin: 1px 0 4px;
 }
 
 /* transcript + turn minimap */
@@ -5287,7 +5572,7 @@ body.resizing-rail {
 .queue-panel {
   width: calc(100% - 32px);
   max-width: 1180px;
-  margin: 0 auto 6px;
+  margin: 0 auto 4px;
   border: 1px solid var(--line);
   border-radius: 12px;
   background: var(--panel);
@@ -5299,7 +5584,7 @@ body.resizing-rail {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 7px 10px;
+  padding: 5px 10px;
   background: var(--inset);
   border-bottom: 1px solid var(--line);
 }
@@ -5344,15 +5629,19 @@ body.resizing-rail {
 .queue-list {
   max-height: 176px;
   overflow-y: auto;
-  padding: 4px 6px;
+  padding: 2px 6px;
 }
 
 .queue-item {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 8px;
+  padding: 2px 8px;
   border-radius: 8px;
+}
+
+.queue-item + .queue-item {
+  border-top: 1px solid var(--line);
 }
 
 .queue-item:hover {
@@ -5636,11 +5925,11 @@ body.resizing-rail {
 }
 
 .workspace-actions button.danger {
-  color: #b3403a;
+  color: var(--danger);
 }
 
 .workspace-actions button.danger svg {
-  color: #b3403a;
+  color: var(--danger);
 }
 
 .workspace-rename {
@@ -5692,9 +5981,9 @@ body.resizing-rail {
 }
 
 .workspace-rename-foot button.primary {
-  border-color: var(--accent-deep);
-  background: var(--accent-deep);
-  color: #fff;
+  border-color: var(--action);
+  background: var(--action);
+  color: var(--on-accent);
 }
 
 .rail-head-actions {
@@ -5726,7 +6015,7 @@ body.resizing-rail {
 
 
 .turn-result {
-  margin-top: 10px;
+  margin-top: -6px;
 }
 
 .turn-result .artifact {
@@ -5794,8 +6083,9 @@ body.resizing-rail {
 }
 
 .message-copy {
-  width: 20px;
-  height: 20px;
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
 }
 
 
@@ -5805,7 +6095,7 @@ body.resizing-rail {
 
 
 .reply-actions {
-  margin-top: 6px;
+  margin-top: 0;
 }
 
 .turn-head {
@@ -5867,7 +6157,7 @@ body.resizing-rail {
 }
 
 .transcript {
-  padding-bottom: calc(var(--dock-h, 120px) + 16px);
+  padding-bottom: calc(var(--dock-h, 120px) + 24px);
 }
 
 .composer {
@@ -5875,7 +6165,7 @@ body.resizing-rail {
   background: color-mix(in srgb, var(--panel) 72%, transparent);
   -webkit-backdrop-filter: blur(18px) saturate(120%);
   backdrop-filter: blur(18px) saturate(120%);
-  box-shadow: 0 18px 44px -26px rgba(24, 20, 14, 0.5);
+  box-shadow: 0 18px 44px -26px rgba(20, 38, 32, 0.5);
 }
 
 .composer:focus-within {
@@ -5919,7 +6209,7 @@ body.resizing-rail {
   background: color-mix(in srgb, var(--panel) 58%, transparent);
   -webkit-backdrop-filter: blur(22px) saturate(130%);
   backdrop-filter: blur(22px) saturate(130%);
-  box-shadow: 0 16px 40px -26px rgba(24, 20, 14, 0.55);
+  box-shadow: 0 16px 40px -26px rgba(20, 38, 32, 0.55);
 }
 
 .composer:focus-within {
@@ -6007,7 +6297,7 @@ body.resizing-rail {
   background: color-mix(in srgb, var(--panel) 78%, transparent);
   -webkit-backdrop-filter: blur(18px) saturate(120%);
   backdrop-filter: blur(18px) saturate(120%);
-  box-shadow: 0 14px 34px -20px rgba(20, 18, 14, 0.5);
+  box-shadow: 0 14px 34px -20px rgba(20, 38, 32, 0.5);
   color: var(--ink);
   font-size: 12px;
   pointer-events: none;
@@ -6048,4 +6338,52 @@ body.resizing-rail {
 .transcript {
   padding-left: 32px;
   padding-right: 32px;
+}
+
+/* ---------- frosted glass: one recipe ---------- */
+
+/* Every floating surface shares one tint + blur. The blur is what keeps the
+   layer below unreadable; the tint alone would either be see-through (52% let
+   the transcript text through) or read as a flat solid (98%). */
+.policy-menu,
+.plus-menu,
+.model-menu,
+.reference-panel,
+.workspace-menu,
+.thread-menu,
+.rail-menu,
+.queue-panel,
+.task-panel,
+.question-card,
+.hm-tip,
+.jump-bottom {
+  background: color-mix(in srgb, var(--panel) 86%, transparent);
+  -webkit-backdrop-filter: blur(30px) saturate(130%);
+  backdrop-filter: blur(30px) saturate(130%);
+}
+
+/* The composer wears the same glass, but on a layer behind its content. If the
+   box itself carried backdrop-filter it would become a backdrop root, and the
+   menus opened inside it could only blur the input instead of the conversation
+   behind them — their tint then left the transcript text readable through the
+   panel. With the glass on ::before, the composer stays frosted while each
+   menu above it blurs the page on its own. */
+.composer,
+.composer:focus-within {
+  position: relative;
+  background: transparent;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+.composer::before {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  z-index: -1;
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--panel) 86%, transparent);
+  -webkit-backdrop-filter: blur(30px) saturate(130%);
+  backdrop-filter: blur(30px) saturate(130%);
+  pointer-events: none;
 }

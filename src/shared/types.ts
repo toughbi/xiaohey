@@ -16,6 +16,8 @@ export type ApprovalDecision = 'allow_once' | 'allow_always' | 'deny';
  */
 export type ApprovalPolicy = 'ask' | 'auto' | 'full';
 
+export type ReasoningEffort = 'default' | 'low' | 'medium' | 'high';
+
 export interface ModelSettings {
   /** OpenAI-compatible base URL, without the trailing /chat/completions. */
   baseUrl: string;
@@ -25,6 +27,8 @@ export interface ModelSettings {
   maxOutputTokens: number;
   /** Budget used for context accounting and compaction. */
   contextWindow: number;
+  /** Sent as `reasoning_effort` when it is not "default". */
+  reasoningEffort?: ReasoningEffort;
 }
 
 export interface ModelProfile extends ModelSettings {
@@ -37,6 +41,9 @@ export interface ModelProfile extends ModelSettings {
   enabled?: boolean;
   /** How the vendor bills this key: plan or pay-as-you-go. */
   billing?: 'plan' | 'payg';
+  /** Provenance for limits: only metadata-derived or user-entered values are shown. */
+  contextWindowSource?: 'metadata' | 'user';
+  maxOutputTokensSource?: 'metadata' | 'user';
 }
 
 export interface Settings {
@@ -137,7 +144,7 @@ export interface PlanItem extends ItemBase {
 
 export interface NoticeItem extends ItemBase {
   kind: 'notice';
-  tone: 'info' | 'warn' | 'error';
+  tone: 'info' | 'warn' | 'error' | 'stopped';
   title: string;
   body: string;
 }
@@ -356,8 +363,8 @@ export type RuntimeEvent =
   | { type: 'runtime/updated'; runtime: RuntimeStatus; context: ContextGauge }
   | { type: 'approval/requested'; approval: ApprovalRequest }
   | { type: 'settings/updated'; settings: Settings }
-  | { type: 'memory/updated'; facts: MemoryFact[] }
-  | { type: 'snapshot/updated'; snapshots: SnapshotMeta[] };
+  | { type: 'memory/updated'; threadId: string; facts: MemoryFact[] }
+  | { type: 'snapshot/updated'; threadId: string; snapshots: SnapshotMeta[] };
 
 export interface RequestMap {
   'app/info': {
@@ -415,9 +422,15 @@ export interface RequestMap {
   'workspace/pick': { params: Record<string, never>; result: { path: string | null } };
   'workspace/reveal': { params: { path: string }; result: { ok: boolean } };
   'workspace/rename': { params: { path: string; name: string }; result: { path: string } };
+  'workspace/delete': { params: { path: string }; result: { ok: boolean; deleted: number } };
   'provider/models': {
     params: { baseUrl: string; apiKey: string };
-    result: { ok: boolean; models: string[]; detail: string };
+    result: {
+      ok: boolean;
+      models: string[];
+      limits: Record<string, { contextWindow?: number; maxOutputTokens?: number }>;
+      detail: string;
+    };
   };
   'app/open-external': { params: { url: string }; result: { ok: boolean } };
 }

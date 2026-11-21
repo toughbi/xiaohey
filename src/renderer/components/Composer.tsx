@@ -4,6 +4,8 @@ import {
   AtSign,
   Check,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   Database,
   Folder,
   GitBranch,
@@ -47,6 +49,7 @@ interface ComposerProps {
   onAllowAlways: (approval: ApprovalRequest) => void;
   onPolicy: (policy: ApprovalPolicy) => void;
   onSelectModel: (id: string) => void;
+  onUpdateModel: (id: string, patch: Partial<ModelProfile>) => void;
   onOpenFiles: () => void;
   onWorkspaceClick?: (rect: DOMRect) => void;
 }
@@ -56,6 +59,21 @@ const POLICY_LABEL: Record<ApprovalPolicy, string> = {
   auto: '自动审批',
   full: '完全访问',
 };
+
+const REASONING_LEVELS = [
+  { value: 'default', label: '默认' },
+  { value: 'low', label: '低' },
+  { value: 'medium', label: '中' },
+  { value: 'high', label: '高' },
+] as const;
+
+const CONTEXT_WINDOWS = [32_768, 65_536, 131_072, 204_800, 409_600, 1_048_576];
+const OUTPUT_LIMITS = [4_096, 8_192, 16_384, 32_768, 65_536];
+
+function contextWindowLabel(value: number): string {
+  if (value >= 1_048_576) return `${Math.round((value / 1_048_576) * 10) / 10}M`;
+  return `${Math.round(value / 1024)}K`;
+}
 
 const POLICY_OPTIONS: Array<{
   id: ApprovalPolicy;
@@ -100,12 +118,14 @@ export function Composer({
   onAllowAlways,
   onPolicy,
   onSelectModel,
+  onUpdateModel,
   onOpenFiles,
   onWorkspaceClick,
 }: ComposerProps) {
   const [value, setValue] = useState('');
   const [policyOpen, setPolicyOpen] = useState(false);
   const [modelOpen, setModelOpen] = useState(false);
+  const [modelView, setModelView] = useState<'root' | 'models' | 'reasoning' | 'context' | 'output'>('root');
   const [plusOpen, setPlusOpen] = useState(false);
   const [referenceOpen, setReferenceOpen] = useState(false);
   const [files, setFiles] = useState<FileEntry[] | null>(null);
@@ -115,6 +135,19 @@ export function Composer({
   const reference = useRef<HTMLTextAreaElement>(null);
   const availableModels = models.filter((profile) => profile.enabled !== false);
   const activeModel = models.find((profile) => profile.id === activeModelId) ?? availableModels[0] ?? models[0];
+  const reasoningLabel =
+    REASONING_LEVELS.find((level) => level.value === (activeModel?.reasoningEffort ?? 'default'))?.label ?? '默认';
+  const contextWindows = activeModel && activeModel.contextWindow > 0
+    ? [...new Set([...CONTEXT_WINDOWS, activeModel.contextWindow])].sort((left, right) => left - right)
+    : [];
+  const outputLimits = activeModel && activeModel.maxOutputTokens > 0
+    ? [...new Set([
+        ...(activeModel.contextWindow > 0
+          ? OUTPUT_LIMITS.filter((value) => value < activeModel.contextWindow)
+          : OUTPUT_LIMITS),
+        activeModel.maxOutputTokens,
+      ])].sort((left, right) => left - right)
+    : [];
 
   useEffect(() => {
     const node = reference.current;
@@ -122,6 +155,17 @@ export function Composer({
     node.style.height = 'auto';
     node.style.height = `${Math.min(200, node.scrollHeight)}px`;
   }, [value]);
+
+  useEffect(() => {
+    if (!modelOpen) return;
+    const onKey = (event: KeyboardEvent): void => {
+      if (event.key !== 'Escape') return;
+      if (modelView === 'root') setModelOpen(false);
+      else setModelView('root');
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [modelOpen, modelView]);
 
   const insertReference = (path: string): void => {
     const node = reference.current;
@@ -381,7 +425,11 @@ export function Composer({
               <button
                 type="button"
                 className="tb-chip model"
-                onClick={() => availableModels.length > 0 && setModelOpen((open) => !open)}
+                onClick={() => {
+                  if (availableModels.length === 0) return;
+                  if (!modelOpen) setModelView('root');
+                  setModelOpen((open) => !open);
+                }}
                 aria-haspopup="listbox"
                 aria-expanded={modelOpen}
                 disabled={models.length === 0}
@@ -393,48 +441,172 @@ export function Composer({
               {modelOpen && availableModels.length > 0 ? (
                 <>
                   <div className="policy-backdrop" onClick={() => setModelOpen(false)} />
-                  <div className="model-menu" role="listbox" aria-label="模型">
-                    <div className="model-search">
-                      <Search size={12} strokeWidth={1.7} />
-                      <input
-                        autoFocus
-                        value={modelQuery}
-                        onChange={(event) => setModelQuery(event.target.value)}
-                        onKeyDown={(event) => {
-                          if (event.key === 'Escape') setModelOpen(false);
-                        }}
-                        placeholder="搜索模型…"
-                        aria-label="搜索模型"
-                      />
-                    </div>
-                    <div className="model-groups">
-                      {modelGroups.map((group) => (
-                        <div className="model-group" key={group.label}>
-                          <div className="model-group-label">{group.label}</div>
-                          {group.items.map((profile) => (
-                            <button
-                              key={profile.id}
-                              type="button"
-                              role="option"
-                              aria-selected={profile.id === activeModelId}
-                              className={`model-item ${profile.id === activeModelId ? 'active' : ''}`}
-                              onClick={() => {
-                                onSelectModel(profile.id);
-                                setModelOpen(false);
-                                setModelQuery('');
-                              }}
-                            >
-                              <span className="model-text">
-                                <strong>{profile.model}</strong>
-                                {profile.name && profile.name !== profile.model && profile.name.toLowerCase() !== group.label.toLowerCase() ? <em>{profile.name}</em> : null}
-                              </span>
-                              {profile.id === activeModelId ? <Check size={14} strokeWidth={1.8} className="policy-check" /> : null}
-                            </button>
-                          ))}
+                  <div
+                    className={`model-menu ${modelView === 'root' ? 'model-menu-root' : 'model-menu-sub'}`}
+                    role="dialog"
+                    aria-label="模型设置"
+                  >
+                    {modelView === 'root' ? (
+                      <>
+                        <button
+                          type="button"
+                          className="model-setting"
+                          onClick={() => {
+                            setModelView('models');
+                            setModelQuery('');
+                          }}
+                        >
+                          <span className="model-setting-label">模型</span>
+                          <span className="model-setting-value">{activeModel?.model ?? '未配置模型'}</span>
+                          <ChevronRight size={13} strokeWidth={1.7} />
+                        </button>
+                        {activeModel ? (
+                          <button type="button" className="model-setting" onClick={() => setModelView('reasoning')}>
+                            <span className="model-setting-label">推理等级</span>
+                            <span className="model-setting-value">{reasoningLabel}</span>
+                            <ChevronRight size={13} strokeWidth={1.7} />
+                          </button>
+                        ) : null}
+                        {activeModel && activeModel.contextWindow > 0 && activeModel.contextWindowSource ? (
+                          <button type="button" className="model-setting" onClick={() => setModelView('context')}>
+                            <span className="model-setting-label">上下文窗口</span>
+                            <span className="model-setting-value">{contextWindowLabel(activeModel.contextWindow)}</span>
+                            <ChevronRight size={13} strokeWidth={1.7} />
+                          </button>
+                        ) : null}
+                        {activeModel && activeModel.maxOutputTokens > 0 && activeModel.maxOutputTokensSource ? (
+                          <button type="button" className="model-setting" onClick={() => setModelView('output')}>
+                            <span className="model-setting-label">输出上限</span>
+                            <span className="model-setting-value">{contextWindowLabel(activeModel.maxOutputTokens)}</span>
+                            <ChevronRight size={13} strokeWidth={1.7} />
+                          </button>
+                        ) : null}
+                      </>
+                    ) : (
+                      <>
+                        <div className="model-sub-head">
+                          <button
+                            type="button"
+                            className="model-back"
+                            onClick={() => setModelView('root')}
+                            aria-label="返回"
+                          >
+                            <ChevronLeft size={14} strokeWidth={1.7} />
+                          </button>
+                          <span>
+                            {modelView === 'models'
+                              ? '选择模型'
+                              : modelView === 'reasoning'
+                                ? '推理等级'
+                                : modelView === 'context'
+                                  ? '上下文窗口'
+                                  : '输出上限'}
+                          </span>
                         </div>
-                      ))}
-                      {modelGroups.length === 0 ? <div className="model-empty">没有匹配的模型</div> : null}
-                    </div>
+                        {modelView === 'models' ? (
+                          <>
+                            <div className="model-search">
+                              <Search size={12} strokeWidth={1.7} />
+                              <input
+                                autoFocus
+                                value={modelQuery}
+                                onChange={(event) => setModelQuery(event.target.value)}
+                                onKeyDown={(event) => {
+                                  if (event.key === 'Escape') setModelView('root');
+                                }}
+                                placeholder="搜索模型…"
+                                aria-label="搜索模型"
+                              />
+                            </div>
+                            <div className="model-groups" role="listbox" aria-label="模型">
+                              {modelGroups.map((group) => (
+                                <div className="model-group" key={group.label}>
+                                  <div className="model-group-label">{group.label}</div>
+                                  {group.items.map((profile) => (
+                                    <button
+                                      key={profile.id}
+                                      type="button"
+                                      role="option"
+                                      aria-selected={profile.id === activeModelId}
+                                      className={`model-item ${profile.id === activeModelId ? 'active' : ''}`}
+                                      onClick={() => {
+                                        onSelectModel(profile.id);
+                                        setModelView('root');
+                                        setModelQuery('');
+                                      }}
+                                    >
+                                      <span className="model-text">
+                                        <strong>{profile.model}</strong>
+                                        {profile.name && profile.name !== profile.model && profile.name.toLowerCase() !== group.label.toLowerCase() ? <em>{profile.name}</em> : null}
+                                      </span>
+                                      {profile.id === activeModelId ? <Check size={14} strokeWidth={1.8} className="policy-check" /> : null}
+                                    </button>
+                                  ))}
+                                </div>
+                              ))}
+                              {modelGroups.length === 0 ? <div className="model-empty">没有匹配的模型</div> : null}
+                            </div>
+                          </>
+                        ) : (
+                          <>
+                            <div className="model-options" role="listbox" aria-label="模型设置">
+                              {(modelView === 'reasoning'
+                                ? REASONING_LEVELS.map((level) => ({
+                                    key: level.value,
+                                    label: level.label,
+                                    active: (activeModel?.reasoningEffort ?? 'default') === level.value,
+                                    run: () => {
+                                      if (activeModel) onUpdateModel(activeModel.id, { reasoningEffort: level.value });
+                                    },
+                                  }))
+                                : (modelView === 'context' ? contextWindows : outputLimits).map((value) => ({
+                                    key: String(value),
+                                    label: contextWindowLabel(value),
+                                    active:
+                                      modelView === 'context'
+                                        ? value === activeModel?.contextWindow
+                                        : value === activeModel?.maxOutputTokens,
+                                    run: () => {
+                                      if (!activeModel) return;
+                                      if (modelView === 'context') {
+                                        onUpdateModel(activeModel.id, {
+                                          contextWindow: value,
+                                          contextWindowSource: 'user',
+                                        });
+                                      } else {
+                                        onUpdateModel(activeModel.id, {
+                                          maxOutputTokens: value,
+                                          maxOutputTokensSource: 'user',
+                                        });
+                                      }
+                                    },
+                                  }))
+                              ).map((option) => (
+                                <button
+                                  key={option.key}
+                                  type="button"
+                                  role="option"
+                                  aria-selected={option.active}
+                                  className={`model-option ${option.active ? 'active' : ''}`}
+                                  onClick={() => {
+                                    option.run();
+                                    setModelView('root');
+                                  }}
+                                >
+                                  <span>{option.label}</span>
+                                  {option.active ? <Check size={13} strokeWidth={1.9} /> : null}
+                                </button>
+                              ))}
+                            </div>
+                            {modelView === 'output' ? (
+                              <p className="model-sub-note">
+                                输出上限是本次请求的 max_tokens，包含思考、计入上下文窗口；4K–64K 只是常用预设，不是从模型查询到的最大值，具体以供应商文档为准。
+                              </p>
+                            ) : null}
+                          </>
+                        )}
+                      </>
+                    )}
                   </div>
                 </>
               ) : null}

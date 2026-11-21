@@ -150,6 +150,7 @@ export class AppServer {
           cwd = workspace;
         }
         const doc = await this.store.createThread(title ?? 'New session', cwd);
+        if (cwd) await this.rememberWorkspace(cwd);
         this.emit({ type: 'thread/list', threads: await this.store.listThreads() });
         return doc.thread as RequestResult<K>;
       }
@@ -195,6 +196,7 @@ export class AppServer {
         doc.thread.cwd = workspace;
         doc.thread.updatedAt = Date.now();
         await this.store.saveNow(threadId);
+        await this.rememberWorkspace(workspace);
         this.emit({ type: 'thread/list', threads: await this.store.listThreads() });
         this.emit({ type: 'thread/updated', thread: doc.thread });
         return doc.thread as RequestResult<K>;
@@ -209,6 +211,10 @@ export class AppServer {
 
       case 'thread/delete': {
         const { threadId } = params as { threadId: string };
+        const doc = await this.store.load(threadId);
+        // Deleting the last session must not erase the workspace from history:
+        // it is still a folder you can start another session in.
+        if (doc?.thread.cwd) await this.rememberWorkspace(doc.thread.cwd);
         await this.agent.cancel(threadId);
         await this.store.deleteThread(threadId);
         this.emit({ type: 'thread/list', threads: await this.store.listThreads() });
@@ -256,7 +262,7 @@ export class AppServer {
         if (!doc) throw new Error('unknown thread');
         doc.state.memory = doc.state.memory.filter((record) => record.slot !== slot);
         await this.store.saveNow(threadId);
-        this.emit({ type: 'memory/updated', facts: this.facts(doc) });
+        this.emit({ type: 'memory/updated', threadId, facts: this.facts(doc) });
         return this.facts(doc) as RequestResult<K>;
       }
 
@@ -354,7 +360,7 @@ export class AppServer {
         const applied = applyClaim(doc.state.memory, { slot: slot.trim() || 'note.manual', value: trimmed, scope: { kind: 'workspace' }, source: 'manual' });
         doc.state.memory = applied.records;
         await this.store.saveNow(threadId);
-        this.emit({ type: 'memory/updated', facts: this.facts(doc) });
+        this.emit({ type: 'memory/updated', threadId, facts: this.facts(doc) });
         return this.facts(doc) as RequestResult<K>;
       }
 
@@ -425,6 +431,27 @@ export class AppServer {
         });
         this.emit({ type: 'thread/list', threads: await this.store.listThreads() });
         return { path: target } as RequestResult<K>;
+      }
+
+      case 'workspace/delete': {
+        const { path } = params as { path: string };
+        if (!isAbsolute(path)) throw new Error('workspace path must be absolute');
+        const doomed = (await this.store.listThreads()).filter((thread) => thread.cwd === path);
+        for (const thread of doomed) {
+          await this.agent.cancel(thread.id);
+          for (let attempt = 0; attempt < 50 && this.agent.isRunning(thread.id); attempt += 1) {
+            await new Promise((resolve) => setTimeout(resolve, 100));
+          }
+          await this.store.deleteThread(thread.id);
+        }
+        const settings = this.store.getSettings();
+        const saved = await this.store.setSettings({
+          ...settings,
+          recentWorkspaces: (settings.recentWorkspaces ?? []).filter((entry) => entry !== path),
+        });
+        this.emit({ type: 'settings/updated', settings: saved });
+        this.emit({ type: 'thread/list', threads: await this.store.listThreads() });
+        return { ok: true, deleted: doomed.length } as RequestResult<K>;
       }
 
       case 'workspace/pick': {
@@ -566,6 +593,23 @@ export class AppServer {
       supersededBy: record.supersededBy,
       conflicts: record.status === 'disputed' ? 1 : 0,
     }));
+  }
+
+  /**
+   * Keep the workspace history current at the source. The renderer used to
+   * write `recentWorkspaces` on its own, which raced with every other settings
+   * write; binding it to the actions that actually open a folder makes the rail
+   * list survive restarts and stay complete. An existing workspace keeps its
+   * position: creating a session in it must not move it to the front.
+   */
+  private async rememberWorkspace(path: string): Promise<void> {
+    if (!path) return;
+    const settings = this.store.getSettings();
+    const recent = settings.recentWorkspaces ?? [];
+    if (recent.includes(path)) return;
+    const next = [path, ...recent].slice(0, 8);
+    const saved = await this.store.setSettings({ ...settings, recentWorkspaces: next });
+    this.emit({ type: 'settings/updated', settings: saved });
   }
 
   private async threadDoc(threadId: string): Promise<ThreadDoc> {
@@ -747,9 +791,19 @@ export class AppServer {
 
   private async diff(threadId: string, path: string, snapshotId?: string): Promise<DiffPayload> {
     const doc = await this.threadDoc(threadId);
-    const snapshot = snapshotId
+    const requested = snapshotId
       ? doc.snapshots.find((entry) => entry.id === snapshotId)
-      : doc.snapshots.at(-1);
+      : undefined;
+    // Without an explicit checkpoint, prefer the last snapshot that actually
+    // recorded a change to this file. The newest snapshot overall may be from
+    // a later, unrelated step and already contains this file's edited state,
+    // which would render a bogus +0/−0 diff.
+    const snapshot =
+      requested ??
+      [...doc.snapshots]
+        .reverse()
+        .find((entry) => entry.changeStats?.files.some((file) => file.path === path) ?? false) ??
+      doc.snapshots.at(-1);
     const current = await readFile(resolveInside(doc.thread.cwd, path), 'utf8').catch(() => '');
     let before = '';
     if (snapshot) {

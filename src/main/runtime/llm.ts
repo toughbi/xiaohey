@@ -156,10 +156,13 @@ async function once(
     model: settings.model,
     messages,
     temperature: settings.temperature,
-    max_tokens: settings.maxOutputTokens,
     stream: true,
     stream_options: { include_usage: true },
   };
+  if (settings.maxOutputTokens > 0) body.max_tokens = settings.maxOutputTokens;
+  if (settings.reasoningEffort && settings.reasoningEffort !== 'default') {
+    body.reasoning_effort = settings.reasoningEffort;
+  }
   if (options.tools && options.tools.length > 0) {
     body.tools = options.tools;
     body.tool_choice = 'auto';

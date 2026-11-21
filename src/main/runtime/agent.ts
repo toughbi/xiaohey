@@ -44,12 +44,9 @@ import { complete, LlmError, type ChatMessage, type ToolCall } from './llm.js';
 import { committed, failed, intent, orphanIntents, reconcile, type JournalRecord, type ReconcileOutcome } from './journal.js';
 import { classifyCommand, autoDecision } from './policy.js';
 import { toolByName, toolSpecs, tools, type ToolExecContext, type ToolDefinition } from './tools.js';
-import { noteAttempt, parseArguments, schemaRetriesLeft, validateArgs, type RetryLedger, type ToolFailure } from './toolerrors.js';
+import { noteAttempt, parseArguments, readDomainFailure, schemaRetriesLeft, validateArgs, type RetryLedger, type ToolFailure } from './toolerrors.js';
 import { fileFingerprint } from '../fingerprint.js';
 import { clamp, estimateTokens, formatDuration, resolveInside, stableStringify, truncate, uid } from '../util.js';
-
-const MAX_STEPS = 20;
-const MAX_TURN_MS = 10 * 60_000;
 
 export interface AgentDeps {
   store: Store;
@@ -130,7 +127,13 @@ export class AgentService {
    * both by boot recovery and by a stop click on a session this process is not
    * actually running.
    */
-  private markInterrupted(doc: ThreadDoc, stopReason: string, title: string, body: string): void {
+  private markInterrupted(
+    doc: ThreadDoc,
+    stopReason: string,
+    title: string,
+    body: string,
+    tone: 'warn' | 'stopped' = 'warn',
+  ): void {
     const threadId = doc.thread.id;
     for (const [id, pending] of this.questions) {
       if (pending.threadId === threadId) {
@@ -150,7 +153,7 @@ export class AgentService {
     }
     this.deps.store.closeOpenToolCalls(doc);
     doc.thread.status = 'idle';
-    this.emitNotice(threadId, { tone: 'warn', title, body });
+    this.emitNotice(threadId, { tone, title, body });
     if (doc.turn) this.deps.emit({ type: 'turn/updated', turn: doc.turn });
     this.emitThread(doc.thread);
     this.deps.emit({
@@ -172,9 +175,10 @@ export class AgentService {
     if (doc.turn?.status !== 'running' && doc.thread.status !== 'running') return false;
     this.markInterrupted(
       doc,
-      'cancelled by the user',
-      '本轮已中止',
-      '这一轮已经不在运行（上一次运行被中断），会话已恢复为空闲。',
+      'stopped by the user',
+      '本轮已停止',
+      '这一轮已经不在运行，已停止并恢复为空闲。已经完成的内容和改动都保留。',
+      'stopped',
     );
     await this.deps.store.saveNow(threadId);
     return true;
@@ -213,7 +217,7 @@ export class AgentService {
     this.deps.emit({ type: 'runtime/updated', runtime: this.status(threadId, 'thinking', `${gauge.tokensUsed} tokens in context`), context: gauge });
   }
 
-  private emitNotice(threadId: string | null, notice: { tone: 'info' | 'warn' | 'error'; title: string; body: string }): void {
+  private emitNotice(threadId: string | null, notice: { tone: NoticeItem['tone']; title: string; body: string }): void {
     if (!threadId) return;
     const doc = this.deps.store.docs.get(threadId);
     if (!doc) return;
@@ -240,16 +244,41 @@ export class AgentService {
     const controller = this.controllers.get(threadId);
     if (!controller) return this.abandonStaleTurn(threadId);
     controller.abort();
+    const doc = this.deps.store.docs.get(threadId) ?? (await this.deps.store.load(threadId));
     for (const [id, pending] of this.approvals) {
-      if (pending.request.threadId === threadId) {
-        pending.resolve('deny');
-        this.approvals.delete(id);
+      if (pending.request.threadId !== threadId) continue;
+      pending.resolve('deny');
+      this.approvals.delete(id);
+      const approval = doc?.items.find((item): item is ApprovalItem => item.kind === 'approval' && item.id === id);
+      if (approval) {
+        approval.decision = 'deny';
+        approval.status = 'cancelled';
+        this.emitItem(approval);
       }
     }
     for (const [id, pending] of this.questions) {
-      if (pending.threadId === threadId) {
-        pending.resolve({ answer: '', cancelled: true });
-        this.questions.delete(id);
+      if (pending.threadId !== threadId) continue;
+      pending.resolve({ answer: '', cancelled: true });
+      this.questions.delete(id);
+      const question = doc?.items.find((item): item is QuestionItem => item.kind === 'question' && item.id === id);
+      if (question && question.status === 'running') {
+        question.status = 'cancelled';
+        this.emitItem(question);
+      }
+    }
+    if (doc) {
+      // A stop must settle every visible "running" row immediately; the loop's
+      // own cleanup follows, but the UI must not keep claiming a tool is live.
+      for (const item of doc.items) {
+        if (item.threadId !== threadId || item.status !== 'running') continue;
+        if (item.kind === 'tool_call' || item.kind === 'approval' || item.kind === 'question') {
+          item.status = 'cancelled';
+          this.emitItem(item);
+        }
+      }
+      if (doc.thread.status === 'waiting_approval') {
+        doc.thread.status = 'running';
+        this.emitThread(doc.thread);
       }
     }
     return true;
@@ -335,7 +364,6 @@ export class AgentService {
     this.running.add(threadId);
     const controller = new AbortController();
     this.controllers.set(threadId, controller);
-    const deadline = Date.now() + MAX_TURN_MS;
 
     const push = <T extends Item>(item: T): T => {
       doc.items.push(item);
@@ -435,23 +463,25 @@ export class AgentService {
       let assistant: MessageItem | null = null;
       let step = 0;
       let stopReason = 'model finished';
+      let lastFinishReason = '';
 
-      while (step < MAX_STEPS) {
+      while (true) {
         step += 1;
         turn.step = step;
         doc.thread.steps += 1;
-        if (Date.now() > deadline) {
-          stopReason = 'turn time budget exhausted';
-          break;
-        }
         if (controller.signal.aborted) {
           stopReason = 'cancelled by the user';
           break;
         }
 
-        // 4. Context assembly + compaction.
+        // 4. Context assembly + compaction. The context window covers prompt +
+        // completion, so keep room for the configured max output instead of
+        // filling the whole window with messages. Unknown metadata falls back
+        // to a conservative internal budget; it is not shown as model metadata.
         let messages = this.messagesFor(doc);
-        const budget = model.contextWindow;
+        const contextBudget = model.contextWindow > 0 ? model.contextWindow : 131_072;
+        const outputReserve = model.maxOutputTokens > 0 ? model.maxOutputTokens : 0;
+        const budget = Math.max(4096, contextBudget - outputReserve);
         if (shouldCompact(estimateTokens(JSON.stringify(messages)), budget)) {
           this.deps.emit({ type: 'runtime/updated', runtime: this.status(threadId, 'compacting', 'folding older steps'), context: this.gauge(doc) });
           const folded = await this.compact(doc, turn, messages);
@@ -505,6 +535,11 @@ export class AgentService {
         assistant = assistantItem;
 
         let lastEmit = 0;
+        // The provider pushes tokens far faster than the eye needs, but a 90ms
+        // window made the reply land in 15–25 character blocks — visibly
+        // "paragraph by paragraph" in Chinese. 30ms (~33fps) keeps the IPC
+        // traffic bounded while every frame only advances a few characters.
+        const STREAM_EMIT_MS = 16;
         const result = await complete(model, modelMessages, {
           tools: toolSpecs(),
           signal: controller.signal,
@@ -512,7 +547,7 @@ export class AgentService {
             onText: (delta) => {
               assistantItem.text += delta;
               const now = Date.now();
-              if (now - lastEmit > 90) {
+              if (now - lastEmit >= STREAM_EMIT_MS) {
                 lastEmit = now;
                 this.emitItem(assistantItem);
               }
@@ -523,6 +558,7 @@ export class AgentService {
             },
           },
         });
+        lastFinishReason = result.finishReason;
         assistantItem.status = 'done';
         if (result.reasoning.trim()) assistantItem.reasoning = result.reasoning;
         if (result.reasoning.trim()) doc.state.context.thinking = true;
@@ -581,9 +617,34 @@ export class AgentService {
         }
       }
 
-      if (step >= MAX_STEPS) stopReason = `step budget exhausted at ${MAX_STEPS}`;
+      // The model decides when it is done: the turn ends only when it stops
+      // calling tools (or the user stops it). No step or time cap intervenes.
+      const aborted = controller.signal.aborted;
+      if (aborted) {
+        // A user stop can unwind through the normal loop (no exception): settle
+        // any open rows and leave the same neutral notice as the catch path.
+        this.closeRunningToolCalls(doc, turn, 'stopped by the user', true);
+        this.emitNotice(threadId, {
+          tone: 'stopped',
+          title: '本轮已停止',
+          body: '你手动停止了这一轮，已经完成的内容和改动都保留。',
+        });
+      } else if (!assistant || assistant.text.trim().length === 0) {
+        const truncated = lastFinishReason === 'length';
+        const outputCap =
+          model.maxOutputTokens > 0
+            ? `${Math.round(model.maxOutputTokens / 1024)}K（max_tokens）`
+            : '供应商默认的 max_tokens';
+        this.emitNotice(threadId, {
+          tone: 'warn',
+          title: truncated ? '输出被截断' : '模型没有返回正文',
+          body: truncated
+            ? `本次请求的输出上限是 ${outputCap}，思考占满了这个预算，没有留下正文。点开输入框右下角的模型菜单，在「当前模型设置」里把输出上限调大（以供应商支持为准），或把推理等级调低后再试。`
+            : '本轮已结束，但没有生成最终答案。可以继续发一条消息让它总结。',
+        });
+      }
 
-      turn.status = controller.signal.aborted ? 'cancelled' : 'completed';
+      turn.status = aborted ? 'cancelled' : 'completed';
       turn.endedAt = Date.now();
       turn.stopReason = stopReason;
       doc.thread.status = 'idle';
@@ -596,26 +657,36 @@ export class AgentService {
       });
     } catch (error) {
       // Nothing may stay "running" after the loop dies, or the transcript lies
-      // about a step that never finished.
+      // about a step that never finished. A user stop is not a failure.
+      const aborted = controller.signal.aborted;
+      const message = aborted
+        ? '你手动停止了这一轮，已经完成的内容和改动都保留。'
+        : error instanceof LlmError
+          ? `${error.message} — ${error.hint}`
+          : (error as Error).message;
+      this.closeRunningToolCalls(doc, turn, message, aborted);
       for (const item of doc.items) {
         if (item.status === 'running') {
-          item.status = controller.signal.aborted ? 'cancelled' : 'error';
+          item.status = aborted ? 'cancelled' : 'error';
           this.emitItem(item);
         }
       }
-      const message = error instanceof LlmError ? `${error.message} — ${error.hint}` : (error as Error).message;
-      turn.status = controller.signal.aborted ? 'cancelled' : 'failed';
+      turn.status = aborted ? 'cancelled' : 'failed';
       turn.endedAt = Date.now();
-      turn.stopReason = message;
-      doc.thread.status = controller.signal.aborted ? 'idle' : 'failed';
+      turn.stopReason = aborted ? 'stopped by the user' : message;
+      doc.thread.status = aborted ? 'idle' : 'failed';
       this.emitNotice(doc.thread.id, {
-        tone: 'error',
-        title: controller.signal.aborted ? '本轮已中止' : '本轮失败',
+        tone: aborted ? 'stopped' : 'error',
+        title: aborted ? '本轮已停止' : '本轮失败',
         body: message,
       });
       this.deps.emit({ type: 'turn/updated', turn });
       this.emitThread(doc.thread);
-      this.deps.emit({ type: 'runtime/updated', runtime: this.status(threadId, 'error', message), context: this.gauge(doc) });
+      this.deps.emit({
+        type: 'runtime/updated',
+        runtime: this.status(threadId, aborted ? 'idle' : 'error', aborted ? '已停止' : message),
+        context: this.gauge(doc),
+      });
     } finally {
       this.running.delete(threadId);
       this.controllers.delete(threadId);
@@ -780,15 +851,16 @@ export class AgentService {
 
     if (signal.aborted) {
       callItem.status = 'cancelled';
-      callItem.summary = '已中止';
+      callItem.summary = '已停止';
       this.emitItem(callItem);
       this.pushResult(
         doc,
         turn,
         call,
-        { ok: false, layer: 'none', summary: '已中止', detail: '用户停止了本轮。', hint: '', retryable: true },
+        { ok: false, layer: 'none', summary: '已停止', detail: '用户停止了本轮。', hint: '', retryable: false },
         durationMs,
         tool,
+        'cancelled',
       );
       return;
     }
@@ -836,7 +908,7 @@ export class AgentService {
             } catch {
               // the process may already be gone
             }
-            finish(() => rejectPromise(new Error('已中止')));
+            finish(() => rejectPromise(new Error('已中断')));
           };
           const child = exec(
             command,
@@ -855,9 +927,10 @@ export class AgentService {
           else signal.addEventListener('abort', onAbort, { once: true });
         }),
       approve: async ({ name, command, reason: rawReason, risk }) => {
+        if (signal.aborted) return 'deny';
         const policy = this.deps.store.getSettings().approval;
         const outcome = autoDecision(policy, command);
-        // 完全访问 / 自动审批放行的命令: nothing waits. The journal still records it.
+        // 完全访问 / 自动审批放行的命令：nothing waits. The journal still records it.
         if (!outcome.ask) return 'allow_once';
 
         const reason = outcome.reason ? `${rawReason} · ${outcome.reason}` : rawReason;
@@ -909,7 +982,7 @@ export class AgentService {
         });
 
         item.decision = decision;
-        item.status = 'done';
+        item.status = signal.aborted ? 'cancelled' : 'done';
         this.emitItem(item);
         doc.thread.status = 'running';
         this.emitThread(doc.thread);
@@ -970,7 +1043,7 @@ export class AgentService {
       remember: async ({ slot, value, scope }) => {
         const result = applyClaim(doc.state.memory, { slot, value, scope: scope as MemoryScope, source: `turn ${turn.index}` });
         doc.state.memory = result.records;
-        this.deps.emit({ type: 'memory/updated', facts: factsOf(doc.state.memory) });
+        this.deps.emit({ type: 'memory/updated', threadId, facts: factsOf(doc.state.memory) });
         return { kind: result.kind, note: result.note };
       },
       setPlan: async (steps: PlanStep[]) => {
@@ -1019,7 +1092,18 @@ export class AgentService {
     }
 
     if (!tool.mutating) {
-      return tool.run(context, args);
+      // Read tools resolve paths at the top of `run`, so a path outside the
+      // workspace throws before the tool can return a failure outcome. Keep
+      // that throw inside the tool contract: the model gets a failed result
+      // it can correct instead of losing the whole turn.
+      try {
+        return await tool.run(context, args);
+      } catch (error) {
+        return readDomainFailure(
+          (error as Error).message || `${tool.name} failed`,
+          `The call did not run. Use a workspace-relative path inside ${context.workspace}, then try again.`,
+        );
+      }
     }
 
     const owner = `thread:${threadId}`;
@@ -1111,7 +1195,7 @@ export class AgentService {
           };
           doc.items.push(item);
           this.emitItem(item);
-          this.deps.emit({ type: 'snapshot/updated', snapshots: doc.snapshots });
+          this.deps.emit({ type: 'snapshot/updated', threadId, snapshots: doc.snapshots });
         }
       }
       return outcome;
@@ -1203,6 +1287,42 @@ export class AgentService {
     return { ok: true, message: result.message, undoSnapshotId: undoId };
   }
 
+  /**
+   * A turn can die between a tool call and its result (a thrown read tool, a
+   * store failure). Leave no call spinning: give it a terminal result so the
+   * transcript matches the turn status even before the turn is re-opened.
+   */
+  private closeRunningToolCalls(doc: ThreadDoc, turn: Turn, message: string, cancelled: boolean): void {
+    const answered = new Set(
+      doc.items.filter((item): item is ToolResultItem => item.kind === 'tool_result').map((item) => item.callId),
+    );
+    for (const item of doc.items) {
+      if (item.kind !== 'tool_call' || item.turnId !== turn.id || answered.has(item.callId)) continue;
+      if (item.status === 'running') {
+        item.status = cancelled ? 'cancelled' : 'error';
+        this.emitItem(item);
+      }
+      const result: ToolResultItem = {
+        id: uid('itm'),
+        threadId: doc.thread.id,
+        turnId: turn.id,
+        kind: 'tool_result',
+        at: Date.now(),
+        status: cancelled ? 'cancelled' : 'error',
+        callId: item.callId,
+        name: item.name,
+        ok: false,
+        summary: cancelled ? '已停止' : '工具没有返回结果',
+        output: cancelled ? '本轮已停止，工具没有返回结果。' : message,
+        layer: 'none',
+        retryable: false,
+      };
+      doc.items.push(result);
+      this.emitItem(result);
+      answered.add(item.callId);
+    }
+  }
+
   private pushResult(
     doc: ThreadDoc,
     turn: Turn,
@@ -1210,6 +1330,7 @@ export class AgentService {
     outcome: Awaited<ReturnType<ToolDefinition['run']>>,
     durationMs: number,
     tool: ToolDefinition | undefined,
+    statusOverride?: ToolResultItem['status'],
   ): void {
     const result: ToolResultItem = {
       id: uid('itm'),
@@ -1217,7 +1338,7 @@ export class AgentService {
       turnId: turn.id,
       kind: 'tool_result',
       at: Date.now(),
-      status: outcome.ok ? 'done' : 'error',
+      status: statusOverride ?? (outcome.ok ? 'done' : 'error'),
       callId: call.id,
       name: tool?.name ?? call.function.name,
       ok: outcome.ok,
@@ -1273,4 +1394,5 @@ function summarizeCall(tool: ToolDefinition, args: Record<string, unknown>): str
   return tool.summary;
 }
 
-export { MAX_STEPS, clamp };
+export { clamp };
+

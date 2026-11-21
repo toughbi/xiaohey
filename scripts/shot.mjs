@@ -180,7 +180,7 @@ async function main() {
     await page.waitForTimeout(300);
     await page.locator('.model-dialog .field input').nth(0).fill('http://127.0.0.1:4788/v1');
     await page.waitForTimeout(250);
-    await page.locator('.model-dialog .select').nth(2).click();
+    await page.locator('.model-dialog .select').nth(1).click();
     await page.waitForTimeout(1200);
     await page.screenshot({ path: join(shots, '23-model-list.png') });
     await page.keyboard.press('Escape');
