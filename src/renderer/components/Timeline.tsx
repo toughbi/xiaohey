@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
+  BookOpen,
   Brain,
   ChevronDown,
   ChevronRight,
@@ -56,6 +57,7 @@ const TOOL_ICON: Record<string, ReactNode> = {
   edit_file: <PencilLine size={15} strokeWidth={1.5} />,
   run_shell: <SquareTerminal size={15} strokeWidth={1.5} />,
   todo_write: <ListChecks size={15} strokeWidth={1.5} />,
+  memory_read: <BookOpen size={15} strokeWidth={1.5} />,
   memory_write: <Brain size={15} strokeWidth={1.5} />,
 };
 
@@ -68,6 +70,7 @@ const TOOL_LABEL: Record<string, string> = {
   edit_file: '编辑文件',
   run_shell: '执行命令',
   todo_write: '更新计划',
+  memory_read: '读取记忆',
   memory_write: '写入记忆',
   ask_user: '向你提问',
 };
@@ -87,6 +90,7 @@ function summarizeTools(calls: ToolCallItem[]): string {
     else if (call.name === 'run_shell') add('exec', '执行命令');
     else if (call.name === 'list_dir' || call.name === 'glob_files') add('browse', '浏览目录');
     else if (call.name === 'todo_write') add('todo', '更新计划');
+    else if (call.name === 'memory_read') add('memory-read', '读取记忆');
     else if (call.name === 'memory_write') add('memory', '写入记忆');
     else add(call.name, '执行工具');
   }
@@ -360,7 +364,7 @@ function CompactionCard({ item }: { item: CompactionItem }) {
   return (
     <details className="compaction">
       <summary>
-        上下文折叠 · {item.foldedItems} 项 · {Math.round(item.tokensBefore / 100) / 10}k →{' '}
+        短期记忆压缩 · 折叠 {item.foldedItems} 轮 · 保留 {item.keptItems} 轮 · {Math.round(item.tokensBefore / 100) / 10}k →{' '}
         {Math.round(item.tokensAfter / 100) / 10}k tokens
       </summary>
       <p>{item.summary}</p>

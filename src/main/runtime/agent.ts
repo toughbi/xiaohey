@@ -10,7 +10,6 @@ import type {
   ContextGauge,
   Item,
   MessageItem,
-  MemoryFact,
   NoticeItem,
   PlanItem,
   PlanStep,
@@ -27,31 +26,47 @@ import type { Store, ThreadDoc } from '../store.js';
 import { Checkpoints } from './checkpoint.js';
 import { LockTable } from './locks.js';
 import { buildContract, checkDrift, MILESTONE_EVERY } from './contract.js';
-import { applyClaim, type MemoryRecord, type MemoryScope } from './memory.js';
+import { LongTermMemory, memoryFacts } from './longterm.js';
+import { ConfiguredEmbedder, type EmbeddingConfig } from './embedding.js';
+import { ConfiguredReranker, type RerankConfig } from './rerank.js';
+import { ShortTermMemory, SHORT_TERM_SUMMARY_PROMPT, mechanicalRoundSummary, type RoundRecord } from './shortterm.js';
+import { WorkingMemory } from './working.js';
+import { memoryRoot } from './memdir.js';
+import { stamp } from './memmark.js';
 import { extractEvents, mergeResolution, parseRelativeTime, resolveEntities } from './resolve.js';
 import { audits } from '../audit.js';
 import {
   auditClaims,
   buildSystemPrompt,
-  foldItems,
+  contextBudget,
+  DEFAULT_CONTEXT_WINDOW,
   gaugeOf,
-  mechanicalSummary,
-  shouldCompact,
-  SUMMARY_PROMPT,
+  shouldCompressHistory,
   toMessages,
+  tokensOf,
 } from './context.js';
 import { complete, LlmError, type ChatMessage, type ToolCall } from './llm.js';
-import { committed, failed, intent, orphanIntents, reconcile, type JournalRecord, type ReconcileOutcome } from './journal.js';
-import { classifyCommand, autoDecision } from './policy.js';
+import { classifyCommand, autoDecision, writeDecision } from './policy.js';
+import { guardedCommit, normalizeWorkspace, workspaceKey } from './commit.js';
+import {
+  commitWorktree,
+  createWorktree,
+  mergeWorktree,
+  prepareConflictResolution,
+  removeWorktree,
+  type WorktreeState,
+} from './worktree.js';
 import { toolByName, toolSpecs, tools, type ToolExecContext, type ToolDefinition } from './tools.js';
 import { noteAttempt, parseArguments, readDomainFailure, schemaRetriesLeft, validateArgs, type RetryLedger, type ToolFailure } from './toolerrors.js';
 import { fileFingerprint } from '../fingerprint.js';
-import { clamp, estimateTokens, formatDuration, resolveInside, stableStringify, truncate, uid } from '../util.js';
+import { clamp, estimateTokens, formatDuration, resolveInside, truncate, uid } from '../util.js';
 
 export interface AgentDeps {
   store: Store;
   emit: (event: RuntimeEvent) => void;
   home: string;
+  /** Overrides `~/.xiaohey` for tests and the demo profile. */
+  memoryHome?: string;
 }
 
 interface PendingApproval {
@@ -64,11 +79,28 @@ interface PendingQuestion {
   resolve: (answer: { answer: string; cancelled: boolean }) => void;
 }
 
+interface PreparedCall {
+  tool: ToolDefinition;
+  args: Record<string, unknown>;
+  callItem: ToolCallItem;
+  context: ToolExecContext;
+  schemaRetries: number;
+}
+
+/**
+ * Tools whose only effect is reading. They take no lease, need no write-ahead
+ * entry and capture no checkpoint, so a batch of them can run at the same time.
+ * Anything mutating, or that blocks on the user, stays strictly sequential.
+ */
+const PARALLEL_READ_TOOLS = new Set(['read_file', 'list_dir', 'glob_files', 'grep_text']);
+const MAX_PARALLEL_READS = 8;
+export { PARALLEL_READ_TOOLS, MAX_PARALLEL_READS };
+
 /**
  * The turn engine.
  *
  * A turn is a bounded loop: assemble context → call the model → execute tool
- * calls under locks/journal/approval → checkpoint → repeat until the model stops
+ * calls under locks/approval → checkpoint → repeat until the model stops
  * asking for tools. Everything the loop needs to survive a crash is written to
  * disk before it is trusted.
  */
@@ -81,13 +113,81 @@ export class AgentService {
   private readonly allowedCommands = new Map<string, Set<string>>();
   private readonly ledger: RetryLedger = { attempts: new Map() };
   private readonly running = new Set<string>();
+  /** threadId → normalized workspace, so a destructive whole-tree action can see its neighbours. */
+  private readonly runningCwd = new Map<string, string>();
+  /** threadId → normalized *effective* tree (worktree path when isolated), for merge/revert addressing. */
+  private readonly trees = new Map<string, string>();
+  private readonly sessions = new Map<string, ShortTermMemory>();
+  readonly memory: LongTermMemory;
+  readonly working: WorkingMemory;
 
   constructor(private readonly deps: AgentDeps) {
     this.locks = new LockTable(join(deps.home, 'leases.json'));
     this.checkpoints = new Checkpoints(join(deps.home, 'snapshots'));
+    const root = deps.memoryHome ?? memoryRoot();
+    this.memory = new LongTermMemory(root, {
+      embedder: new ConfiguredEmbedder(() => this.embeddingConfig()),
+      reranker: new ConfiguredReranker(() => this.rerankConfig()),
+    });
+    this.working = new WorkingMemory(root);
+  }
+
+  /** The embedding provider is the configured one, or the active chat model's endpoint. */
+  private embeddingConfig(): EmbeddingConfig | null {
+    const settings = this.deps.store.getSettings();
+    const embedding = settings.embedding;
+    if (!embedding?.enabled || !embedding.model.trim()) return null;
+    const active = this.deps.store.activeModel();
+    const baseUrl = embedding.baseUrl.trim() || active?.baseUrl.trim() || '';
+    const apiKey = embedding.apiKey.trim() || active?.apiKey || '';
+    if (!baseUrl) return null;
+    return { baseUrl, apiKey, model: embedding.model.trim() };
+  }
+
+  /** Reranking is optional and independent of whether vectors are configured. */
+  private rerankConfig(): RerankConfig | null {
+    const settings = this.deps.store.getSettings();
+    const embedding = settings.embedding;
+    if (!embedding?.enabled || !embedding.rerankModel?.trim()) return null;
+    const active = this.deps.store.activeModel();
+    const baseUrl = embedding.rerankBaseUrl?.trim() || embedding.baseUrl.trim() || active?.baseUrl.trim() || '';
+    const apiKey = embedding.apiKey.trim() || active?.apiKey || '';
+    if (!baseUrl) return null;
+    return { baseUrl, apiKey, model: embedding.rerankModel.trim() };
   }
 
   async init(): Promise<void> {
+    // Memory must never keep the app from starting: a read-only or corrupt
+    // memory file degrades to "no memory", it does not brick the workspace.
+    try {
+      await this.memory.load();
+      await this.memory.maintain();
+      await this.migrateLegacyMemory();
+      // Build/refresh vectors in the background: a local index is immediate, a
+      // provider index can take a few requests and must not delay boot.
+      void this.memory.ensureVectors().catch(() => undefined);
+    } catch {
+      // Memory tool calls will surface the real error if the user asks for them.
+    }
+    try {
+      await this.working.load();
+    } catch {
+      // Working memory is a recovery aid; the turn loop still works without it.
+    }
+
+    const interrupted = await this.working.settleInterrupted().catch(() => []);
+    for (const threadId of interrupted) {
+      const doc = await this.deps.store.load(threadId).catch(() => null);
+      if (!doc) continue;
+      const task = this.working.get(threadId);
+      this.emitNotice(threadId, {
+        tone: 'warn',
+        title: '上一次任务中断，工作记忆已保留',
+        body: `进度写在 ${this.working.file}，最近一步：${task?.steps.at(-1)?.tool ?? '无'}。下一步：${task?.next || '先读工作记忆再继续'}。`,
+      });
+      await this.deps.store.saveNow(threadId);
+    }
+
     await this.locks.load();
     if (this.locks.droppedOnLoad > 0) {
       this.emitNotice(null, {
@@ -97,10 +197,70 @@ export class AgentService {
       });
     }
     await this.recoverInterrupted();
+    await this.recoverWorktrees();
   }
 
   /**
-   * A turn that was still running when the app quit stays `running` on disk. On
+   * The old store kept facts inside each thread's JSON. Move every live record
+   * into `memory.md` once, so a user who upgrades does not lose their facts and
+   * the new UI has something to show.
+   */
+  async migrateLegacyMemory(): Promise<void> {
+    for (const thread of await this.deps.store.listThreads()) {
+      const doc = await this.deps.store.load(thread.id);
+      if (doc) await this.migrateDocMemory(doc);
+    }
+    await this.memory.saveIfDirty();
+  }
+
+  private async migrateDocMemory(doc: ThreadDoc): Promise<void> {
+    if (doc.state.memory.length === 0) return;
+    for (const record of doc.state.memory) this.memory.importLegacy(record, doc.thread.id, doc.thread.cwd);
+    doc.state.memory = [];
+    await this.memory.saveIfDirty();
+    void this.memory.ensureVectors().catch(() => undefined);
+    await this.deps.store.saveNow(doc.thread.id);
+  }
+
+  /** A deleted session takes its short-term file and progress section with it. */
+  async purgeSessionMemory(threadId: string): Promise<void> {
+    const stm = this.sessions.get(threadId) ?? new ShortTermMemory(this.memory.root, threadId);
+    this.sessions.delete(threadId);
+    try {
+      await stm.deleteFile();
+    } catch {
+      // Deleting a session must not fail because a memory file is unreadable.
+    }
+    try {
+      await this.working.remove(threadId);
+    } catch {
+      // Same for the progress file.
+    }
+  }
+
+  /**
+   * The short-term file is the model's conversation window. It is seeded from
+   * the transcript the first time a session is opened after this upgrade, and
+   * rebuilt after a checkpoint revert.
+   */
+  private async shortTermFor(doc: ThreadDoc): Promise<ShortTermMemory> {
+    const cached = this.sessions.get(doc.thread.id);
+    if (cached) return cached;
+    const stm = new ShortTermMemory(this.memory.root, doc.thread.id, {
+      title: doc.thread.title,
+      workspace: doc.thread.cwd,
+    });
+    await stm.load({ title: doc.thread.title, workspace: doc.thread.cwd, turnCount: doc.thread.turnCount }).catch(() => undefined);
+    if (!stm.hasContent() && doc.items.length > 0) {
+      if (stm.seedFromItems(doc.thread, doc.items, doc.state.context.summary)) {
+        await stm.save().catch(() => undefined);
+      }
+    }
+    this.sessions.set(doc.thread.id, stm);
+    return stm;
+  }
+
+  /** A turn that was still running when the app quit stays `running` on disk. On
    * the next launch the composer then offers a stop button that nothing can
    * answer — there is no controller in this process — so the session looks
    * permanently busy. Settle every orphaned turn at boot instead.
@@ -203,20 +363,6 @@ export class AgentService {
     this.deps.emit({ type: 'item/upsert', item });
   }
 
-  private emitContext(threadId: string, doc: ThreadDoc): void {
-    const messages = toMessages(doc.items.slice(doc.state.context.foldedItems), doc.state.context.summary);
-    const gauge: ContextGauge = gaugeOf({
-      messages,
-      budget: this.deps.store.activeModel()?.contextWindow ?? 131_072,
-      compacted: doc.state.context.compacted,
-      memory: doc.state.memory,
-      evidence: doc.state.evidence.length,
-      toolCalls: doc.items.filter((item) => item.kind === 'tool_call').length,
-    });
-    doc.state.context.tokensUsed = gauge.tokensUsed;
-    this.deps.emit({ type: 'runtime/updated', runtime: this.status(threadId, 'thinking', `${gauge.tokensUsed} tokens in context`), context: gauge });
-  }
-
   private emitNotice(threadId: string | null, notice: { tone: NoticeItem['tone']; title: string; body: string }): void {
     if (!threadId) return;
     const doc = this.deps.store.docs.get(threadId);
@@ -317,6 +463,7 @@ export class AgentService {
     if (!doc) throw new Error(`unknown thread ${threadId}`);
     if (this.running.has(threadId)) throw new Error('a turn is already running in this session');
     if (!doc.thread.cwd) throw new Error('请选择工作区后再发送');
+    await this.migrateDocMemory(doc).catch(() => undefined);
 
     const turn: Turn = {
       id: uid('trn'),
@@ -336,6 +483,8 @@ export class AgentService {
     this.emitThread(doc.thread);
     this.deps.emit({ type: 'turn/updated', turn });
 
+    // Concurrency notice is emitted by setupIsolation inside runTurn, where it
+    // knows whether the session got an isolated worktree or fell back to CAS.
     void this.runTurn(doc, turn, prompt, attachments);
     return turn;
   }
@@ -362,6 +511,7 @@ export class AgentService {
   private async runTurn(doc: ThreadDoc, turn: Turn, prompt: string, attachments: string[] = []): Promise<void> {
     const threadId = doc.thread.id;
     this.running.add(threadId);
+    this.runningCwd.set(threadId, normalizeWorkspace(doc.thread.cwd));
     const controller = new AbortController();
     this.controllers.set(threadId, controller);
 
@@ -377,6 +527,37 @@ export class AgentService {
       const model = this.deps.store.activeModel();
       if (!model) {
         throw new LlmError('还没有可用的模型', 0, false, '打开设置 → 模型，添加一个模型后再发送。');
+      }
+
+      // 0.5 Isolation: when another session already runs in this workspace, this
+      // turn works in its own git worktree. Tools and checkpoints
+      // follow the effective tree, so the existing safety layers apply unchanged.
+      const effectiveWorkspace = await this.setupIsolation(doc, turn);
+      this.trees.set(threadId, effectiveWorkspace);
+      const worktree = doc.state.worktree;
+      const isolationNote =
+        worktree && worktree.status !== 'merged' && normalizeWorkspace(effectiveWorkspace) === normalizeWorkspace(worktree.path)
+          ? `Isolation: this turn runs in a private git worktree at ${worktree.path} (branch ${worktree.branch}); the main checkout is ${doc.thread.cwd}. Relative paths resolve against the worktree. At turn end your changes are committed and merged back into the main checkout, gated on the project's typecheck; conflicts are surfaced, never overwritten.${worktree.conflicted?.length ? ` A pending merge left conflict markers in: ${worktree.conflicted.join(', ')}. Resolve them in the worktree, keeping both sides' intent, then finish the turn — the turn-end commit completes the merge.` : ''}`
+          : undefined;
+
+      // Long-term maintenance is time-based, not turn-based: at most one pass
+      // every six hours, and the user is told when something was archived.
+      const maintenance = await this.memory.maintain().catch(() => null);
+      if (maintenance && (maintenance.decayed > 0 || maintenance.archived > 0)) {
+        this.deps.emit({ type: 'memory/updated', threadId, facts: memoryFacts(this.memory.all()) });
+      }
+      if (maintenance && maintenance.archived > 0) {
+        push<NoticeItem>({
+          id: uid('itm'),
+          threadId,
+          turnId: turn.id,
+          kind: 'notice',
+          at: Date.now(),
+          status: 'done',
+          tone: 'info',
+          title: `长期记忆已归档 ${maintenance.archived} 条`,
+          body: '这些记忆长时间没有被召回，按遗忘曲线衰减后移入 memory-archive.md；再次被明确召回时会自动唤醒。',
+        });
       }
 
       // 1. Contract: freeze goal, acceptance, non-goals and forbidden actions.
@@ -400,7 +581,7 @@ export class AgentService {
       const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Shanghai';
       const time = parseRelativeTime(prompt, new Date(), timezone);
       const events = extractEvents(prompt, new Date(), timezone, 'user_message');
-      const entities = resolveEntities(prompt, doc.state.memory);
+      const entities = resolveEntities(prompt, this.memory.all());
       doc.state.resolution = mergeResolution(doc.state.resolution, {
         times: time ? [time] : [],
         events,
@@ -420,31 +601,17 @@ export class AgentService {
         });
       }
 
-      // 3. Reconcile journal entries orphaned by a previous crash.
-      const orphans = orphanIntents(doc.state.journal);
-      for (const orphan of orphans) {
-        const current: Record<string, string> = {};
-        for (const path of Object.keys(orphan.before)) current[path] = await fileFingerprint(path);
-        const verdict = reconcile(orphan, current);
-        doc.state.journal.push({
-          ...orphan,
-          id: `${orphan.idempotencyKey}:reconciled`,
-          phase: 'reconciled',
-          note: `${verdict.outcome}: ${verdict.detail}`,
-          at: Date.now(),
-        });
-        push<NoticeItem>({
-          id: uid('itm'),
+      // Short-term memory is the model-visible conversation window; working
+      // memory is the live task notebook injected into the system prompt.
+      const shortTerm = await this.shortTermFor(doc);
+      await this.working
+        .startTask({
           threadId,
-          turnId: turn.id,
-          kind: 'notice',
-          at: Date.now(),
-          status: 'done',
-          tone: verdict.outcome === 'unknown' ? 'warn' : 'info',
-          title: `已对账中断的步骤 ${orphan.step}（${orphan.tool}）`,
-          body: `${OUTCOME_LABEL[verdict.outcome]} — ${verdict.detail}。没有自动重试。`,
-        });
-      }
+          title: doc.thread.title,
+          cwd: effectiveWorkspace,
+          goal: doc.state.contract?.goal ?? prompt,
+        })
+        .catch(() => undefined);
 
       const references = await this.readReferences(doc.thread.cwd, attachments);
       const userItem: MessageItem = {
@@ -464,6 +631,7 @@ export class AgentService {
       let step = 0;
       let stopReason = 'model finished';
       let lastFinishReason = '';
+      let trimmedNotice = false;
 
       while (true) {
         step += 1;
@@ -474,21 +642,63 @@ export class AgentService {
           break;
         }
 
-        // 4. Context assembly + compaction. The context window covers prompt +
-        // completion, so keep room for the configured max output instead of
-        // filling the whole window with messages. Unknown metadata falls back
-        // to a conservative internal budget; it is not shown as model metadata.
-        let messages = this.messagesFor(doc);
-        const contextBudget = model.contextWindow > 0 ? model.contextWindow : 131_072;
-        const outputReserve = model.maxOutputTokens > 0 ? model.maxOutputTokens : 0;
-        const budget = Math.max(4096, contextBudget - outputReserve);
-        if (shouldCompact(estimateTokens(JSON.stringify(messages)), budget)) {
-          this.deps.emit({ type: 'runtime/updated', runtime: this.status(threadId, 'compacting', 'folding older steps'), context: this.gauge(doc) });
-          const folded = await this.compact(doc, turn, messages);
-          if (folded) messages = this.messagesFor(doc);
+        // 3. Context assembly: short-term memory (summary + last rounds) plus
+        // this turn's live trace. Long-term memory stays behind memory_read.
+        // The history budget is derived from the model window, its output cap,
+        // the system/tool template and a safety margin — not a fixed ratio.
+        const thinking = doc.state.context.thinking === true;
+        const toolList = tools
+          .map((tool) => `- ${tool.name} (${tool.risk}) — ${tool.summary} Use when: ${tool.useWhen} Do NOT use: ${tool.avoidWhen}`)
+          .join('\n');
+        const verification = await this.verification(doc);
+        const planText = doc.state.plan.map((entry) => `- [${entry.status}] ${entry.title}`).join('\n');
+        const provisional = buildSystemPrompt({
+          workspace: effectiveWorkspace,
+          contract: doc.state.contract,
+          plan: planText,
+          working: this.working.render(threadId),
+          memoryIndex: this.memory.indexNote(),
+          resolution: doc.state.resolution,
+          verification,
+          toolList,
+          step,
+          budget: 0,
+          compacted: doc.state.context.compacted > 0,
+          isolationNote,
+        });
+        const budget = contextBudget({
+          contextWindow: model.contextWindow,
+          maxOutputTokens: model.maxOutputTokens,
+          promptTokens: estimateTokens(provisional) + 256,
+          toolTokens: estimateTokens(JSON.stringify(toolSpecs())),
+        });
+
+        let history = shortTerm.messages(thinking);
+        let messages = [...history, ...this.currentTurnMessages(doc)];
+        if (shouldCompressHistory(tokensOf(messages), budget.historyLimit) || shortTerm.shouldCompressByCount(doc.thread.turnCount)) {
+          this.deps.emit({ type: 'runtime/updated', runtime: this.status(threadId, 'compacting', 'compressing older rounds'), context: this.gauge(doc) });
+          const folded = await this.compressShortTerm(doc, turn, shortTerm);
+          if (folded) {
+            history = shortTerm.messages(thinking);
+            messages = [...history, ...this.currentTurnMessages(doc)];
+          }
+          if (tokensOf(messages) > budget.historyLimit) {
+            // A single turn can outgrow the window by itself. Keep every message
+            // and the newest tool pairs; older pairs survive in working memory.
+            const keep = Math.max(1024, budget.historyLimit - tokensOf(history));
+            messages = [...history, ...this.currentTurnMessages(doc, keep)];
+            if (!trimmedNotice) {
+              trimmedNotice = true;
+              this.emitNotice(threadId, {
+                tone: 'warn',
+                title: '本轮上下文超出预算，旧工具步骤已收起',
+                body: '较早的工具调用与结果不再进入模型上下文，但每一步都还在工作记忆（progress.md）里，可以按需重读文件。',
+              });
+            }
+          }
         }
 
-        // 5. Milestone re-read of the verbatim requirement.
+        // 4. Milestone re-read of the verbatim requirement.
         const atMilestone = step > 1 && step % MILESTONE_EVERY === 0;
         if (atMilestone && doc.state.contract) {
           messages = [
@@ -504,22 +714,24 @@ export class AgentService {
           {
             role: 'system',
             content: buildSystemPrompt({
-              workspace: doc.thread.cwd,
+              workspace: effectiveWorkspace,
               contract: doc.state.contract,
-              memory: doc.state.memory,
+              plan: planText,
+              working: this.working.render(threadId),
+              memoryIndex: this.memory.indexNote(),
               resolution: doc.state.resolution,
-              plan: doc.state.plan.map((s) => `- [${s.status}] ${s.title}`).join('\n'),
-              verification: await this.verification(doc),
-              toolList: tools.map((tool) => `- ${tool.name} (${tool.risk}) — ${tool.summary} Use when: ${tool.useWhen} Do NOT use: ${tool.avoidWhen}`).join('\n'),
+              verification,
+              toolList,
               step,
-              budget,
+              budget: budget.historyLimit,
               compacted: doc.state.context.compacted > 0,
+              isolationNote,
             }),
           },
           ...messages,
         ];
 
-        // 6. Model call, streamed into one assistant item.
+        // 5. Model call, streamed into one assistant item.
         this.deps.emit({ type: 'runtime/updated', runtime: this.status(threadId, 'thinking', `第 ${step} 步 · 调用 ${model.model}`), context: this.gauge(doc) });
         const assistantItem: MessageItem = {
           id: uid('itm'),
@@ -601,13 +813,35 @@ export class AgentService {
           break;
         }
 
-        // 7. Tool execution, one call at a time (mutating calls are serialized).
-        for (const call of result.toolCalls) {
-          if (controller.signal.aborted) {
-            stopReason = 'cancelled by the user';
-            break;
+        // 6. Tool execution. Consecutive read-only calls run together; anything that
+        // mutates, or blocks on the user, keeps its strict order.
+        {
+          const calls = result.toolCalls;
+          let cursor = 0;
+          while (cursor < calls.length) {
+            if (controller.signal.aborted) {
+              stopReason = 'cancelled by the user';
+              break;
+            }
+            if (PARALLEL_READ_TOOLS.has(calls[cursor].function.name)) {
+              const group: ToolCall[] = [];
+              while (
+                cursor < calls.length &&
+                group.length < MAX_PARALLEL_READS &&
+                PARALLEL_READ_TOOLS.has(calls[cursor].function.name)
+              ) {
+                group.push(calls[cursor]);
+                cursor += 1;
+              }
+              await this.executeToolGroup(doc, turn, group, step, result.reasoning, controller.signal);
+              for (const call of group) await this.logToolStep(doc, turn, step, call, result.reasoning);
+            } else {
+              const call = calls[cursor];
+              await this.executeTool(doc, turn, call, step, result.reasoning, controller.signal);
+              await this.logToolStep(doc, turn, step, call, result.reasoning);
+              cursor += 1;
+            }
           }
-          await this.executeTool(doc, turn, call, step, result.reasoning, controller.signal);
         }
         await this.deps.store.save(threadId);
         this.emitThread(doc.thread);
@@ -688,70 +922,104 @@ export class AgentService {
         context: this.gauge(doc),
       });
     } finally {
-      this.running.delete(threadId);
-      this.controllers.delete(threadId);
-      await this.locks.releaseAll(`thread:${threadId}`);
-      doc.state.context.tokensUsed = this.gauge(doc).tokensUsed;
-      await this.deps.store.saveNow(threadId);
+      try {
+        await this.locks.releaseAll(`thread:${threadId}`);
+        // Measure before the round is appended to short-term memory; afterwards
+        // the same round would be counted twice (history + current transcript).
+        const finalGauge = this.gauge(doc);
+        try {
+          await this.commitRound(doc, turn);
+        } catch {
+          // Memory persistence is best-effort here: a disk failure must not
+          // leave the session marked as running. The transcript is saved below.
+        }
+        doc.state.context.tokensUsed = finalGauge.tokensUsed;
+        await this.deps.store.saveNow(threadId);
+      } finally {
+        // Release tree occupancy before settling merges so they see the main
+        // tree as free, but keep `running` set until everything is on disk:
+        // callers (and tests) use it as the signal the session is fully settled.
+        this.runningCwd.delete(threadId);
+        this.trees.delete(threadId);
+        try {
+          const state = doc.state.worktree;
+          if (state && state.status === 'active') await this.finalizeWorktree(doc, turn, state);
+          await this.drainPendingMerges(doc.thread.cwd, threadId);
+          await this.deps.store.saveNow(threadId);
+        } catch {
+          // Merge bookkeeping must never mask the turn's own outcome.
+        }
+        this.controllers.delete(threadId);
+        this.running.delete(threadId);
+      }
     }
   }
 
   private gauge(doc: ThreadDoc): ContextGauge {
-    const messages = toMessages(doc.items.slice(doc.state.context.foldedItems), doc.state.context.summary);
+    const stm = this.sessions.get(doc.thread.id);
+    const history = stm?.messages(doc.state.context.thinking === true) ?? [];
+    const messages = [...history, ...this.currentTurnMessages(doc)];
     return gaugeOf({
       messages,
-      budget: this.deps.store.activeModel()?.contextWindow ?? 131_072,
+      budget: this.deps.store.activeModel()?.contextWindow || DEFAULT_CONTEXT_WINDOW,
       compacted: doc.state.context.compacted,
-      memory: doc.state.memory,
+      memoryFacts: this.memory.activeCount(),
       evidence: doc.state.evidence.length,
       toolCalls: doc.items.filter((item) => item.kind === 'tool_call').length,
     });
   }
 
-  private messagesFor(doc: ThreadDoc): ChatMessage[] {
-    return toMessages(doc.items.slice(doc.state.context.foldedItems), doc.state.context.summary, doc.state.context.thinking === true);
+  /**
+   * Messages for the turn in progress only. Past rounds come from short-term
+   * memory, so `doc.items` (the UI transcript, which can be long) is never sent
+   * wholesale.
+   */
+  private currentTurnMessages(doc: ThreadDoc, maxTokens?: number): ChatMessage[] {
+    const turnId = doc.turn?.id;
+    let items = turnId ? doc.items.filter((item) => item.turnId === turnId) : doc.items;
+    const thinking = doc.state.context.thinking === true;
+    if (maxTokens !== undefined && maxTokens > 0) {
+      const full = toMessages(items, '', thinking);
+      if (tokensOf(full) > maxTokens) items = this.trimToolPairs(items, maxTokens, thinking);
+    }
+    return toMessages(items, '', thinking);
   }
 
-  /** Fold older items into a summary; falls back to a mechanical digest when the model is unavailable. */
-  private async compact(doc: ThreadDoc, turn: Turn, messages: ChatMessage[]): Promise<boolean> {
-    const before = doc.state.context.tokensUsed || estimateTokens(JSON.stringify(messages));
-    const items = doc.items;
-    const foldable = Math.max(0, items.length - (items.length - doc.state.context.foldedItems) % 0 - 0);
-    const boundary = Math.max(doc.state.context.foldedItems, items.length - 12);
-    const slice = items.slice(0, boundary);
-    if (slice.length === doc.state.context.foldedItems) return false;
-
-    const foldedText = slice
-      .slice(doc.state.context.foldedItems)
-      .map((item) => {
-        if (item.kind === 'message') return `${item.role}: ${truncate(item.text, 500)}`;
-        if (item.kind === 'tool_call') return `tool ${item.name}(${truncate(JSON.stringify(item.args), 200)})`;
-        if (item.kind === 'tool_result') return `result ${item.ok ? 'ok' : 'failed'}: ${truncate(item.summary, 200)}`;
-        if (item.kind === 'checkpoint') return `checkpoint ${item.step}: ${item.label}`;
-        return '';
-      })
-      .filter(Boolean)
-      .join('\n');
-
-    let summary: string;
-    try {
-      const active = this.deps.store.activeModel();
-      if (!active) return false;
-      const response = await complete(active, [
-        { role: 'system', content: SUMMARY_PROMPT },
-        { role: 'user', content: `${doc.state.context.summary ? `Existing summary:\n${doc.state.context.summary}\n\n` : ''}Fold these steps:\n${foldedText}` },
-      ], { tools: [], retries: 0 });
-      summary = response.content.trim() || mechanicalSummary(slice);
-    } catch {
-      summary = mechanicalSummary(slice);
+  /**
+   * Keep every user/assistant message and the newest tool call/result pairs.
+   * A dropped pair is dropped whole, because an orphaned tool call breaks the
+   * OpenAI message contract; the step still exists in working memory.
+   */
+  private trimToolPairs(items: Item[], maxTokens: number, thinking: boolean): Item[] {
+    const messageTokens = tokensOf(toMessages(items.filter((item) => item.kind === 'message'), '', thinking));
+    const allowed = new Set<string>();
+    let remaining = Math.max(512, maxTokens - messageTokens);
+    const calls = items.filter((item): item is ToolCallItem => item.kind === 'tool_call');
+    for (let index = calls.length - 1; index >= 0; index -= 1) {
+      const call = calls[index];
+      const result = items.find((item): item is ToolResultItem => item.kind === 'tool_result' && item.callId === call.callId);
+      const cost = estimateTokens(JSON.stringify(call.args)) + (result ? estimateTokens(result.output) : 0) + 24;
+      if (allowed.size > 0 && remaining - cost < 0) break;
+      allowed.add(call.callId);
+      remaining -= cost;
     }
+    return items.filter((item) => {
+      if (item.kind === 'message') return true;
+      if (item.kind === 'tool_call' || item.kind === 'tool_result') return allowed.has(item.callId);
+      return true;
+    });
+  }
 
-    doc.state.context.summary = summary;
-    doc.state.context.foldedItems = boundary;
-    doc.state.context.compacted += 1;
-    const after = estimateTokens(JSON.stringify(toMessages(items.slice(boundary), summary)));
-    doc.state.context.tokensUsed = after;
-
+  /** Fold older rounds into the short-term summary; emits one visible compaction card. */
+  private async compressShortTerm(doc: ThreadDoc, turn: Turn, stm: ShortTermMemory): Promise<boolean> {
+    const thinking = doc.state.context.thinking === true;
+    const before = tokensOf(stm.messages(thinking));
+    const result = await stm.compress((folded, previous) => this.summarizeRounds(folded, previous));
+    if (!result) return false;
+    await stm.save().catch(() => undefined);
+    doc.state.context.summary = stm.summary;
+    doc.state.context.compacted = stm.compressed;
+    const after = tokensOf(stm.messages(thinking));
     const compaction: CompactionItem = {
       id: uid('itm'),
       threadId: doc.thread.id,
@@ -761,22 +1029,130 @@ export class AgentService {
       status: 'done',
       tokensBefore: before,
       tokensAfter: after,
-      foldedItems: boundary,
-      keptItems: items.length - boundary,
-      summary,
+      foldedItems: result.folded,
+      keptItems: result.kept,
+      summary: stm.summary,
     };
     doc.items.push(compaction);
     this.emitItem(compaction);
-    void foldable;
     return true;
+  }
+
+  private async summarizeRounds(folded: readonly RoundRecord[], previous: string): Promise<string> {
+    const active = this.deps.store.activeModel();
+    if (!active) return mechanicalRoundSummary(folded);
+    const transcript = folded
+      .map((round) => {
+        const tools = round.tools.map((tool) => `- ${tool.name} · ${tool.ok ? 'ok' : 'failed'} · ${tool.summary}`).join('\n');
+        return `第 ${round.index} 轮（${stamp(round.at)}）\n用户：${round.prompt}\n工具步骤：\n${tools || '（无）'}\n助手：${round.assistant || '（无正文）'}\n下一步：${round.next || '未记录'}`;
+      })
+      .join('\n\n');
+    try {
+      const response = await complete(
+        active,
+        [
+          { role: 'system', content: SHORT_TERM_SUMMARY_PROMPT },
+          { role: 'user', content: `${previous ? `已有摘要：\n${previous}\n\n` : ''}需要压缩的轮次：\n${transcript}` },
+        ],
+        { tools: [], retries: 0 },
+      );
+      const text = response.content.trim();
+      return text || mechanicalRoundSummary(folded);
+    } catch {
+      return mechanicalRoundSummary(folded);
+    }
+  }
+
+  /**
+   * Close the turn's books: append the round to short-term memory, sync the
+   * visible context counters, and leave working memory with a concrete next step
+   * so an interruption is resumable.
+   */
+  private async commitRound(doc: ThreadDoc, turn: Turn): Promise<void> {
+    const threadId = doc.thread.id;
+    const stm = await this.shortTermFor(doc);
+    const items = doc.items.filter((item) => item.turnId === turn.id);
+    const user = items.find((item): item is MessageItem => item.kind === 'message' && item.role === 'user');
+    const assistants = items.filter(
+      (item): item is MessageItem => item.kind === 'message' && item.role === 'assistant' && item.text.trim().length > 0,
+    );
+    const results = new Map(
+      items.filter((item): item is ToolResultItem => item.kind === 'tool_result').map((item) => [item.callId, item]),
+    );
+    const tools = items
+      .filter((item): item is ToolCallItem => item.kind === 'tool_call')
+      .map((call) => {
+        const result = results.get(call.callId);
+        return {
+          name: call.name,
+          summary: result?.summary ?? call.summary,
+          ok: result?.ok !== false,
+        };
+      });
+    const outcome: RoundRecord['outcome'] =
+      turn.status === 'completed' ? 'completed' : turn.status === 'cancelled' ? 'cancelled' : 'failed';
+    const pending = doc.state.plan.find((entry) => entry.status === 'active') ?? doc.state.plan.find((entry) => entry.status === 'pending');
+    const wroteMemory = tools.some((tool) => tool.name === 'memory_write' && tool.ok);
+    const next =
+      turn.status === 'completed'
+        ? pending
+          ? `继续计划：${pending.title}`
+          : wroteMemory
+            ? '本轮计划已走完，长期记忆已写入。'
+            : '本轮计划已走完；如果任务/工程整体完成，用 memory_write 写入长期记忆。'
+        : turn.status === 'cancelled'
+          ? '本轮被用户停止；下一轮先读工作记忆，问用户是否从「下一步」继续。'
+          : '本轮失败；下一轮先读工作记忆和错误信息，修复后再继续。';
+    stm.recordRound(
+      {
+        index: turn.index,
+        at: turn.startedAt,
+        prompt: user?.text ?? turn.prompt,
+        assistant: assistants.at(-1)?.text ?? '',
+        tools,
+        outcome,
+        next,
+      },
+      doc.thread.turnCount,
+    );
+    await stm.save();
+    doc.state.context.summary = stm.summary;
+    doc.state.context.compacted = stm.compressed;
+
+    await this.working
+      .recordStep({
+        threadId,
+        turn: turn.index,
+        step: turn.step,
+        tool: 'turn_end',
+        detail: `第 ${turn.index} 轮结束`,
+        intent: '收起本轮，写下可续接的下一步',
+        result: truncate(assistants.at(-1)?.text ?? outcome, 300),
+        ok: outcome === 'completed',
+        next,
+      })
+      .catch(() => undefined);
+    await this.working.finish({
+      threadId,
+      status:
+        turn.status === 'completed'
+          ? pending
+            ? 'paused'
+            : 'done'
+          : turn.status === 'cancelled'
+            ? 'interrupted'
+            : 'failed',
+      next,
+    });
   }
 
   /** Ground-truth verification: what actually changed on disk, not what the model said. */
   private async verification(doc: ThreadDoc): Promise<string> {
     const lines: string[] = [];
-    const committedSteps = doc.state.journal.filter((record) => record.phase === 'committed');
-    if (committedSteps.length > 0) {
-      lines.push(`${committedSteps.length} write steps committed; last: ${committedSteps.at(-1)?.summary ?? ''}`);
+    const task = this.working.get(doc.thread.id);
+    const writeSteps = (task?.steps ?? []).filter((step) => step.target && step.phase === 'done' && step.ok);
+    if (writeSteps.length > 0) {
+      lines.push(`${writeSteps.length} write steps committed; last: ${writeSteps.at(-1)?.detail ?? ''}`);
     }
     const shellResults = doc.items.filter((item): item is ToolResultItem => item.kind === 'tool_result' && item.name === 'run_shell');
     for (const result of shellResults.slice(-2)) {
@@ -786,12 +1162,19 @@ export class AgentService {
     if (latest) {
       lines.push(`checkpoint ${latest.id} holds ${latest.files.length} files, ${Math.round(latest.sizeBytes / 1024)} KB`);
     }
-    const audited = audits(doc);
+    const audited = audits(doc, task);
     lines.push(...audited);
     return lines.join('\n');
   }
 
-  private async executeTool(doc: ThreadDoc, turn: Turn, call: ToolCall, step: number, reasoning: string | undefined, signal: AbortSignal): Promise<void> {
+  private prepareCall(
+    doc: ThreadDoc,
+    turn: Turn,
+    call: ToolCall,
+    step: number,
+    reasoning: string | undefined,
+    signal: AbortSignal,
+  ): PreparedCall | null {
     const threadId = doc.thread.id;
     const tool = toolByName.get(call.function.name);
     const callItem: ToolCallItem = {
@@ -826,7 +1209,7 @@ export class AgentService {
       callItem.summary = failure.summary;
       this.emitItem(callItem);
       this.pushResult(doc, turn, call, failure, 0, undefined);
-      return;
+      return null;
     }
 
     const parsed = parseArguments(tool.name, call.function.arguments);
@@ -835,19 +1218,32 @@ export class AgentService {
       callItem.summary = parsed.summary;
       this.emitItem(callItem);
       this.pushResult(doc, turn, call, parsed, 0, undefined);
-      return;
+      return null;
     }
 
     callItem.args = parsed.args;
     callItem.summary = summarizeCall(tool, parsed.args);
     this.emitItem(callItem);
 
-    const schemaRetries = schemaRetriesLeft(this.ledger, call.id);
-    const context = this.toolContext(doc, turn, step, signal);
+    return {
+      tool,
+      args: parsed.args,
+      callItem,
+      context: this.toolContext(doc, turn, step, signal),
+      schemaRetries: schemaRetriesLeft(this.ledger, call.id),
+    };
+  }
 
-    const started = Date.now();
-    const outcome = await this.invoke(doc, turn, tool, parsed.args, context, call.id);
-    const durationMs = Date.now() - started;
+  private finishCall(
+    doc: ThreadDoc,
+    turn: Turn,
+    call: ToolCall,
+    prepared: PreparedCall,
+    outcome: Awaited<ReturnType<ToolDefinition['run']>>,
+    durationMs: number,
+    signal: AbortSignal,
+  ): void {
+    const { tool, callItem, schemaRetries } = prepared;
 
     if (signal.aborted) {
       callItem.status = 'cancelled';
@@ -880,15 +1276,111 @@ export class AgentService {
     if (!outcome.ok) callItem.summary = outcome.summary;
     this.emitItem(callItem);
     this.pushResult(doc, turn, call, outcome, durationMs, tool);
-    await this.deps.store.save(threadId);
+  }
+
+  private async executeTool(doc: ThreadDoc, turn: Turn, call: ToolCall, step: number, reasoning: string | undefined, signal: AbortSignal): Promise<void> {
+    const prepared = this.prepareCall(doc, turn, call, step, reasoning, signal);
+    if (!prepared) return;
+    const started = Date.now();
+    const outcome = await this.invoke(doc, turn, prepared.tool, prepared.args, prepared.context, call.id);
+    this.finishCall(doc, turn, call, prepared, outcome, Date.now() - started, signal);
+    await this.deps.store.save(doc.thread.id);
+  }
+
+  /**
+   * Run a batch of read-only calls together. Items are still created in call
+   * order before any of them runs, so the transcript reads the same as a serial
+   * run; results are finalized in order too, even if they finish out of order.
+   */
+  private async executeToolGroup(
+    doc: ThreadDoc,
+    turn: Turn,
+    calls: ToolCall[],
+    step: number,
+    reasoning: string | undefined,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const prepared: Array<{ call: ToolCall; prep: PreparedCall }> = [];
+    for (const call of calls) {
+      const prep = this.prepareCall(doc, turn, call, step, reasoning, signal);
+      if (prep) prepared.push({ call, prep });
+    }
+    if (prepared.length === 0) return;
+
+    const settled = await Promise.all(
+      prepared.map(async ({ call, prep }) => {
+        const started = Date.now();
+        const outcome = await this.invoke(doc, turn, prep.tool, prep.args, prep.context, call.id).catch(
+          (error: Error): ToolFailure => ({
+            ok: false,
+            layer: 'transient',
+            summary: 'tool threw',
+            detail: error.message,
+            hint: 'Retry once; if it throws again the environment is at fault.',
+            retryable: true,
+          }),
+        );
+        return { call, prep, outcome, durationMs: Date.now() - started };
+      }),
+    );
+
+    for (const entry of settled) {
+      this.finishCall(doc, turn, entry.call, entry.prep, entry.outcome, entry.durationMs, signal);
+    }
+    await this.deps.store.save(doc.thread.id);
+  }
+
+  /**
+   * One line per executed tool in working memory: which tool, why, what came
+   * back, and what should happen next. Written immediately so an interrupted
+   * turn is resumable step by step.
+   */
+  private async logToolStep(doc: ThreadDoc, turn: Turn, step: number, call: ToolCall, reasoning?: string): Promise<void> {
+    const callItem = [...doc.items]
+      .reverse()
+      .find((item): item is ToolCallItem => item.kind === 'tool_call' && item.callId === call.id);
+    const resultItem = [...doc.items]
+      .reverse()
+      .find((item): item is ToolResultItem => item.kind === 'tool_result' && item.callId === call.id);
+    const name = callItem?.name ?? call.function.name;
+    const args = callItem?.args ?? {};
+    const purpose = typeof args.purpose === 'string' ? args.purpose.trim() : '';
+    const intent =
+      purpose ||
+      (reasoning?.trim() ? truncate(reasoning.trim().replace(/\s+/g, ' '), 300) : '') ||
+      whyForTool(name, args) ||
+      toolByName.get(name)?.useWhen ||
+      '继续当前步骤';
+    try {
+      await this.working.recordStep({
+        threadId: doc.thread.id,
+        turn: turn.index,
+        step,
+        tool: name,
+        callId: call.id,
+        detail: callItem?.summary ?? '',
+        intent,
+        result: resultItem?.summary ?? callItem?.summary ?? '没有返回结果',
+        ok: resultItem?.ok === true,
+        next: this.nextStep(doc),
+      });
+    } catch {
+      // The progress file is a recovery aid; a write failure must not stop the turn.
+    }
+  }
+
+  private nextStep(doc: ThreadDoc): string {
+    const pending = doc.state.plan.find((entry) => entry.status === 'active') ?? doc.state.plan.find((entry) => entry.status === 'pending');
+    return pending ? `继续计划：${pending.title}` : '继续当前任务';
   }
 
   private toolContext(doc: ThreadDoc, turn: Turn, step: number, signal: AbortSignal): ToolExecContext {
     const threadId = doc.thread.id;
+    const workspace = this.trees.get(threadId) ?? doc.thread.cwd;
     return {
       threadId: doc.thread.id,
       turnId: turn.id,
-      workspace: doc.thread.cwd,
+      workspace,
       shell: (command, timeoutMs, cwd) =>
         new Promise((resolvePromise, rejectPromise) => {
           let settled = false;
@@ -926,11 +1418,13 @@ export class AgentService {
           if (signal.aborted) onAbort();
           else signal.addEventListener('abort', onAbort, { once: true });
         }),
-      approve: async ({ name, command, reason: rawReason, risk }) => {
+      approve: async ({ name, command, reason: rawReason, risk, tier }) => {
         if (signal.aborted) return 'deny';
         const policy = this.deps.store.getSettings().approval;
-        const outcome = autoDecision(policy, command);
-        // 完全访问 / 自动审批放行的命令：nothing waits. The journal still records it.
+        // Commands and file writes share the three modes but not the classifier:
+        // a shell command is judged by what it runs, a write by what it destroys.
+        const outcome = risk === 'write' ? writeDecision(policy, tier ?? 'medium') : autoDecision(policy, command);
+        // 完全访问 / 自动审批放行的动作：nothing waits. Working memory still records it.
         if (!outcome.ask) return 'allow_once';
 
         const reason = outcome.reason ? `${rawReason} · ${outcome.reason}` : rawReason;
@@ -948,6 +1442,7 @@ export class AgentService {
           command,
           reason,
           risk,
+          ...(tier ? { tier } : {}),
         };
         const item: ApprovalItem = {
           id: approval.id,
@@ -1040,11 +1535,20 @@ export class AgentService {
         }
         return answer;
       },
-      remember: async ({ slot, value, scope }) => {
-        const result = applyClaim(doc.state.memory, { slot, value, scope: scope as MemoryScope, source: `turn ${turn.index}` });
-        doc.state.memory = result.records;
-        this.deps.emit({ type: 'memory/updated', threadId, facts: factsOf(doc.state.memory) });
+      remember: async (entry) => {
+        const scope = entry.scope === 'global' ? { kind: 'global' as const } : { kind: 'path' as const, path: doc.thread.cwd };
+        const result = await this.memory.write({
+          ...entry,
+          scope: entry.kind === 'knowledge' ? scope : undefined,
+          source: `${threadId} · 第 ${turn.index} 轮`,
+        });
+        this.deps.emit({ type: 'memory/updated', threadId, facts: memoryFacts(this.memory.all()) });
         return { kind: result.kind, note: result.note };
+      },
+      recall: async (input) => {
+        const result = await this.memory.recall(input);
+        this.deps.emit({ type: 'memory/updated', threadId, facts: memoryFacts(this.memory.all()) });
+        return result;
       },
       setPlan: async (steps: PlanStep[]) => {
         doc.state.plan = steps;
@@ -1066,10 +1570,19 @@ export class AgentService {
       evidence: (tag) => {
         doc.state.evidence.push(tag);
       },
+      commitFile: (target, content, expected) =>
+        guardedCommit({
+          locks: this.locks,
+          workspace,
+          target,
+          content,
+          expected,
+          owner: `thread:${threadId}`,
+        }),
     };
   }
 
-  /** Schema validation, drift guard, locking, journal and checkpoint for one call. */
+  /** Schema validation, drift guard, locking, write-ahead working memory and checkpoint for one call. */
   private async invoke(
     doc: ThreadDoc,
     turn: Turn,
@@ -1108,7 +1621,13 @@ export class AgentService {
 
     const owner = `thread:${threadId}`;
     const target = String(args.path ?? '');
-    const lockKey = target ? resolve(context.workspace, target) : `exec:${tool.name}`;
+    // `run_shell` may touch any file in the tree, so its lease is the whole
+    // workspace; a per-file key would let a shell run beside a write.
+    const lockKey = target
+      ? resolve(context.workspace, target)
+      : tool.name === 'run_shell'
+        ? workspaceKey(context.workspace)
+        : `exec:${tool.name}`;
     const fingerprint = target ? await fileFingerprint(lockKey) : 'n/a';
 
     const acquired = await this.locks
@@ -1139,16 +1658,19 @@ export class AgentService {
       });
     }
 
-    const idempotencyKey = `${callId}:${stableStringify(args).length}:${hashText(stableStringify(args))}`;
-    const record = intent({
-      step: turn.step,
-      callId,
-      tool: tool.name,
-      idempotencyKey,
-      before: target ? { [lockKey]: fingerprint } : {},
-      summary: summarizeCall(tool, args),
-    });
-    doc.state.journal.push(record);
+    await this.working
+      .beginStep({
+        threadId,
+        turn: turn.index,
+        step: turn.step,
+        tool: tool.name,
+        callId,
+        detail: summarizeCall(tool, args),
+        intent: typeof args.purpose === 'string' ? args.purpose.trim() : '',
+        target: target ? lockKey : undefined,
+        before: target ? fingerprint : undefined,
+      })
+      .catch(() => undefined);
 
     try {
       // Capture BEFORE the tool touches disk: a snapshot is the state to go
@@ -1173,8 +1695,6 @@ export class AgentService {
 
       const outcome = await tool.run(context, args);
       {
-        const after = target ? await fileFingerprint(lockKey) : 'n/a';
-        doc.state.journal.push(committed(record, target ? { [lockKey]: after } : {}, outcome.ok ? outcome.summary : 'failed'));
         const touched = (outcome.ok ? outcome.files : undefined) ?? (target ? [target] : []);
         if (outcome.ok && touched.length > 0) {
           const meta = (await this.checkpoints.restat(threadId, pre.id, context.workspace)) ?? pre;
@@ -1200,7 +1720,6 @@ export class AgentService {
       }
       return outcome;
     } catch (error) {
-      doc.state.journal.push(failed(record, (error as Error).message));
       return { ok: false, layer: 'transient', summary: 'tool threw', detail: (error as Error).message, hint: 'Retry once; if it throws again the environment is at fault.', retryable: true };
     } finally {
       await this.locks.release(lockKey, owner);
@@ -1216,13 +1735,54 @@ export class AgentService {
   async previewRevert(threadId: string, snapshotId: string) {
     const doc = await this.deps.store.load(threadId);
     if (!doc) return { entries: [] as never[] };
-    return this.checkpoints.preview(threadId, snapshotId, doc.thread.cwd);
+    return this.checkpoints.preview(threadId, snapshotId, this.treeOf(doc));
+  }
+
+  /** The tree this session's snapshots address: its worktree while unmerged, else the main checkout. */
+  private treeOf(doc: ThreadDoc): string {
+    const worktree = doc.state.worktree;
+    return worktree && worktree.status !== 'merged' ? worktree.path : doc.thread.cwd;
   }
 
   async revert(threadId: string, snapshotId: string): Promise<{ ok: boolean; message: string; undoSnapshotId?: string }> {
     const doc = await this.deps.store.load(threadId);
     if (!doc) return { ok: false, message: 'unknown session' };
     if (this.running.has(threadId)) return { ok: false, message: 'stop the running turn before reverting' };
+
+    if (doc.state.worktree?.status === 'merged') {
+      return {
+        ok: false,
+        message: '该会话的隔离副本已合并回主工作区并清理，旧快照不能直接套回主工作区。要撤销这次合并，在主工作区用 git revert 对应的合并提交。',
+      };
+    }
+
+    // A revert restores the whole tree, so it would silently overwrite whatever
+    // another session is doing in the same tree. Isolated worktrees are private,
+    // so only sessions sharing this exact tree count as neighbours.
+    const tree = this.treeOf(doc);
+    const neighbours = [...this.trees.entries()].filter(([id, t]) => id !== threadId && normalizeWorkspace(t) === normalizeWorkspace(tree));
+    if (neighbours.length > 0) {
+      return {
+        ok: false,
+        message: `同一工作区还有 ${neighbours.length} 个会话在运行（${neighbours.map(([id]) => id.slice(0, 8)).join('、')}）。回退会覆盖它们的改动，先停止它们再试。`,
+      };
+    }
+
+    const workspaceLock = workspaceKey(tree);
+    try {
+      await this.locks.acquire(workspaceLock, `revert:${threadId}`, { fingerprint: 'n/a', waitMs: 5_000 });
+    } catch (error) {
+      return { ok: false, message: `工作区正忙，先等写操作结束：${(error as Error).message}` };
+    }
+
+    try {
+      return await this.revertLocked(doc, threadId, snapshotId, tree);
+    } finally {
+      await this.locks.release(workspaceLock, `revert:${threadId}`);
+    }
+  }
+
+  private async revertLocked(doc: ThreadDoc, threadId: string, snapshotId: string, tree: string): Promise<{ ok: boolean; message: string; undoSnapshotId?: string }> {
 
     // Snapshot the current state first: a revert should be undoable too.
     const undoId = `undo-${Date.now().toString(36)}`;
@@ -1232,7 +1792,7 @@ export class AgentService {
         id: undoId,
         step: 0,
         label: '回退前',
-        workspace: doc.thread.cwd,
+        workspace: tree,
         state: {
           items: doc.items,
           plan: doc.state.plan,
@@ -1249,7 +1809,7 @@ export class AgentService {
       // if the pre-snapshot fails, still prefer a correct revert
     }
 
-    const result = await this.checkpoints.revert(threadId, snapshotId, doc.thread.cwd);
+    const result = await this.checkpoints.revert(threadId, snapshotId, tree);
     if (!result.ok) return { ok: false, message: result.message };
 
     const restored = result.state as
@@ -1266,6 +1826,27 @@ export class AgentService {
       doc.state.context.foldedItems = restored.foldedItems ?? 0;
     }
 
+    // The short-term window is derived state: rebuild it from the restored
+    // transcript, or the model would keep the rounds the revert just removed.
+    try {
+      const stm = await this.shortTermFor(doc);
+      stm.seedFromItems(doc.thread, doc.items, doc.state.context.summary, true);
+      await stm.save();
+    } catch {
+      // A memory rebuild failure must not block the file revert itself.
+    }
+    await this.working.recordStep({
+      threadId,
+      turn: doc.turn?.index ?? 0,
+      step: 0,
+      tool: 'snapshot_revert',
+      detail: snapshotId,
+      intent: '用户要求回到之前的检查点',
+      result: result.message,
+      ok: result.ok,
+      next: '重新确认当前状态，不要重复被回退掉的改动',
+    }).catch(() => undefined);
+
     const snapshot = doc.snapshots.find((entry) => entry.id === snapshotId);
     const notice: NoticeItem = {
       id: uid('itm'),
@@ -1280,11 +1861,168 @@ export class AgentService {
     };
     doc.items.push(notice);
     doc.thread.status = 'idle';
-    doc.state.journal = doc.state.journal.filter((record) => record.phase !== 'intent');
     this.emitItem(notice);
     this.emitThread(doc.thread);
     await this.deps.store.saveNow(threadId);
     return { ok: true, message: result.message, undoSnapshotId: undoId };
+  }
+
+  /**
+   * Decide where this turn works. The first session in a workspace keeps the
+   * main checkout; every additional concurrent session gets its own worktree,
+   * so write sets are disjoint by construction. A non-git workspace falls back
+   * to the lease/CAS path with a notice — isolation is an optimization, never
+   * a prerequisite for running.
+   */
+  private async setupIsolation(doc: ThreadDoc, turn: Turn): Promise<string> {
+    const threadId = doc.thread.id;
+    const workspace = doc.thread.cwd;
+    const existing = doc.state.worktree;
+
+    if (existing && existing.status !== 'merged') {
+      // A previous turn left unmerged work (deferred merge, conflict, or crash):
+      // commit what landed and retry the merge before doing anything new.
+      await this.finalizeWorktree(doc, turn, existing);
+      const settled = doc.state.worktree;
+      if (settled && settled.status === 'pending') {
+        if (!this.mainTreeBusy(workspace, threadId)) {
+          const resolution = await prepareConflictResolution(workspace, settled).catch(() => null);
+          if (resolution?.ok) {
+            doc.state.worktree = { ...settled, conflicted: resolution.conflicted, detail: resolution.detail };
+            this.emitNotice(threadId, {
+              tone: resolution.conflicted.length > 0 ? 'warn' : 'info',
+              title: resolution.conflicted.length > 0 ? '合并冲突已放入副本，等待解决' : '主工作区改动已并入副本',
+              body: `${resolution.detail}解决后正常结束回合即可，收尾时会重新合并回主工作区。`,
+            });
+          }
+        }
+        return settled.path;
+      }
+      // Merged: fall through — this turn may still need a fresh worktree.
+    }
+
+    const neighbours = (): Array<[string, string]> =>
+      [...this.runningCwd.entries()].filter(([id, cwd]) => id !== threadId && cwd === normalizeWorkspace(workspace));
+    if (neighbours().length === 0) return workspace;
+
+    // Serialize check-and-create so two simultaneous starts cannot both claim
+    // the main tree. A dedicated key: shells holding the workspace mutex must
+    // not push a starting session back into the shared tree.
+    const setupKey = `setup:${normalizeWorkspace(workspace)}`;
+    await this.locks.acquire(setupKey, `setup:${threadId}`, { fingerprint: 'n/a', waitMs: 10_000 }).catch(() => undefined);
+    try {
+      const count = neighbours().length;
+      if (count === 0) return workspace;
+      const created = await createWorktree({ home: this.deps.home, workspace, threadId });
+      if (!created.ok) {
+        this.emitNotice(threadId, {
+          tone: 'info',
+          title: '同一工作区还有另一个会话在运行',
+          body: `正在并行：${count} 个。${created.reason}，本会话沿用写前校验：写文件前会核对内容有没有被改过，改不动就报冲突；整体回退需要先停掉其他会话。`,
+        });
+        return workspace;
+      }
+      doc.state.worktree = created.state;
+      this.emitNotice(threadId, {
+        tone: 'info',
+        title: '本会话在隔离副本中工作',
+        body: `同一工作区还有 ${count} 个会话在运行。本回合改动写在独立 git worktree（分支 ${created.state.branch}），回合结束后自动合并回主工作区并跑 typecheck 验证；冲突或验证失败会保留分支提示处理，不会覆盖别人的改动。`,
+      });
+      return created.state.path;
+    } finally {
+      await this.locks.release(setupKey, `setup:${threadId}`);
+    }
+  }
+
+  /** True while another session's turn runs in the main checkout of this workspace. */
+  private mainTreeBusy(workspace: string, excludeThreadId: string): boolean {
+    const main = normalizeWorkspace(workspace);
+    return [...this.trees.entries()].some(([id, tree]) => id !== excludeThreadId && normalizeWorkspace(tree) === main);
+  }
+
+  /**
+   * Commit the worktree and merge it home, serially and behind the typecheck
+   * gate. Success cleans up checkout and branch; anything else keeps both and
+   * records a pending state the next turn start (or a neighbour's turn end)
+   * retries. Never throws: the turn's own outcome must not be masked.
+   */
+  private async finalizeWorktree(doc: ThreadDoc, turn: Turn | null, state: WorktreeState): Promise<void> {
+    const threadId = doc.thread.id;
+    const workspace = doc.thread.cwd;
+    try {
+      const changed = await commitWorktree(state, `xiaohey: 会话「${doc.thread.title}」${turn ? ` 第 ${turn.index} 轮` : ''}`);
+      if (!changed && state.status === 'active') {
+        await removeWorktree(workspace, state, true);
+        doc.state.worktree = { ...state, status: 'merged', detail: '本回合没有改动，副本已清理。' };
+        return;
+      }
+      const result = await mergeWorktree({
+        workspace,
+        state,
+        locks: this.locks,
+        owner: `merge:${threadId}`,
+        title: doc.thread.title,
+        mainBusy: () => this.mainTreeBusy(workspace, threadId),
+      });
+      doc.state.worktree = { ...state, status: result.status === 'merged' ? 'merged' : 'pending', detail: result.detail, conflicted: result.conflicted };
+      this.emitNotice(threadId, {
+        tone: result.status === 'merged' ? 'info' : 'warn',
+        title: result.status === 'merged' ? '隔离副本已合并回主工作区' : '改动暂存于隔离分支，待合并',
+        body:
+          result.status === 'merged'
+            ? `${result.detail}分支 ${state.branch} 与副本已清理。`
+            : `${result.detail}继续本会话会自动重试合并；也可以直接用 git 处理该分支。`,
+      });
+    } catch (error) {
+      doc.state.worktree = { ...state, status: 'pending', detail: (error as Error).message };
+      this.emitNotice(threadId, {
+        tone: 'warn',
+        title: '隔离副本收尾失败',
+        body: `${(error as Error).message}。改动保留在分支 ${state.branch}，继续本会话会自动重试。`,
+      });
+    }
+  }
+
+  /** After any turn ends in a workspace, retry other sessions' deferred merges. */
+  private async drainPendingMerges(workspace: string, excludeThreadId: string): Promise<void> {
+    if (!workspace) return;
+    try {
+      for (const thread of await this.deps.store.listThreads()) {
+        if (thread.id === excludeThreadId || normalizeWorkspace(thread.cwd) !== normalizeWorkspace(workspace)) continue;
+        const doc = await this.deps.store.load(thread.id);
+        const state = doc?.state.worktree;
+        if (!doc || !state || state.status !== 'pending' || this.running.has(thread.id)) continue;
+        await this.finalizeWorktree(doc, null, state);
+        await this.deps.store.saveNow(thread.id);
+      }
+    } catch {
+      // Draining is opportunistic; the next turn end or session start retries.
+    }
+  }
+
+  /** A crash can leave a checkout behind: commit what landed, merge it home. */
+  private async recoverWorktrees(): Promise<void> {
+    try {
+      for (const thread of await this.deps.store.listThreads()) {
+        const doc = await this.deps.store.load(thread.id);
+        const state = doc?.state.worktree;
+        if (!doc || !state || state.status === 'merged' || this.running.has(thread.id)) continue;
+        await this.finalizeWorktree(doc, null, state);
+        await this.deps.store.saveNow(thread.id);
+      }
+    } catch {
+      // Recovery is best-effort; the next turn start retries.
+    }
+  }
+
+  /** Deleting a session removes its checkout but keeps an unmerged branch: work is never silently lost. */
+  async disposeWorktree(threadId: string): Promise<void> {
+    const doc = this.deps.store.docs.get(threadId) ?? (await this.deps.store.load(threadId));
+    const state = doc?.state.worktree;
+    if (!doc || !state) return;
+    if (state.status !== 'merged') await removeWorktree(doc.thread.cwd, state, false).catch(() => undefined);
+    doc.state.worktree = null;
+    await this.deps.store.saveNow(threadId).catch(() => undefined);
   }
 
   /**
@@ -1359,39 +2097,44 @@ function thresholdMessage(changed: boolean): string {
   return changed ? '失效的租约已接管，目标已重新读取' : '失效的租约已接管';
 }
 
-const OUTCOME_LABEL: Record<ReconcileOutcome, string> = {
-  applied: '已落地',
-  'not-applied': '未落地',
-  unknown: '无法判定',
-};
-
-/** Memory records carry structure; the wire type is the flattened view. */
-function factsOf(records: MemoryRecord[]): MemoryFact[] {
-  return records.map((record) => ({
-    slot: record.slot,
-    value: record.value,
-    scope: record.scope.kind === 'path' ? `path:${record.scope.path}` : record.scope.kind,
-    source: record.source,
-    updatedAt: record.updatedAt,
-    supersededBy: record.supersededBy,
-    conflicts: record.status === 'disputed' ? 1 : 0,
-  }));
-}
-
-function hashText(text: string): string {
-  let hash = 0;
-  for (let i = 0; i < text.length; i += 1) hash = (hash * 31 + text.charCodeAt(i)) | 0;
-  return Math.abs(hash).toString(36);
-}
-
 function summarizeCall(tool: ToolDefinition, args: Record<string, unknown>): string {
   if (tool.name === 'run_shell') return truncate(String(args.command ?? ''), 120);
   if (tool.name === 'ask_user') return truncate(String(args.question ?? ''), 120);
   if (typeof args.path === 'string') return `${tool.name} ${args.path}`;
   if (typeof args.pattern === 'string') return `${tool.name} /${args.pattern}/`;
   if (tool.name === 'todo_write') return 'plan updated';
-  if (tool.name === 'memory_write') return `remember ${args.slot}`;
+  if (tool.name === 'memory_read') return args.query ? `recall ${truncate(String(args.query), 60)}` : `recall ${args.kind ?? 'all'}`;
+  if (tool.name === 'memory_write') return `remember ${args.kind ?? 'memory'}${args.slot ? ` ${String(args.slot)}` : ''}`;
   return tool.summary;
+}
+
+/** A concrete "why" for working memory when the model gave no reasoning. */
+function whyForTool(name: string, args: Record<string, unknown>): string {
+  const path = typeof args.path === 'string' ? args.path : '';
+  switch (name) {
+    case 'read_file':
+      return path ? `读取 ${path}，确认当前内容` : '读取文件确认现状';
+    case 'list_dir':
+      return `查看 ${String(args.path ?? '.')} 里有什么`;
+    case 'glob_files':
+      return `按 ${String(args.pattern ?? '')} 查找文件`;
+    case 'grep_text':
+      return `搜索 ${String(args.pattern ?? '')} 的落点`;
+    case 'write_file':
+      return path ? `写入 ${path} 的完整内容` : '新建文件';
+    case 'edit_file':
+      return path ? `修改 ${path} 的目标片段` : '修改文件';
+    case 'todo_write':
+      return '更新任务计划';
+    case 'memory_read':
+      return args.query ? `召回与「${String(args.query)}」相关的长期记忆` : '回顾长期记忆';
+    case 'memory_write':
+      return `写入${String(args.kind ?? '')}长期记忆`;
+    case 'ask_user':
+      return `向用户确认：${truncate(String(args.question ?? ''), 80)}`;
+    default:
+      return '';
+  }
 }
 
 export { clamp };

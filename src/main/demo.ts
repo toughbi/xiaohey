@@ -281,7 +281,7 @@ export async function buildDemoDoc(home: string, workspace: string): Promise<Thr
 
   push({
     id: uid('itm'), threadId: thread.id, turnId, kind: 'compaction', at: at(14), status: 'done',
-    tokensBefore: 71_240, tokensAfter: 18_930, foldedItems: 9, keptItems: 10,
+    tokensBefore: 71_240, tokensAfter: 18_930, foldedItems: 6, keptItems: 2,
     summary: '用户要求重做 Northwind 概览页，不新增功能。审计发现渐变标题、问候语、emoji、发光按钮、全大写加宽标签。方向定为石墨灰 + 账页纸 + 一个账本绿。头部已重做，构建 8.4s 通过。剩余：表格状态，然后最终验收。',
   });
 
@@ -323,12 +323,6 @@ export async function buildDemoDoc(home: string, workspace: string): Promise<Thr
         compacted: 1,
         tokensUsed: 18_930,
       },
-      journal: [
-        {
-          id: 'k1', step: 4, callId: 'call_write_1', tool: 'edit_file', idempotencyKey: 'k1', phase: 'committed', at: at(30),
-          before: { 'app/page.tsx': '4a91c2' }, after: { 'app/page.tsx': 'e7b310' }, summary: 'edited app/page.tsx · 1 replacement',
-        },
-      ],
       evidence: ['read_file:app/page.tsx', 'grep_text:gradient|glow', 'edit_file:app/page.tsx', 'run_shell:npm run build'],
     },
     snapshots: [],

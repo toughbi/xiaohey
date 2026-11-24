@@ -12,7 +12,7 @@ export type ApprovalDecision = 'allow_once' | 'allow_always' | 'deny';
  * How much the runtime asks before it acts.
  * `ask`  — every command waits for a decision.
  * `auto` — only commands that match a known risk pattern ask.
- * `full` — nothing asks; the journal still records every step.
+ * `full` — nothing asks; working memory still records every step.
  */
 export type ApprovalPolicy = 'ask' | 'auto' | 'full';
 
@@ -46,6 +46,21 @@ export interface ModelProfile extends ModelSettings {
   maxOutputTokensSource?: 'metadata' | 'user';
 }
 
+export interface EmbeddingSettings {
+  /** Off means: local hashed vectors + keyword matching (still hybrid, not semantic). */
+  enabled: boolean;
+  /** Empty reuses the active chat model's base URL. */
+  baseUrl: string;
+  /** Empty reuses the active chat model's API key. */
+  apiKey: string;
+  /** Required when enabled, e.g. text-embedding-3-small / bge-m3 / nomic-embed-text. */
+  model: string;
+  /** Optional reranker; empty disables the rerank stage. */
+  rerankModel: string;
+  /** Optional rerank endpoint; empty derives it from baseUrl. */
+  rerankBaseUrl: string;
+}
+
 export interface Settings {
   /** Every model the user added. Configuration happens in Settings only. */
   models: ModelProfile[];
@@ -56,6 +71,8 @@ export interface Settings {
   allowedCommands: string[];
   /** Folders opened through the workspace picker, most recent first. */
   recentWorkspaces?: string[];
+  /** Optional embedding provider for semantic long-term memory recall. */
+  embedding: EmbeddingSettings;
 }
 
 export type ItemKind =
@@ -257,6 +274,8 @@ export interface RuntimeStatus {
   adapters: { llm: boolean; shell: boolean; editor: boolean };
 }
 
+export type WriteTier = 'low' | 'medium' | 'high';
+
 export interface ApprovalRequest {
   id: string;
   threadId: string;
@@ -266,6 +285,8 @@ export interface ApprovalRequest {
   command: string;
   reason: string;
   risk: ToolRisk;
+  /** Set for file writes: how destructive the change is. */
+  tier?: WriteTier;
 }
 
 export interface FileEntry {
@@ -292,12 +313,25 @@ export interface DiffPayload {
   deletions: number;
 }
 
+export type MemoryKind = 'episodic' | 'relational' | 'knowledge';
+
 export interface MemoryFact {
+  id: string;
+  kind: MemoryKind;
+  /** Human-readable title; the UI shows it above the value. */
+  title: string;
+  /** Display key: the knowledge slot, or the entry id for episodes/relations. */
   slot: string;
   value: string;
   scope: string;
   source: string;
+  /** 1–100, judged by the model when the memory was written. */
+  importance: number;
+  createdAt: number;
   updatedAt: number;
+  /** Present when the entry was cleared to the archive file. */
+  archived?: boolean;
+  outcome?: string;
   supersededBy?: string;
   conflicts?: number;
 }
@@ -390,7 +424,10 @@ export interface RequestMap {
   'thread/export': { params: { threadId: string }; result: { path: string } };
   'thread/markdown': { params: { threadId: string }; result: { markdown: string } };
   'approvals/list': { params: { threadId: string }; result: ApprovalItem[] };
-  'memory/set': { params: { threadId: string; slot: string; value: string }; result: MemoryFact[] };
+  'memory/set': {
+    params: { threadId: string; slot: string; value: string; kind?: MemoryKind; importance?: number };
+    result: MemoryFact[];
+  };
   'fs/files': { params: { threadId: string }; result: FileEntry[] };
   'app/reveal': { params: { path: string; threadId?: string }; result: { ok: boolean } };
   'app/notify': { params: { title: string; body: string }; result: { ok: boolean } };
@@ -405,8 +442,8 @@ export interface RequestMap {
   'question/respond': { params: { questionId: string; answer: string }; result: { ok: boolean } };
   'context/get': { params: { threadId: string }; result: ContextGauge };
   'tools/list': { params: Record<string, never>; result: ToolDescriptor[] };
-  'memory/list': { params: { threadId: string }; result: MemoryFact[] };
-  'memory/delete': { params: { threadId: string; slot: string }; result: MemoryFact[] };
+  'memory/list': { params: { threadId?: string; includeArchived?: boolean }; result: MemoryFact[] };
+  'memory/delete': { params: { threadId?: string; slot: string }; result: MemoryFact[] };
   'snapshot/list': { params: { threadId: string }; result: SnapshotMeta[] };
   'snapshot/revert': { params: { threadId: string; snapshotId: string }; result: { ok: boolean; message: string; undoSnapshotId?: string } };
   'fs/list': { params: { threadId: string; path: string }; result: FileEntry[] };

@@ -23,7 +23,8 @@ import type {
 } from '../shared/types.js';
 import { Store, type ThreadDoc } from './store.js';
 import { AgentService } from './runtime/agent.js';
-import { applyClaim } from './runtime/memory.js';
+import { DEFAULT_CONTEXT_WINDOW } from './runtime/context.js';
+import { memoryFacts } from './runtime/longterm.js';
 import { truncate } from './util.js';
 import { toolDescriptors } from './runtime/tools.js';
 import { testModel } from './runtime/llm.js';
@@ -69,7 +70,13 @@ export class AppServer {
     readonly demo: boolean,
   ) {
     this.store = new Store(home, workspaceRoot);
-    this.agent = new AgentService({ store: this.store, emit, home });
+    this.agent = new AgentService({
+      store: this.store,
+      emit,
+      home,
+      // Demo mode must never write the real `~/.xiaohey` memory files.
+      memoryHome: demo ? join(home, 'memory') : undefined,
+    });
   }
 
   async init(): Promise<void> {
@@ -106,6 +113,7 @@ export class AppServer {
       }
       this.store.closeOpenToolCalls(doc);
     }
+    await this.agent.memory.flush().catch(() => undefined);
     await this.store.flushAll();
     await this.store.saveIndex();
   }
@@ -128,6 +136,9 @@ export class AppServer {
         const settings = params as Settings;
         const saved = await this.store.setSettings(settings);
         this.emit({ type: 'settings/updated', settings: saved });
+        // An embedding model change invalidates the old vector space; rebuild in
+        // the background with the new configuration.
+        void this.agent.memory.ensureVectors().catch(() => undefined);
         return saved as RequestResult<K>;
       }
 
@@ -193,6 +204,9 @@ export class AppServer {
         const info = await stat(workspace).catch(() => null);
         if (!info || !info.isDirectory()) throw new Error(`not a folder: ${workspace}`);
         const doc = await this.threadDoc(threadId);
+        if (doc.state.worktree && doc.state.worktree.status !== 'merged') {
+          throw new Error('该会话还有未合并的隔离副本，先继续会话完成合并，或删除会话后再切换工作区');
+        }
         doc.thread.cwd = workspace;
         doc.thread.updatedAt = Date.now();
         await this.store.saveNow(threadId);
@@ -216,6 +230,8 @@ export class AppServer {
         // it is still a folder you can start another session in.
         if (doc?.thread.cwd) await this.rememberWorkspace(doc.thread.cwd);
         await this.agent.cancel(threadId);
+        await this.agent.purgeSessionMemory(threadId);
+        await this.agent.disposeWorktree(threadId);
         await this.store.deleteThread(threadId);
         this.emit({ type: 'thread/list', threads: await this.store.listThreads() });
         return { ok: true } as RequestResult<K>;
@@ -251,19 +267,18 @@ export class AppServer {
         return toolDescriptors() as ToolDescriptor[] as RequestResult<K>;
 
       case 'memory/list': {
-        const doc = await this.store.load((params as { threadId: string }).threadId);
-        if (!doc) return [] as RequestResult<K>;
-        return this.facts(doc) as RequestResult<K>;
+        const { includeArchived } = params as { threadId?: string; includeArchived?: boolean };
+        await this.agent.memory.load();
+        return memoryFacts(this.agent.memory.all(includeArchived === true)) as RequestResult<K>;
       }
 
       case 'memory/delete': {
-        const { threadId, slot } = params as { threadId: string; slot: string };
-        const doc = await this.store.load(threadId);
-        if (!doc) throw new Error('unknown thread');
-        doc.state.memory = doc.state.memory.filter((record) => record.slot !== slot);
-        await this.store.saveNow(threadId);
-        this.emit({ type: 'memory/updated', threadId, facts: this.facts(doc) });
-        return this.facts(doc) as RequestResult<K>;
+        const { threadId, slot } = params as { threadId?: string; slot: string };
+        const removed = await this.agent.memory.delete(slot);
+        if (removed) {
+          this.emit({ type: 'memory/updated', threadId: threadId ?? '', facts: this.facts() });
+        }
+        return this.facts() as RequestResult<K>;
       }
 
       case 'snapshot/list': {
@@ -325,9 +340,9 @@ export class AppServer {
 
       case 'app/reveal': {
         const { path, threadId } = params as { path: string; threadId?: string };
-        // File paths in the docs panel are relative to the session workspace,
-        // which is not necessarily the default root.
-        const root = threadId ? (await this.threadDoc(threadId)).thread.cwd : this.store.workspaceRoot;
+        // File paths in the docs panel are relative to the session's tree,
+        // which is not necessarily the default root or even the main checkout.
+        const root = threadId ? this.sessionRoot(await this.threadDoc(threadId)) : this.store.workspaceRoot;
         const full = resolveInside(root, path);
         await stat(full);
         shell.showItemInFolder(full);
@@ -353,15 +368,33 @@ export class AppServer {
       }
 
       case 'memory/set': {
-        const { threadId, slot, value } = params as { threadId: string; slot: string; value: string };
+        const { threadId, slot, value, importance } = params as {
+          threadId: string;
+          slot: string;
+          value: string;
+          importance?: number;
+        };
         const trimmed = value.trim();
         if (!trimmed) throw new Error('memory value is empty');
         const doc = await this.threadDoc(threadId);
-        const applied = applyClaim(doc.state.memory, { slot: slot.trim() || 'note.manual', value: trimmed, scope: { kind: 'workspace' }, source: 'manual' });
-        doc.state.memory = applied.records;
-        await this.store.saveNow(threadId);
-        this.emit({ type: 'memory/updated', threadId, facts: this.facts(doc) });
-        return this.facts(doc) as RequestResult<K>;
+        const key = slot.trim();
+        // Keep the scope of the entry being edited: a global fact edited from a
+        // session must not fork into a workspace-scoped duplicate.
+        const existing = this.agent.memory
+          .all()
+          .find((entry) => entry.kind === 'knowledge' && entry.status === 'active' && (entry.slot === key || entry.id === key));
+        await this.agent.memory.write({
+          id: existing?.id,
+          kind: 'knowledge',
+          detail: trimmed,
+          importance: typeof importance === 'number' && Number.isFinite(importance) ? importance : existing?.importance ?? 60,
+          title: existing?.title ?? (key || undefined),
+          slot: existing ? existing.slot : key || undefined,
+          scope: existing?.scope ?? (doc.thread.cwd ? { kind: 'path', path: doc.thread.cwd } : { kind: 'global' }),
+          source: 'manual',
+        });
+        this.emit({ type: 'memory/updated', threadId, facts: this.facts() });
+        return this.facts() as RequestResult<K>;
       }
 
       case 'fs/diff': {
@@ -387,12 +420,17 @@ export class AppServer {
       case 'workspace/info': {
         const { threadId } = params as { threadId?: string };
         let path = this.store.workspaceRoot;
+        let worktreeBranch: string | null = null;
         if (threadId) {
           const doc = await this.store.load(threadId);
-          if (doc) path = doc.thread.cwd;
+          if (doc) {
+            path = doc.thread.cwd;
+            const worktree = doc.state.worktree;
+            if (worktree && worktree.status !== 'merged') worktreeBranch = worktree.branch;
+          }
         }
         if (!path) return { path: '', name: '', branch: null } as RequestResult<K>;
-        return { path, name: basename(path), branch: await this.gitBranch(path) } as RequestResult<K>;
+        return { path, name: basename(path), branch: worktreeBranch ?? (await this.gitBranch(path)) } as RequestResult<K>;
       }
 
       case 'workspace/reveal': {
@@ -414,6 +452,15 @@ export class AppServer {
         if (target === path) return { path } as RequestResult<K>;
         const info = await stat(path).catch(() => null);
         if (!info || !info.isDirectory()) throw new Error(`not a folder: ${path}`);
+        // Moving the main checkout breaks every worktree's gitdir pointer; make
+        // the user land pending merges first instead of stranding them.
+        for (const thread of await this.store.listThreads()) {
+          if (thread.cwd !== path) continue;
+          const doc = await this.store.load(thread.id);
+          if (doc?.state.worktree && doc.state.worktree.status !== 'merged') {
+            throw new Error('该工作区还有会话的隔离副本未合并，先继续那些会话完成合并再重命名');
+          }
+        }
         await rename(path, target);
         const threads = await this.store.listThreads();
         for (const thread of threads) {
@@ -442,6 +489,8 @@ export class AppServer {
           for (let attempt = 0; attempt < 50 && this.agent.isRunning(thread.id); attempt += 1) {
             await new Promise((resolve) => setTimeout(resolve, 100));
           }
+          await this.agent.purgeSessionMemory(thread.id);
+          await this.agent.disposeWorktree(thread.id);
           await this.store.deleteThread(thread.id);
         }
         const settings = this.store.getSettings();
@@ -573,26 +622,19 @@ export class AppServer {
     }
   }
 
-  private gaugeOf(doc: ThreadDoc) {    return {
+  private gaugeOf(doc: ThreadDoc) {
+    return {
       tokensUsed: doc.state.context.tokensUsed,
-      tokensBudget: this.store.activeModel()?.contextWindow ?? 131_072,
+      tokensBudget: this.store.activeModel()?.contextWindow || DEFAULT_CONTEXT_WINDOW,
       compacted: doc.state.context.compacted,
-      memoryFacts: doc.state.memory.filter((fact) => fact.status !== 'superseded').length,
+      memoryFacts: this.agent.memory.activeCount(),
       evidence: doc.state.evidence.length,
       toolCalls: doc.items.filter((item) => item.kind === 'tool_call').length,
     };
   }
 
-  private facts(doc: ThreadDoc): MemoryFact[] {
-    return doc.state.memory.map((record) => ({
-      slot: record.slot,
-      value: record.value,
-      scope: record.scope.kind === 'path' ? `path:${record.scope.path}` : record.scope.kind,
-      source: record.source,
-      updatedAt: record.updatedAt,
-      supersededBy: record.supersededBy,
-      conflicts: record.status === 'disputed' ? 1 : 0,
-    }));
+  private facts(): MemoryFact[] {
+    return memoryFacts(this.agent.memory.all());
   }
 
   /**
@@ -618,9 +660,16 @@ export class AppServer {
     return doc;
   }
 
+  /** The tree a session actually reads and writes: its worktree while unmerged, else the workspace. */
+  private sessionRoot(doc: ThreadDoc): string {
+    const worktree = doc.state.worktree;
+    return worktree && worktree.status !== 'merged' ? worktree.path : doc.thread.cwd;
+  }
+
   private async listFiles(threadId: string, path: string): Promise<FileEntry[]> {
     const doc = await this.threadDoc(threadId);
-    const dir = resolveInside(doc.thread.cwd, path || '.');
+    const root = this.sessionRoot(doc);
+    const dir = resolveInside(root, path || '.');
     const entries = await readdir(dir, { withFileTypes: true });
     const result: FileEntry[] = [];
     for (const entry of entries) {
@@ -629,7 +678,7 @@ export class AppServer {
       const info = await stat(full).catch(() => null);
       if (!info) continue;
       result.push({
-        path: relativeTo(doc.thread.cwd, full),
+        path: relativeTo(root, full),
         name: entry.name,
         dir: entry.isDirectory(),
         size: info.size,
@@ -642,7 +691,7 @@ export class AppServer {
   /** Flat list of text files for the @-reference picker. */
   private async allFiles(threadId: string): Promise<FileEntry[]> {
     const doc = await this.threadDoc(threadId);
-    const root = doc.thread.cwd;
+    const root = this.sessionRoot(doc);
     const found: FileEntry[] = [];
     const skip = new Set(['node_modules', '.git', 'dist', 'dist-electron', '.xiaohey', '.dsh', '.agent', 'release']);
     const walk = async (dir: string, depth: number): Promise<void> => {
@@ -742,18 +791,19 @@ export class AppServer {
     if (buffer.length === 0) throw new Error('文件是空的');
     if (buffer.length > 10 * 1024 * 1024) throw new Error('文件超过 10 MB');
     const safe = name.replace(/[^\p{L}\p{N}._-]+/gu, '-').replace(/^[-.]+|[-.]+$/g, '').slice(0, 80) || 'attachment';
-    const folder = join(doc.thread.cwd, 'uploads');
+    const root = this.sessionRoot(doc);
+    const folder = join(root, 'uploads');
     await mkdir(folder, { recursive: true });
     const stamp = Date.now().toString(36);
     const dot = safe.lastIndexOf('.');
     const file = dot > 0 ? `${safe.slice(0, dot)}-${stamp}${safe.slice(dot)}` : `${safe}-${stamp}`;
     await writeFile(join(folder, file), buffer);
-    return { path: relativeTo(doc.thread.cwd, join(folder, file)) };
+    return { path: relativeTo(root, join(folder, file)) };
   }
 
   private async readDocument(threadId: string, path: string): Promise<DocumentPayload> {
     const doc = await this.threadDoc(threadId);
-    const full = resolveInside(doc.thread.cwd, path);
+    const full = resolveInside(this.sessionRoot(doc), path);
     const info = await stat(full);
     if (!info.isFile()) throw new Error(`${path} is not a file`);
     if (!TEXT_EXTENSIONS.has(extname(full).toLowerCase())) {
@@ -779,7 +829,7 @@ export class AppServer {
   /** Images are rendered inline in the preview, so hand the renderer a data URL. */
   private async readImage(threadId: string, path: string): Promise<{ dataUrl: string; mime: string } | null> {
     const doc = await this.threadDoc(threadId);
-    const full = resolveInside(doc.thread.cwd, path);
+    const full = resolveInside(this.sessionRoot(doc), path);
     const extension = extname(full).toLowerCase();
     const mime = IMAGE_EXTENSIONS[extension];
     if (!mime) return null;
@@ -804,7 +854,7 @@ export class AppServer {
         .reverse()
         .find((entry) => entry.changeStats?.files.some((file) => file.path === path) ?? false) ??
       doc.snapshots.at(-1);
-    const current = await readFile(resolveInside(doc.thread.cwd, path), 'utf8').catch(() => '');
+    const current = await readFile(resolveInside(this.sessionRoot(doc), path), 'utf8').catch(() => '');
     let before = '';
     if (snapshot) {
       before = await readFile(join(this.store.home, 'snapshots', threadId, snapshot.id, 'tree', path), 'utf8').catch(() => '');

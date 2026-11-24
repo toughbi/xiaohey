@@ -1,9 +1,7 @@
 import type { ChatMessage } from './llm.js';
 import type { Contract } from './contract.js';
-import type { MemoryRecord } from './memory.js';
 import type { ResolutionState } from './resolve.js';
 import type { ContextGauge, Item } from '../../shared/types.js';
-import { renderMemory } from './memory.js';
 import { renderContract } from './contract.js';
 import { renderResolution } from './resolve.js';
 import { estimateTokens, truncate } from '../util.js';
@@ -11,13 +9,16 @@ import { estimateTokens, truncate } from '../util.js';
 /**
  * Context assembly and compaction.
  *
- * Three layers, because they decay at different rates and must be trusted
+ * Four layers, because they decay at different rates and must be trusted
  * differently:
  *  1. the contract — verbatim original requirement, never summarized;
- *  2. externalized state — plan, memory, resolution, verification — re-read
- *     from disk each turn instead of recalled from the transcript;
- *  3. the transcript — compacted when it grows, folding the oldest items into a
- *     summary that keeps decisions and evidence rather than chatter.
+ *  2. externalized state — plan, resolution, verification — re-read from disk;
+ *  3. working memory — the live task notebook, injected so a resumed session
+ *     knows its next step without digging through the transcript;
+ *  4. short-term memory — the summary plus the last rounds, assembled by
+ *     `shortterm.ts`, never the raw unbounded transcript.
+ *
+ * Long-term memory is NOT injected: the model decides when to call `memory_read`.
  */
 
 export interface ContextState {
@@ -38,14 +39,19 @@ export const emptyContext = (): ContextState => ({ summary: '', foldedItems: 0, 
 export interface PromptInput {
   workspace: string;
   contract: Contract | null;
-  memory: MemoryRecord[];
-  resolution: ResolutionState;
   plan: string;
+  /** Task notebook rendered by working memory, injected on purpose. */
+  working: string;
+  /** One-line statistics about long-term memory; contents stay behind the tool. */
+  memoryIndex: string;
+  resolution: ResolutionState;
   verification: string;
   toolList: string;
   step: number;
   budget: number;
   compacted: boolean;
+  /** Set while the turn runs in an isolated worktree; explains the merge-back. */
+  isolationNote?: string;
 }
 
 export const SYSTEM_PROMPT = `You are xiaohey, a local coding agent running on the user's Windows desktop.
@@ -59,9 +65,20 @@ Operating rules:
 - Finish a step with something observable: a file written, a command exiting 0, a test passing. "Done" without proof is not done.
 - When you stop calling tools and answer, open the final answer with a short overview of what was actually done this turn — files changed, commands run with their exit status, clarifications answered — then the details. Never claim work the tool results do not show, and say so plainly when nothing was changed.`;
 
+export const MEMORY_POLICY = `Long-term memory is not pasted into this prompt. Decide for yourself when to read it:
+- Call memory_read when the user refers to something from before ("上次", "那个客户", "阿姨", "还记得吗"), when a name/role/pronoun needs resolving, or when starting a task that may repeat past work, preferences or failures.
+- Do NOT call it every turn, and do not call it for facts a file tool can verify first. Do not pretend to remember anything you have not read in this conversation or recalled through the tool.
+- When a task or project is finished — success or failure — call memory_write with one episodic memory (when/where/what happened/result), plus a relational memory for any new reference, plus a knowledge memory for a durable fact or constraint. You choose importance 1–100: 80+ for long-lived constraints and identities, 50–79 for ordinary completed work, 20–49 for useful but narrow details.
+- Write when the work is done, not after every step; working memory already records the steps.`;
+
 export function buildSystemPrompt(input: PromptInput): string {
   const sections: string[] = [SYSTEM_PROMPT];
-  sections.push(`Workspace: ${input.workspace}\nStep: ${input.step} of this turn\nContext budget: ${input.budget} tokens`);
+  const now = new Date();
+  const zone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'local';
+  sections.push(
+    `Workspace: ${input.workspace}\nLocal time: ${now.toLocaleString('sv-SE')} (${zone})\nStep: ${input.step} of this turn\nContext budget: ${input.budget} tokens`,
+  );
+  if (input.isolationNote) sections.push(input.isolationNote);
 
   if (input.contract) {
     sections.push(`## Task contract (verbatim, authoritative)\n${renderContract(input.contract)}`);
@@ -69,7 +86,8 @@ export function buildSystemPrompt(input: PromptInput): string {
   if (input.plan.trim()) {
     sections.push(`## Plan (externalized state, not a summary)\n${input.plan}`);
   }
-  sections.push(`## Memory\n${renderMemory(input.memory)}`);
+  sections.push(`## Long-term memory\n${MEMORY_POLICY}${input.memoryIndex ? `\n\n${input.memoryIndex}` : ''}`);
+  sections.push(`## Working memory (this session's progress — resume from here after an interruption)\n${input.working}`);
   sections.push(`## Resolved references\n${renderResolution(input.resolution)}`);
   if (input.verification.trim()) {
     sections.push(`## Verification from ground truth\n${input.verification}`);
@@ -77,7 +95,7 @@ export function buildSystemPrompt(input: PromptInput): string {
   sections.push(`## Tools (route with these rules)\n${input.toolList}`);
 
   if (input.compacted) {
-    sections.push('Context was compacted earlier in this session; the folded summary is the first assistant message. Treat it as context, not as proof.');
+    sections.push('Earlier rounds of this session were compressed into a summary; the summary is context, not proof. Re-read files before relying on details it does not spell out.');
   }
   return sections.join('\n\n');
 }
@@ -158,7 +176,7 @@ export function gaugeOf(input: {
   messages: ChatMessage[];
   budget: number;
   compacted: number;
-  memory: MemoryRecord[];
+  memoryFacts: number;
   evidence: number;
   toolCalls: number;
 }): ContextGauge {
@@ -166,10 +184,54 @@ export function gaugeOf(input: {
     tokensUsed: tokensOf(input.messages),
     tokensBudget: input.budget,
     compacted: input.compacted,
-    memoryFacts: input.memory.filter((fact) => fact.status !== 'superseded').length,
+    memoryFacts: input.memoryFacts,
     evidence: input.evidence,
     toolCalls: input.toolCalls,
   };
+}
+
+/**
+ * Context budget for the short-term window.
+ *
+ * The window is shared by prompt, tools, history and completion, so the room
+ * left for history is:
+ *   window − output reserve − (system prompt + tool schemas) − safety margin.
+ * The margin absorbs tokenizer drift, the unmeasured provider-side template and
+ * one tool result that arrives after the check. `historyLimit` is therefore the
+ * number the short-term memory is measured against.
+ */
+export interface ContextBudget {
+  window: number;
+  outputReserve: number;
+  promptReserve: number;
+  safetyMargin: number;
+  historyLimit: number;
+}
+
+/** Conservative fallback when the provider does not publish a context size. */
+export const DEFAULT_CONTEXT_WINDOW = 32_768;
+
+export function contextBudget(input: {
+  contextWindow: number;
+  maxOutputTokens: number;
+  promptTokens: number;
+  toolTokens?: number;
+}): ContextBudget {
+  const window = input.contextWindow > 0 ? input.contextWindow : DEFAULT_CONTEXT_WINDOW;
+  // Unknown output cap: reserve a conservative slice instead of the whole window.
+  const outputReserve =
+    input.maxOutputTokens > 0 ? input.maxOutputTokens : Math.min(8192, Math.max(1024, Math.round(window * 0.08)));
+  const promptReserve = Math.max(0, Math.round(input.promptTokens + (input.toolTokens ?? 0)));
+  const safetyMargin = Math.max(2048, Math.min(16_384, Math.round(window * 0.1)));
+  const historyLimit = Math.max(2048, window - outputReserve - promptReserve - safetyMargin);
+  return { window, outputReserve, promptReserve, safetyMargin, historyLimit };
+}
+
+/** Compress a little before the hard limit, because one tool result can be large. */
+export const HISTORY_TRIGGER_RATIO = 0.85;
+
+export function shouldCompressHistory(tokens: number, historyLimit: number): boolean {
+  return tokens > historyLimit * HISTORY_TRIGGER_RATIO;
 }
 
 export const COMPACT_AT = 0.62;
@@ -194,17 +256,9 @@ export function mechanicalSummary(items: Item[]): string {
   return lines.slice(-40).join('\n');
 }
 
-export const SUMMARY_PROMPT = `Summarize the folded part of this agent session for your own future use.
-Keep, in this order and no prose:
-1. what the user actually asked for, in their words where possible
-2. decisions made and facts verified, each with its evidence (file path or command)
-3. what was tried and failed, with the reason
-4. open questions and what the next step should be
-Drop greetings, restated plans and anything already written to a file. Maximum 220 words.`;
-
 /**
- * Compact: fold the oldest items into `summary` while keeping a recent window
- * intact, so the model still sees verbatim tool output for the current work.
+ * Legacy item-based folding, kept for checkpoint/state compatibility and the
+ * self-test. The model-visible history is assembled by `shortterm.ts`.
  */
 export function foldItems(
   items: Item[],

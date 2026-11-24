@@ -59,6 +59,10 @@ async function bootstrap(): Promise<void> {
       await captureDemoSnapshot(home, doc);
       await applyDemoEdits(workspace);
       await server.store.seedDemo(doc);
+      // The demo transcript carries two legacy facts; promote them into the
+      // long-term store so the memory panel has real content in the showcase.
+      await server.agent.migrateLegacyMemory().catch(() => undefined);
+      void server.agent.memory.ensureVectors().catch(() => undefined);
     }
   }
 
@@ -175,10 +179,12 @@ app.whenReady().then(async () => {
 });
 
 app.on('window-all-closed', () => {
+  void server?.agent.memory.flush();
   void server?.store.flushAll();
   if (process.platform !== 'darwin') app.quit();
 });
 
 app.on('before-quit', () => {
+  void server?.agent.memory.flush();
   void server?.store.flushAll();
 });

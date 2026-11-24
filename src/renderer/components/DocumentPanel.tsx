@@ -51,6 +51,18 @@ const TABS: Array<{ id: DocTab; label: string }> = [
   { id: 'approvals', label: '审批' },
 ];
 
+const MEMORY_KIND_LABEL: Record<MemoryFact['kind'], string> = {
+  episodic: '情景',
+  relational: '关系',
+  knowledge: '知识',
+};
+
+const MEMORY_OUTCOME_LABEL: Record<string, string> = {
+  success: '成功',
+  failure: '失败',
+  partial: '部分完成',
+};
+
 export function DocumentPanel(props: DocumentPanelProps) {
   const { width, tab, onTab, dir, files, doc, diff, memory, snapshots, approvals, view, onView, threadId, onOpenExternal, onMemorySet, onRefreshFiles } = props;
   const parent = dir.includes('/') ? dir.slice(0, dir.lastIndexOf('/')) : '.';
@@ -212,13 +224,13 @@ export function DocumentPanel(props: DocumentPanelProps) {
         <div className="docs-body">
           <div className="docs-note">
             <CornerDownRight size={14} strokeWidth={1.5} />
-            <span>跨会话保留的事实。冲突的会标出来，不会自动挑一个。</span>
+            <span>长期记忆分情景 / 关系 / 知识三类，模型需要时会自己读；冲突的会标出来，不会自动挑一个。</span>
           </div>
           <div className="memory-form">
             <input
               value={memorySlot}
               onChange={(event) => setMemorySlot(event.target.value)}
-              placeholder="槽位，例如 pref.comments"
+              placeholder="槽位，例如 env.packageManager"
               aria-label="记忆槽位"
             />
             <input
@@ -227,7 +239,7 @@ export function DocumentPanel(props: DocumentPanelProps) {
               onKeyDown={(event) => {
                 if (event.key === 'Enter') saveMemory(memorySlot, memoryValue);
               }}
-              placeholder="要记住的事"
+              placeholder="要记住的事实或约束"
               aria-label="记忆内容"
             />
             <button type="button" className="mini" onClick={() => saveMemory(memorySlot, memoryValue)} disabled={!memoryValue.trim()}>
@@ -236,17 +248,21 @@ export function DocumentPanel(props: DocumentPanelProps) {
           </div>
           <ul className="memory-list">
             {memory.map((fact) => (
-              <li key={fact.slot} className={fact.conflicts ? 'disputed' : ''}>
+              <li key={fact.id} className={fact.conflicts ? 'disputed' : ''}>
                 <div className="memory-head">
+                  <span className="chip chip-quiet mono">{MEMORY_KIND_LABEL[fact.kind]}</span>
                   <span className="mono memory-slot">{fact.slot}</span>
-                  <span className="chip chip-quiet mono">{fact.scope}</span>
-                  <button type="button" className="ghost icon tiny" onClick={() => setEditing({ slot: fact.slot, value: fact.value })} aria-label="编辑">
-                    <Pencil size={13} strokeWidth={1.5} />
-                  </button>
+                  <span className="chip chip-quiet mono">{fact.importance}</span>
+                  {fact.kind === 'knowledge' ? (
+                    <button type="button" className="ghost icon tiny" onClick={() => setEditing({ slot: fact.slot, value: fact.value })} aria-label="编辑">
+                      <Pencil size={13} strokeWidth={1.5} />
+                    </button>
+                  ) : null}
                   <button type="button" className="ghost icon tiny" onClick={() => props.onDeleteMemory(fact.slot)} aria-label="删除">
                     <Trash2 size={13} strokeWidth={1.5} />
                   </button>
                 </div>
+                {fact.title && fact.title !== fact.slot ? <p className="memory-value memory-title">{fact.title}</p> : null}
                 {editing?.slot === fact.slot ? (
                   <div className="memory-edit">
                     <input
@@ -270,12 +286,14 @@ export function DocumentPanel(props: DocumentPanelProps) {
                 )}
                 <div className="mono dim memory-meta">
                   {fact.source} · {relativeTime(fact.updatedAt)}
+                  {fact.outcome ? ` · ${MEMORY_OUTCOME_LABEL[fact.outcome] ?? fact.outcome}` : ''}
                   {fact.conflicts ? ' · 冲突待澄清' : ''}
+                  {fact.archived ? ' · 已归档' : ''}
                 </div>
               </li>
             ))}
           </ul>
-          {memory.length === 0 ? <p className="docs-empty">还没有记住任何事。稳定的偏好和约定会存在这里。</p> : null}
+          {memory.length === 0 ? <p className="docs-empty">还没有记住任何事。任务完成后模型会写入情景记忆，稳定的偏好和约束会写成知识记忆。</p> : null}
         </div>
       ) : null}
 
@@ -366,7 +384,7 @@ export function DocumentPanel(props: DocumentPanelProps) {
               </li>
             ))}
           </ul>
-          {approvals.length === 0 ? <p className="docs-empty">还没有需要审批的命令。</p> : null}
+          {approvals.length === 0 ? <p className="docs-empty">还没有需要审批的动作。</p> : null}
         </div>
       ) : null}
     </aside>

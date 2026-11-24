@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
   MoreHorizontal,
   Zap,
@@ -12,7 +12,7 @@ import {
   Settings2,
   Trash2,
 } from 'lucide-react';
-import type { ActivityResult, ModelProfile, Settings } from '../../shared/types';
+import type { ActivityResult, EmbeddingSettings, ModelProfile, Settings } from '../../shared/types';
 import { ActivityCard } from './ActivityHeatmap';
 import { ModelEditor } from './ModelEditor';
 import { providerById } from '../lib/providers';
@@ -58,6 +58,15 @@ const PAGE_META: Record<Page, { title: string; subtitle: string }> = {
   about: { title: '关于', subtitle: '本机运行信息与数据位置。' },
 };
 
+const EMPTY_EMBEDDING: EmbeddingSettings = {
+  enabled: false,
+  baseUrl: '',
+  apiKey: '',
+  model: '',
+  rerankModel: '',
+  rerankBaseUrl: '',
+};
+
 
 export function SettingsView({
   settings,
@@ -88,6 +97,29 @@ export function SettingsView({
   const activeModelId = settings.activeModelId;
 
   const [rowMenu, setRowMenu] = useState<string | null>(null);
+  const [embedding, setEmbedding] = useState<EmbeddingSettings>(settings.embedding ?? EMPTY_EMBEDDING);
+  const [embeddingDirty, setEmbeddingDirty] = useState(false);
+
+  useEffect(() => {
+    setEmbedding(settings.embedding ?? EMPTY_EMBEDDING);
+    setEmbeddingDirty(false);
+  }, [settings.embedding]);
+
+  const saveEmbedding = async (next: EmbeddingSettings): Promise<void> => {
+    await onSave({ ...settings, embedding: next });
+    setEmbeddingDirty(false);
+  };
+
+  const editEmbedding = (patch: Partial<EmbeddingSettings>): void => {
+    setEmbedding((current) => ({ ...current, ...patch }));
+    setEmbeddingDirty(true);
+  };
+
+  const toggleEmbedding = (): void => {
+    const next = { ...embedding, enabled: !embedding.enabled };
+    setEmbedding(next);
+    void saveEmbedding(next).catch(() => setEmbeddingDirty(true));
+  };
 
   const toggleModel = async (profile: ModelProfile): Promise<void> => {
     const enabled = profile.enabled !== false;
@@ -164,7 +196,8 @@ export function SettingsView({
         </header>
 
         {page === 'models' ? (
-          settings.models.length === 0 ? (
+          <>
+            {settings.models.length === 0 ? (
             <div className="settings-empty">
               <span className="settings-empty-glyph">
                 <Settings2 size={22} strokeWidth={1.4} />
@@ -273,7 +306,91 @@ export function SettingsView({
                   })}
               </ul>
             </div>
-          )
+          )}
+            <div className="embedding-panel">
+              <div className="embedding-head">
+                <div>
+                  <h2>记忆向量召回</h2>
+                  <p>长期记忆使用向量检索 + 关键词匹配混合召回。接口需支持 OpenAI 兼容的 POST /embeddings；未配置时使用本地哈希向量，仍可离线工作。</p>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={embedding.enabled}
+                  aria-label={`${embedding.enabled ? '停用' : '启用'}记忆向量召回`}
+                  className={`switch ${embedding.enabled ? 'on' : ''}`}
+                  onClick={toggleEmbedding}
+                >
+                  <span className="switch-knob" />
+                </button>
+              </div>
+              <div className={`embedding-fields ${embedding.enabled ? '' : 'disabled'}`}>
+                <label>
+                  <span>Embedding 模型</span>
+                  <input
+                    value={embedding.model}
+                    onChange={(event) => editEmbedding({ model: event.target.value })}
+                    placeholder="例如 text-embedding-3-small / bge-m3"
+                    disabled={!embedding.enabled}
+                  />
+                </label>
+                <label>
+                  <span>接口地址（可选）</span>
+                  <input
+                    value={embedding.baseUrl}
+                    onChange={(event) => editEmbedding({ baseUrl: event.target.value })}
+                    placeholder="留空复用当前模型的接口地址"
+                    disabled={!embedding.enabled}
+                  />
+                </label>
+                <label>
+                  <span>API Key（可选）</span>
+                  <input
+                    type="password"
+                    value={embedding.apiKey}
+                    onChange={(event) => editEmbedding({ apiKey: event.target.value })}
+                    placeholder="留空复用当前模型的 Key"
+                    disabled={!embedding.enabled}
+                  />
+                </label>
+                <label>
+                  <span>重排模型（可选）</span>
+                  <input
+                    value={embedding.rerankModel}
+                    onChange={(event) => editEmbedding({ rerankModel: event.target.value })}
+                    placeholder="例如 qwen3.7-text-rerank / bge-reranker-v2-m3"
+                    disabled={!embedding.enabled}
+                  />
+                </label>
+                <label>
+                  <span>重排接口（可选）</span>
+                  <input
+                    value={embedding.rerankBaseUrl}
+                    onChange={(event) => editEmbedding({ rerankBaseUrl: event.target.value })}
+                    placeholder="留空自动推断（阿里云走原生 rerank 路径，其余走 /rerank）"
+                    disabled={!embedding.enabled}
+                  />
+                </label>
+              </div>
+              <div className="embedding-foot">
+                <span>
+                  {embedding.enabled && !embedding.model.trim()
+                    ? '填写 Embedding 模型后才会启用语义向量；当前仍使用本地哈希向量。'
+                    : embedding.rerankModel.trim()
+                      ? '重排会在召回候选上再算一次相关度，能提高首条命中率，代价是一次额外请求（约 0.2 秒）。'
+                      : '索引保存在 ~/.xiaohei/memory-vectors.json；更换模型会自动重建。'}
+                </span>
+                <button
+                  type="button"
+                  className="mini"
+                  disabled={!embeddingDirty}
+                  onClick={() => void saveEmbedding(embedding).catch(() => setEmbeddingDirty(true))}
+                >
+                  {embeddingDirty ? '保存向量设置' : '已保存'}
+                </button>
+              </div>
+            </div>
+          </>
         ) : null}
 
         {page === 'appearance' ? (

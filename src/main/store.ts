@@ -2,22 +2,28 @@ import { mkdir, readdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Item, ModelProfile, ModelSettings, PlanStep, Settings, SnapshotMeta, Thread, Turn } from '../shared/types.js';
 import type { Contract } from './runtime/contract.js';
-import type { JournalRecord } from './runtime/journal.js';
 import type { MemoryRecord } from './runtime/memory.js';
 import type { ResolutionState } from './runtime/resolve.js';
 import type { ContextState } from './runtime/context.js';
+import type { WorktreeState } from './runtime/worktree.js';
 import { emptyContext } from './runtime/context.js';
 import { emptyResolution } from './runtime/resolve.js';
 import { ensureDir, readJson, uid, writeJsonAtomic } from './util.js';
 
 export interface ThreadState {
   plan: PlanStep[];
+  /**
+   * @deprecated Legacy per-thread memory. Kept only so old thread JSON and
+   * checkpoint state still parse; the runtime migrates live records into
+   * `~/.xiaohei/memory.md` on boot and never writes this array again.
+   */
   memory: MemoryRecord[];
   resolution: ResolutionState;
   contract: Contract | null;
   context: ContextState;
-  journal: JournalRecord[];
   evidence: string[];
+  /** Isolated checkout while another session holds the main tree; null when none. */
+  worktree: WorktreeState | null;
 }
 
 export interface ThreadDoc {
@@ -44,7 +50,7 @@ export const DEFAULT_PROFILE = {
   model: 'deepseek-chat',
   temperature: 0.4,
   maxOutputTokens: 0,
-  contextWindow: 0,
+  contextWindow: 131_072,
   reasoningEffort: 'default',
 } as const;
 
@@ -53,6 +59,7 @@ export const DEFAULT_SETTINGS: Settings = {
   activeModelId: '',
   approval: 'ask',
   allowedCommands: [],
+  embedding: { enabled: false, baseUrl: '', apiKey: '', model: '', rerankModel: '', rerankBaseUrl: '' },
 };
 
 export function emptyState(): ThreadState {
@@ -62,8 +69,8 @@ export function emptyState(): ThreadState {
     resolution: emptyResolution(),
     contract: null,
     context: emptyContext(),
-    journal: [],
     evidence: [],
+    worktree: null,
   };
 }
 
@@ -144,7 +151,17 @@ export function normalizeSettings(raw: unknown): Settings {
     ? [...new Set(value.allowedCommands.filter((entry): entry is string => typeof entry === 'string' && entry.length > 0))]
     : [];
 
-  return { models, activeModelId, approval, allowedCommands, recentWorkspaces };
+  const embeddingRaw = (value.embedding ?? {}) as Partial<Settings['embedding']>;
+  const embedding = {
+    enabled: embeddingRaw.enabled === true,
+    baseUrl: typeof embeddingRaw.baseUrl === 'string' ? embeddingRaw.baseUrl.trim() : '',
+    apiKey: typeof embeddingRaw.apiKey === 'string' ? embeddingRaw.apiKey : '',
+    model: typeof embeddingRaw.model === 'string' ? embeddingRaw.model.trim() : '',
+    rerankModel: typeof embeddingRaw.rerankModel === 'string' ? embeddingRaw.rerankModel.trim() : '',
+    rerankBaseUrl: typeof embeddingRaw.rerankBaseUrl === 'string' ? embeddingRaw.rerankBaseUrl.trim() : '',
+  };
+
+  return { models, activeModelId, approval, allowedCommands, recentWorkspaces, embedding };
 }
 
 export class Store {

@@ -1,8 +1,12 @@
 import { exec } from 'node:child_process';
 import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { dirname, join, relative } from 'node:path';
-import type { ApprovalDecision, PlanStep, QuestionOption, ToolRisk } from '../../shared/types.js';
-import type { MemoryScope } from './memory.js';
+import type { ApprovalDecision, PlanStep, QuestionOption, ToolRisk, WriteTier } from '../../shared/types.js';
+import { countLineDiff } from './checkpoint.js';
+import { classifyWrite } from './policy.js';
+import type { CommitResult } from './commit.js';
+import { textFingerprint } from '../fingerprint.js';
+import { formatRecall, type MemoryWriteArgs, type RecallArgs, type RecallResult } from './longterm.js';
 import { domainFailure, readDomainFailure, transientFailure, type ToolOutcome } from './toolerrors.js';
 import type { ToolSchema } from './validate.js';
 import { resolveInside } from '../util.js';
@@ -26,13 +30,28 @@ export interface ToolExecContext {
   turnId: string;
   workspace: string;
   shell: (command: string, timeoutMs: number, cwd: string) => Promise<ShellRun>;
-  approve: (request: { name: string; command: string; reason: string; risk: ToolRisk }) => Promise<ApprovalDecision>;
+  approve: (request: {
+    name: string;
+    command: string;
+    reason: string;
+    risk: ToolRisk;
+    /** File writes only: drives the `auto` policy and the card copy. */
+    tier?: WriteTier;
+  }) => Promise<ApprovalDecision>;
   /** Show a clarification card and resolve with the user's answer. */
   ask: (request: { header: string; question: string; options: QuestionOption[] }) => Promise<{ answer: string; cancelled: boolean }>;
-  remember: (claim: { slot: string; value: string; scope: MemoryScope }) => Promise<{ kind: string; note: string }>;
+  remember: (entry: MemoryWriteArgs) => Promise<{ kind: string; note: string }>;
+  /** Long-term recall: the model asks for memory, memory does not volunteer. */
+  recall: (input: RecallArgs) => Promise<RecallResult>;
   setPlan: (steps: PlanStep[]) => Promise<void>;
   markTouched: (files: string[]) => void;
   evidence: (tag: string) => void;
+  /**
+   * Compare-and-swap write: succeeds only when the file still matches the
+   * fingerprint the tool read. Returns a conflict instead of clobbering another
+   * session's change.
+   */
+  commitFile: (target: string, content: string, expected: string) => Promise<CommitResult>;
 }
 
 export interface ToolDefinition {
@@ -42,6 +61,8 @@ export interface ToolDefinition {
   summary: string;
   useWhen: string;
   avoidWhen: string;
+  /** Concrete call examples, appended to the tool description the model sees. */
+  examples?: string[];
   schema: ToolSchema;
   run: (ctx: ToolExecContext, args: Record<string, unknown>) => Promise<ToolOutcome>;
 }
@@ -103,7 +124,7 @@ function lineHits(text: string, pattern: RegExp, path: string, limit: number): s
   return hits;
 }
 
-const pathArg = { type: 'string' as const, description: 'Workspace-relative path, e.g. src/App.tsx' };
+const pathArg = { type: 'string' as const, minLength: 1, description: 'Workspace-relative path, e.g. src/App.tsx' };
 
 export const tools: ToolDefinition[] = [
   {
@@ -294,15 +315,42 @@ export const tools: ToolDefinition[] = [
     async run(ctx, args) {
       const target = resolveInside(ctx.workspace, String(args.path));
       const content = String(args.content);
-      try {
-        await mkdir(dirname(target), { recursive: true });
-        await writeFile(target, content, 'utf8');
-      } catch (error) {
-        return domainFailure('写入失败', '确认父目录存在；用 list_dir 核对路径后再试。', (error as Error).message);
+      const relative = rel(ctx, target);
+      // Read the previous body before writing: the diff decides the risk tier
+      // shown on the approval card, and whether this is create or overwrite.
+      const prior = await readFile(target, 'utf8').catch(() => null);
+      const expected = prior === null ? 'absent' : textFingerprint(prior);
+      const change = prior === null ? { additions: content.split(/\r?\n/).length, deletions: 0 } : countLineDiff(prior, content);
+      const verdict = classifyWrite({
+        path: relative,
+        kind: prior === null ? 'create' : 'overwrite',
+        addedLines: change.additions,
+        deletedLines: change.deletions,
+        totalLinesBefore: prior ? prior.split(/\r?\n/).length : 0,
+      });
+      const decision = await ctx.approve({
+        name: 'write_file',
+        command: relative,
+        reason: `${verdict.reason}${prior === null ? '' : ` · 覆盖 ${prior.split(/\r?\n/).length} 行`}`,
+        risk: 'write',
+        tier: verdict.tier,
+      });
+      if (decision === 'deny') {
+        return domainFailure(
+          '写入未获批准',
+          `The user declined writing \`${relative}\`. Do not retry the same write; ask what they want instead, or leave the file untouched.`,
+        );
+      }
+      const committed = await ctx.commitFile(target, content, expected);
+      if (!committed.ok) {
+        return domainFailure(
+          committed.reason === 'busy' ? '工作区正忙，没有写入' : '文件在写入前被改过，没有写入',
+          `${committed.detail} 重新 read_file 拿最新内容，再决定是合并还是覆盖；不要用旧内容重试。`,
+        );
       }
       const lines = content.split(/\r?\n/).length;
-      ctx.markTouched([rel(ctx, target)]);
-      return { ok: true, summary: `wrote ${rel(ctx, target)} · ${lines} lines`, output: `${rel(ctx, target)} written (${content.length} chars)`, files: [rel(ctx, target)] };
+      ctx.markTouched([relative]);
+      return { ok: true, summary: `wrote ${relative} · ${lines} lines`, output: `${relative} written (${content.length} chars)`, files: [relative] };
     },
   },
   {
@@ -316,7 +364,7 @@ export const tools: ToolDefinition[] = [
       type: 'object',
       properties: {
         path: pathArg,
-        find: { type: 'string', description: 'Exact text to replace, including indentation' },
+        find: { type: 'string', minLength: 1, description: 'Exact text to replace, including indentation' },
         replace: { type: 'string', description: 'Replacement text' },
         all: { type: 'boolean', description: 'Replace every occurrence, default false' },
       },
@@ -347,13 +395,41 @@ export const tools: ToolDefinition[] = [
         );
       }
       const next = args.all ? text.split(find).join(replacement) : text.replace(find, replacement);
-      await writeFile(target, next, 'utf8');
-      ctx.markTouched([rel(ctx, target)]);
+      const relative = rel(ctx, target);
+      const change = countLineDiff(text, next);
+      const verdict = classifyWrite({
+        path: relative,
+        kind: 'edit',
+        addedLines: change.additions,
+        deletedLines: change.deletions,
+        totalLinesBefore: text.split(/\r?\n/).length,
+      });
+      const decision = await ctx.approve({
+        name: 'edit_file',
+        command: relative,
+        reason: `${verdict.reason} · ${occurrences} 处替换`,
+        risk: 'write',
+        tier: verdict.tier,
+      });
+      if (decision === 'deny') {
+        return domainFailure(
+          '修改未获批准',
+          `The user declined the edit to \`${relative}\`. Do not retry it unchanged; ask what they want changed.`,
+        );
+      }
+      const committed = await ctx.commitFile(target, next, textFingerprint(text));
+      if (!committed.ok) {
+        return domainFailure(
+          committed.reason === 'busy' ? '工作区正忙，没有写入' : '文件在修改前被改过，没有写入',
+          `${committed.detail} 重新 read_file 看最新内容，再重新定位要替换的片段；不要用旧的片段重试。`,
+        );
+      }
+      ctx.markTouched([relative]);
       return {
         ok: true,
-        summary: `edited ${rel(ctx, target)} · ${occurrences} replacement${occurrences === 1 ? '' : 's'}`,
-        output: `${rel(ctx, target)} updated`,
-        files: [rel(ctx, target)],
+        summary: `edited ${relative} · ${occurrences} replacement${occurrences === 1 ? '' : 's'}`,
+        output: `${relative} updated`,
+        files: [relative],
       };
     },
   },
@@ -367,8 +443,8 @@ export const tools: ToolDefinition[] = [
     schema: {
       type: 'object',
       properties: {
-        command: { type: 'string', description: 'Command line, e.g. npm test' },
-        purpose: { type: 'string', description: 'One line: what this command proves' },
+        command: { type: 'string', minLength: 1, description: 'Command line, e.g. npm test' },
+        purpose: { type: 'string', minLength: 1, description: 'One line: what this command proves' },
         timeoutMs: { type: 'integer', minimum: 1000, maximum: 180000, description: 'Default 120000' },
       },
       required: ['command', 'purpose'],
@@ -415,7 +491,17 @@ export const tools: ToolDefinition[] = [
       properties: {
         steps: {
           type: 'array',
-          items: { type: 'object' },
+          minItems: 1,
+          maxItems: 12,
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', description: 'Stable id, optional' },
+              title: { type: 'string', minLength: 1, maxLength: 160, description: 'One short line describing the step' },
+              status: { type: 'string', enum: ['pending', 'active', 'done', 'dropped'], description: 'Default pending' },
+            },
+            required: ['title'],
+          },
           description: 'Array of {title, status} where status is pending | active | done | dropped',
         },
       },
@@ -444,25 +530,158 @@ export const tools: ToolDefinition[] = [
     },
   },
   {
-    name: 'memory_write',
-    risk: 'write',
+    name: 'memory_read',
+    risk: 'read',
     mutating: false,
-    summary: 'Remember one durable fact about this user or workspace.',
-    useWhen: 'The user states a stable preference, constraint or environment fact worth keeping across sessions.',
-    avoidWhen: 'It is a one-off instruction for this turn, or it is already true in the workspace files.',
+    summary: 'Recall long-term memories (episodic / relational / knowledge) about this user, project or past work.',
+    useWhen:
+      'Use when the user refers to something from before ("last time", "that client", "阿姨", "do you remember"), when a name, role or pronoun needs resolving, or when starting a task that may repeat past work, preferences, decisions or failures. Also use it before asking the user to repeat a stable preference.',
+    avoidWhen:
+      'Do NOT use it every turn, for facts the current conversation already states, or for anything a file tool can verify first (read_file / grep_text / glob_files). Do NOT use it to fish for general context: pass a concrete query. Do NOT invent memories: if the tool returns nothing, say you do not have that memory and ask.',
+    examples: [
+      'query: "上次登录超时" — find the past episode and whether the fix worked.',
+      'query: "阿姨", kind: "relational" — resolve who that nickname refers to and the episode it is anchored to.',
+      'query: "包管理器", kind: "knowledge" — check a stable constraint before choosing a command.',
+      'query: "", kind: "episodic", limit: 5 — review the most important past tasks before starting similar work.',
+    ],
     schema: {
       type: 'object',
       properties: {
-        slot: { type: 'string', description: 'Dotted slot, e.g. pref.comments or env.packageManager' },
-        value: { type: 'string', description: 'The fact, in the user’s own words' },
-        scope: { type: 'string', enum: ['workspace', 'global'], description: 'Default workspace' },
+        query: { type: 'string', description: 'What to recall. Prefer concrete names, people, files or task keywords; empty means "most important memories".' },
+        kind: { type: 'string', enum: ['all', 'episodic', 'relational', 'knowledge'], description: 'Restrict to one memory kind, default all' },
+        limit: { type: 'integer', minimum: 1, maximum: 20, description: 'Maximum hits, default 5' },
+        include_archived: { type: 'boolean', description: 'Also search the forgotten/archive file, default true' },
+        wake: { type: 'boolean', description: 'Wake matching archived memories back into active memory, default true' },
       },
-      required: ['slot', 'value'],
       additionalProperties: false,
     },
     async run(ctx, args) {
-      const scope: MemoryScope = String(args.scope ?? 'workspace') === 'global' ? { kind: 'global' } : { kind: 'workspace' };
-      const result = await ctx.remember({ slot: String(args.slot), value: String(args.value), scope });
+      const kind = String(args.kind ?? 'all');
+      const allowed = ['all', 'episodic', 'relational', 'knowledge'];
+      const result = await ctx.recall({
+        query: String(args.query ?? ''),
+        kind: allowed.includes(kind) ? (kind as RecallArgs['kind']) : 'all',
+        limit: Number(args.limit ?? 5),
+        includeArchived: args.include_archived !== false,
+        wake: args.wake !== false,
+      });
+      const mode = result.mode === 'hybrid' ? ' · 混合召回' : result.mode === 'keyword' ? ' · 关键词召回' : '';
+      return {
+        ok: true,
+        summary: result.hits.length === 0 ? `长期记忆 · 没有命中` : `长期记忆 · ${result.hits.length} 条${result.woken.length ? ` · 唤醒 ${result.woken.length}` : ''}${mode}`,
+        output: formatRecall(result),
+      };
+    },
+  },
+  {
+    name: 'memory_write',
+    risk: 'write',
+    mutating: false,
+    summary: 'Write one durable long-term memory: an episode, a reference, or a stable fact/constraint.',
+    useWhen:
+      'Use when a task or project is finished (success or failure) to record what happened and what it taught; when the user corrects how to refer to a person/thing; or when a durable fact or constraint becomes clear and is worth keeping across sessions. Importance is your judgement, 1–100.',
+    avoidWhen:
+      'Not for one-off instructions for this turn, not for what a workspace file already records, and not for every intermediate step — working memory already logs the steps. Do not write the same memory twice.',
+    examples: [
+      'kind: "episodic", when: "2026-11-23 下午", where: "E:/code/xiaohei", detail: "重构记忆管理，新增长期/短期/工作三层", result: "typecheck、测试、构建均通过", outcome: "success", importance: 72 — record a finished task.',
+      'kind: "relational", alias: "阿姨", referent: "妈妈的同学", relation: "长辈", detail: "那天打招呼、戴眼镜的卷发女士就是她", episode_id: "mem_xxx", importance: 65 — pin a reference to the episode that introduced it.',
+      'kind: "knowledge", slot: "env.packageManager", detail: "这个工作区统一用 pnpm", scope: "workspace", importance: 85 — keep a stable constraint.',
+    ],
+    schema: {
+      type: 'object',
+      properties: {
+        kind: { type: 'string', enum: ['episodic', 'relational', 'knowledge'], description: 'Memory kind' },
+        importance: {
+          type: 'integer',
+          minimum: 1,
+          maximum: 100,
+          description: 'Your judgement: 80+ long-lived constraints/identities, 50–79 ordinary completed work, 20–49 narrow useful details, 1–19 marginal.',
+        },
+        title: { type: 'string', description: 'Short title, e.g. "修复登录超时" or "阿姨 → 妈妈的同学"' },
+        detail: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 4000,
+          description:
+            'episodic: what happened; relational: how you know who/what this refers to; knowledge: the fact/constraint/statement.',
+        },
+        when: { type: 'string', description: 'Episodic: when it happened, e.g. 2026-11-23 下午 or 上周三晚上' },
+        where: { type: 'string', description: 'Episodic: where it happened, usually the workspace or file' },
+        result: { type: 'string', description: 'Episodic: the outcome detail, including the failure reason when it failed' },
+        outcome: { type: 'string', enum: ['success', 'failure', 'partial'], description: 'Episodic: did it work' },
+        alias: { type: 'string', description: 'Relational: the name/nickname/pronoun used, e.g. 阿姨' },
+        referent: { type: 'string', description: 'Relational: who or what it refers to, e.g. 妈妈的同学' },
+        relation: { type: 'string', description: 'Relational: optional relation label, e.g. 长辈 / 同事 / 客户系统' },
+        episode_id: { type: 'string', description: 'Relational: id of the episodic memory that introduced this reference, if any' },
+        slot: { type: 'string', description: 'Knowledge: dotted slot for updates/conflicts, e.g. env.packageManager' },
+        scope: { type: 'string', enum: ['workspace', 'global'], description: 'Knowledge: default workspace' },
+        tags: {
+          type: 'array',
+          items: { type: 'string', minLength: 1 },
+          maxItems: 8,
+          description: 'Optional tags for recall',
+        },
+      },
+      required: ['kind', 'importance', 'detail'],
+      additionalProperties: false,
+    },
+    async run(ctx, args) {
+      const kind = String(args.kind ?? '');
+      if (kind !== 'episodic' && kind !== 'relational' && kind !== 'knowledge') {
+        return domainFailure('kind 必须是 episodic / relational / knowledge', 'Pass one of the three memory kinds in `kind`.');
+      }
+      const detail = String(args.detail ?? '').trim();
+      if (!detail) return domainFailure('detail 是空的', 'Describe what happened, who it refers to, or the fact itself in `detail`.');
+      const importance = Number(args.importance);
+      if (!Number.isFinite(importance) || importance < 1 || importance > 100) {
+        return domainFailure('importance 必须是 1–100 的整数', 'Judge how durable this memory is: 80+ for long-lived constraints, 50–79 for ordinary completed work, 20–49 for narrow details.');
+      }
+      if (kind === 'episodic') {
+        const missing = [
+          !String(args.when ?? '').trim() ? 'when（何时）' : '',
+          !String(args.where ?? '').trim() ? 'where（何地）' : '',
+          !String(args.result ?? '').trim() ? 'result（结果）' : '',
+          !['success', 'failure', 'partial'].includes(String(args.outcome ?? '')) ? 'outcome（success / failure / partial）' : '',
+        ].filter(Boolean);
+        if (missing.length > 0) {
+          return domainFailure(
+            `情景记忆缺少：${missing.join('、')}`,
+            'An episodic memory is only useful with 何时 / 何地 / 结果 / 成败. Fill those fields; a failure is as valuable as a success because future you must not repeat it.',
+          );
+        }
+      }
+      if (kind === 'relational') {
+        if (!String(args.alias ?? '').trim() || !String(args.referent ?? '').trim()) {
+          return domainFailure(
+            '关系记忆缺少 alias 或 referent',
+            'A relational memory is a mapping: `alias` is what the user says ("阿姨"), `referent` is who it actually is ("妈妈的同学"). Add the episode_id when an episode introduced it.',
+          );
+        }
+      }
+      const scalar = (value: unknown): string | undefined => {
+        const clean = typeof value === 'string' ? value.trim() : '';
+        return clean ? clean : undefined;
+      };
+      const tags = Array.isArray(args.tags)
+        ? args.tags.filter((tag): tag is string => typeof tag === 'string' && tag.trim().length > 0).slice(0, 8)
+        : undefined;
+      const result = await ctx.remember({
+        kind,
+        detail,
+        importance: Math.round(importance),
+        title: scalar(args.title),
+        when: scalar(args.when),
+        where: scalar(args.where),
+        result: scalar(args.result),
+        outcome: ['success', 'failure', 'partial'].includes(String(args.outcome)) ? (args.outcome as MemoryWriteArgs['outcome']) : undefined,
+        alias: scalar(args.alias),
+        referent: scalar(args.referent),
+        relation: scalar(args.relation),
+        episodeId: scalar(args.episode_id),
+        slot: scalar(args.slot),
+        scope: args.scope === 'global' ? 'global' : args.scope === 'workspace' ? 'workspace' : undefined,
+        tags,
+      });
       return { ok: true, summary: `memory · ${result.kind}`, output: result.note };
     },
   },
@@ -478,8 +697,8 @@ export const tools: ToolDefinition[] = [
     schema: {
       type: 'object',
       properties: {
-        header: { type: 'string', description: 'Short label for the card, 2–8 chars, e.g. 选择范围' },
-        question: { type: 'string', description: 'One focused question, plain text, no markdown' },
+        header: { type: 'string', minLength: 1, maxLength: 16, description: 'Short label for the card, 2–8 chars, e.g. 选择范围' },
+        question: { type: 'string', minLength: 1, description: 'One focused question, plain text, no markdown' },
         options: {
           type: 'array',
           items: { type: 'object' },
@@ -527,16 +746,26 @@ export const toolByName = new Map(tools.map((tool) => [tool.name, tool]));
 
 /** OpenAI-compatible tool definitions. */
 export function toolSpecs(): Array<{ type: 'function'; function: { name: string; description: string; parameters: unknown } }> {
-  return tools.map((tool) => ({
-    type: 'function' as const,
-    function: {
-      name: tool.name,
-      description: `${tool.summary}\nUse when: ${tool.useWhen}\nDo NOT use when: ${tool.avoidWhen}`,
-      parameters: tool.schema,
-    },
-  }));
+  return tools.map((tool) => {
+    const examples = tool.examples?.length ? `\nExamples:\n${tool.examples.map((example) => `- ${example}`).join('\n')}` : '';
+    return {
+      type: 'function' as const,
+      function: {
+        name: tool.name,
+        description: `${tool.summary}\nUse when: ${tool.useWhen}\nDo NOT use when: ${tool.avoidWhen}${examples}`,
+        parameters: tool.schema,
+      },
+    };
+  });
 }
 
-export function toolDescriptors(): Array<{ name: string; summary: string; risk: ToolRisk; useWhen: string; avoidWhen: string }> {
-  return tools.map((tool) => ({ name: tool.name, summary: tool.summary, risk: tool.risk, useWhen: tool.useWhen, avoidWhen: tool.avoidWhen }));
+export function toolDescriptors(): Array<{ name: string; summary: string; risk: ToolRisk; useWhen: string; avoidWhen: string; examples?: string[] }> {
+  return tools.map((tool) => ({
+    name: tool.name,
+    summary: tool.summary,
+    risk: tool.risk,
+    useWhen: tool.useWhen,
+    avoidWhen: tool.avoidWhen,
+    ...(tool.examples?.length ? { examples: tool.examples } : {}),
+  }));
 }

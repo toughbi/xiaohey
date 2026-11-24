@@ -2756,6 +2756,12 @@ body.resizing-docs {
   line-height: 1.6;
 }
 
+.memory-title {
+  margin-bottom: 2px;
+  color: var(--ink);
+  font-weight: 500;
+}
+
 .memory-meta {
   color: var(--ink-3);
 }
@@ -5024,6 +5030,90 @@ body.resizing-rail {
   border-radius: 12px;
   background: var(--panel);
   overflow: visible;
+}
+
+.embedding-panel {
+  margin-top: 18px;
+  padding: 16px 18px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+}
+
+.embedding-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.embedding-head h2 {
+  margin: 0;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.embedding-head p {
+  max-width: 640px;
+  margin: 5px 0 0;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+
+.embedding-fields {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.embedding-fields.disabled {
+  opacity: 0.5;
+}
+
+.embedding-fields label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: var(--ink-2);
+  font-size: 11.5px;
+}
+
+.embedding-fields input {
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--inset);
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.embedding-fields input:focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+}
+
+.embedding-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-top: 14px;
+  color: var(--ink-3);
+  font-size: 11px;
+}
+
+.embedding-foot .mini {
+  flex: none;
+}
+
+@media (max-width: 900px) {
+  .embedding-fields {
+    grid-template-columns: 1fr;
+  }
 }
 
 .model-rows {

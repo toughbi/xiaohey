@@ -84,19 +84,19 @@ const POLICY_OPTIONS: Array<{
   {
     id: 'ask',
     title: '每次询问',
-    description: '执行命令前始终询问；文件写入只发生在工作区内',
+    description: '每次命令执行和文件写入都先问你',
     icon: <ShieldCheck size={15} strokeWidth={1.6} />,
   },
   {
     id: 'auto',
     title: '自动审批',
-    description: '仅在检测到潜在风险时询问',
+    description: '只在危险命令或高风险写入时询问（覆盖大文件、敏感路径）',
     icon: <Shield size={15} strokeWidth={1.6} />,
   },
   {
     id: 'full',
     title: '完全访问',
-    description: '不再询问，命令直接执行，仍全程记录到日志与检查点',
+    description: '不再询问，命令与写入直接执行，仍全程记录到日志与检查点',
     icon: <Unlock size={15} strokeWidth={1.6} />,
   },
 ];
@@ -274,9 +274,15 @@ export function Composer({
         <div className="approval-card">
           <div className="approval-head">
             <span className="label">需要你的许可</span>
-            <span className="mono dim">{approval.risk === 'exec' ? '命令' : '写入'}</span>
+            <span className="mono dim">
+              {approval.risk === 'exec' ? '命令' : '写入'}
+              {approval.tier ? ` · ${approval.tier === 'high' ? '高风险' : approval.tier === 'medium' ? '中风险' : '低风险'}` : ''}
+            </span>
           </div>
-          <pre className="approval-command">$ {approval.command}</pre>
+          <pre className="approval-command">
+            {approval.risk === 'exec' ? '$ ' : ''}
+            {approval.command}
+          </pre>
           <p className="approval-reason">{approval.reason}</p>
           <div className="approval-actions">
             <button type="button" className="primary small" onClick={() => onApprove(approval.id, 'allow_once')}>
@@ -285,8 +291,13 @@ export function Composer({
             <button type="button" className="mini" onClick={() => onApprove(approval.id, 'allow_always')}>
               本会话允许
             </button>
-            <button type="button" className="mini" onClick={() => onAllowAlways(approval)} title="以后这条命令不再询问">
-              总是允许这条命令
+            <button
+              type="button"
+              className="mini"
+              onClick={() => onAllowAlways(approval)}
+              title={approval.risk === 'exec' ? '以后这条命令不再询问' : '以后写入这个文件不再询问'}
+            >
+              {approval.risk === 'exec' ? '总是允许这条命令' : '总是允许写这个文件'}
             </button>
             <button type="button" className="mini danger" onClick={() => onApprove(approval.id, 'deny')}>
               拒绝

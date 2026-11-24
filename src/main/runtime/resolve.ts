@@ -1,5 +1,3 @@
-import type { MemoryRecord } from './memory.js';
-import { activeFacts } from './memory.js';
 import { estimateTokens } from '../util.js';
 
 /**
@@ -206,21 +204,45 @@ export function extractEvents(text: string, now: Date, timezone: string, source:
   return events;
 }
 
-/** Pull entity candidates out of the memory store so a pronoun can be linked. */
-export function resolveEntities(text: string, facts: MemoryRecord[]): { matched: EntityRef[]; ambiguous: EntityRef[][] } {
+/**
+ * Pull entity candidates out of long-term memory so a pronoun can be linked.
+ *
+ * Two shapes feed this: relational memories (alias → referent) and knowledge
+ * memories slotted `entity.<term>`. A structural type keeps the resolver usable
+ * by the legacy store and by `memory.md` alike.
+ */
+export interface MemoryEntitySource {
+  slot?: string;
+  value?: string;
+  detail?: string;
+  alias?: string;
+  referent?: string;
+  source: string;
+  status?: string;
+}
+
+export function resolveEntities(text: string, facts: MemoryEntitySource[]): { matched: EntityRef[]; ambiguous: EntityRef[][] } {
   const matched: EntityRef[] = [];
   const ambiguous: EntityRef[][] = [];
-  for (const fact of activeFacts(facts)) {
-    if (!fact.slot.startsWith('entity.')) continue;
+  const active = facts.filter((fact) => fact.status !== 'superseded' && fact.status !== 'disputed');
+  for (const fact of active) {
+    const alias = fact.alias?.trim();
+    if (alias) {
+      if (text.includes(alias)) {
+        matched.push({ term: alias, canonical: fact.referent?.trim() || fact.detail || alias, kind: 'relation', source: fact.source });
+      }
+      continue;
+    }
+    if (!fact.slot?.startsWith('entity.')) continue;
     const term = fact.slot.slice('entity.'.length);
     if (!text.includes(term)) continue;
-    const ref: EntityRef = { term, canonical: fact.value, kind: 'entity', source: fact.source };
+    const ref: EntityRef = { term, canonical: fact.value ?? fact.detail ?? term, kind: 'entity', source: fact.source };
     matched.push(ref);
-    const alternatives = activeFacts(facts).filter(
-      (other) => other !== fact && other.slot.startsWith(`entity.${term}.`) && other.status !== 'superseded',
+    const alternatives = active.filter(
+      (other) => other !== fact && other.slot?.startsWith(`entity.${term}.`),
     );
     if (alternatives.length > 0) {
-      ambiguous.push([ref, ...alternatives.map((alt) => ({ term, canonical: alt.value, kind: 'entity', source: alt.source }))]);
+      ambiguous.push([ref, ...alternatives.map((alt) => ({ term, canonical: alt.value ?? alt.detail ?? term, kind: 'entity', source: alt.source }))]);
     }
   }
   return { matched, ambiguous };

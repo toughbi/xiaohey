@@ -290,7 +290,8 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
           if (event.approval.threadId === activeId) setApproval(event.approval);
           break;
         case 'memory/updated':
-          if (event.threadId !== activeId) return;
+          // Long-term memory is global; a background session's write still
+          // belongs in the panel of the session the user is looking at.
           setMemory(event.facts);
           break;
         case 'snapshot/updated':
