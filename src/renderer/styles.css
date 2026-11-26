@@ -1,35 +1,52 @@
 /* xiaohey: a pale mist canvas with one verdigris action, hairlines, and the
    wider Monet hues kept for code and data. */
 
+/* Latin UI face, taken from the system. Noto Sans' grotesque sits with PuHuiTi's
+   Chinese where Segoe's narrow humanist glyphs read like a different document,
+   and the variable cut carries the 400/500/600 the interface actually uses.
+   `unicode-range` keeps this face to Latin and punctuation: Chinese keeps
+   rendering with the bundled font, and a machine without Noto falls straight
+   through to Segoe in --font-ui, so nothing breaks. */
+@font-face {
+  font-family: "Xiaohey Latin";
+  src: local("Noto Sans SC"), local("Noto Sans"), local("Inter"), local("Source Sans 3");
+  font-style: normal;
+  font-weight: 300 700;
+  font-display: swap;
+  unicode-range:
+    U+0000-024F, U+02B0-02FF, U+1E00-1EFF, U+2000-206F, U+20A0-20CF, U+2116, U+2122,
+    U+2190-21FF, U+2200-22FF, U+25A0-25FF, U+FB00-FB06;
+}
+
 :root {
   color-scheme: light;
-  --canvas: #fdfefd;
+  --canvas: #fbfbfb;
   --panel: #ffffff;
   --rail: transparent;
-  --inset: #f8fbf9;
-  --inset-2: #f0f6f2;
-  --active: #f5faf7;
-  --hover: #fbfdfc;
-  --ink: #2b3e34;
-  --ink-2: #5b6d63;
-  --ink-3: #687b70;
-  --line: #f5f9f6;
-  --line-strong: #ecf3ee;
-  --accent: #6fb39a;
-  --accent-ink: #3e7c6a;
-  --accent-soft: #f2f9f5;
-  --accent-deep: #3e7c6a;
-  --action: #c9ecdf;
-  --on-accent: #1e4639;
-  --bubble: color-mix(in srgb, var(--accent) 9%, var(--panel));
-  --add: #3d8150;
-  --del: #b45650;
-  --warn: #8c6c26;
-  --warn-soft: #fbf6ea;
-  --danger: #ae4b44;
-  --danger-soft: #fbf2f0;
-  --shadow: 0 12px 32px -18px rgba(18, 38, 32, 0.08);
-  --font-ui: "Segoe UI Variable Text", "Segoe UI", "Alibaba PuHuiTi 3", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+  --inset: #f5f5f5;
+  --inset-2: #eeeeee;
+  --active: #ededed;
+  --hover: #f4f4f4;
+  --ink: #1f2023;
+  --ink-2: #5f6368;
+  --ink-3: #80868b;
+  --line: #ececec;
+  --line-strong: #e0e0e0;
+  --accent: #a8c7fa;
+  --accent-ink: #1a73e8;
+  --accent-soft: #eaf1fd;
+  --accent-deep: #0b57d0;
+  --action: #d3e3fd;
+  --on-accent: #0b57d0;
+  --bubble: #f1f3f4;
+  --add: #1e8e3e;
+  --del: #d93025;
+  --warn: #9a6400;
+  --warn-soft: #fef7e0;
+  --danger: #d93025;
+  --danger-soft: #fce8e6;
+  --shadow: 0 10px 26px -18px rgba(15, 18, 24, 0.12);
+  --font-ui: "Xiaohey Latin", "Segoe UI Variable Text", "Segoe UI", "Alibaba PuHuiTi 3", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
   --font-mono: "SF Mono", "JetBrains Mono", "Fira Code", "Cascadia Code", "Cascadia Mono", Consolas, "Alibaba PuHuiTi 3", "Microsoft YaHei UI", "Microsoft YaHei", monospace;
   --radius-sm: 6px;
   --radius: 8px;
@@ -289,6 +306,7 @@ button {
 
 .panel {
   display: flex;
+  flex-direction: column;
   flex: 1;
   min-width: 0;
   min-height: 0;
@@ -307,38 +325,6 @@ button {
   width: 232px;
   min-height: 0;
   padding-right: 4px;
-}
-
-.rail-modes {
-  display: inline-flex;
-  align-self: flex-start;
-  align-items: center;
-  gap: 2px;
-  margin: 2px 0 6px;
-  padding: 2px;
-  border-radius: 10px;
-  background: var(--inset-2);
-}
-
-.mode {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 26px;
-  padding: 0 10px;
-  border-radius: 8px;
-  color: var(--ink-2);
-  font-size: 12.5px;
-}
-
-.mode.active {
-  background: var(--panel);
-  color: var(--ink);
-  box-shadow: 0 0 0 1px var(--line);
-}
-
-.mode.active svg {
-  color: var(--accent);
 }
 
 .rail-new {
@@ -711,64 +697,6 @@ button {
   flex: none;
 }
 
-.usage-pop {
-  position: absolute;
-  left: 4px;
-  bottom: 52px;
-  z-index: 40;
-  width: 208px;
-  padding: 10px 12px;
-  border: 1px solid var(--line-strong);
-  border-radius: 10px;
-  background: var(--panel);
-  box-shadow: var(--shadow);
-  animation: rise 140ms ease both;
-}
-
-.usage-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 8px;
-  padding-bottom: 6px;
-  border-bottom: 1px solid var(--line);
-  color: var(--ink);
-  font-size: 12px;
-}
-
-.usage-head .mono {
-  color: var(--ink-3);
-  font-size: 10px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.usage-pop dl {
-  margin: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.usage-pop dl > div {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.usage-pop dt {
-  color: var(--ink-3);
-  font-size: 11.5px;
-}
-
-.usage-pop dd {
-  margin: 0;
-  color: var(--ink);
-  font-size: 11.5px;
-}
 
 .rail-menu-backdrop {
   position: fixed;
@@ -973,7 +901,17 @@ button {
   min-height: 0;
   overflow-y: auto;
   padding: 8px 24px 4px;
-  mask-image: linear-gradient(to bottom, transparent 0, #000 10px, #000 calc(100% - 10px), transparent 100%);
+  /* The viewport runs to the bottom of the panel and the composer floats over
+     it: no fade where the glass starts — the glass edge is the cut, and the
+     trace it blurs through is the point. Only the last sliver, under the stats
+     line, is faded out. */
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 10px,
+    #000 calc(100% - 26px),
+    transparent 100%
+  );
 }
 
 .timeline {
@@ -1020,6 +958,25 @@ button {
   font-size: 13.5px;
   line-height: 1.7;
   white-space: pre-wrap;
+}
+
+/* How this turn reached the model: 原文 / L1 句柄 / L2 摘要 / L3 指针. */
+.turn-level {
+  margin-top: 6px;
+  padding: 1px 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--ink-3);
+  font-size: 10px;
+  line-height: 1.6;
+  letter-spacing: 0.02em;
+  user-select: none;
+}
+
+.turn-level.level-2,
+.turn-level.level-3 {
+  border-color: var(--line-strong);
+  color: var(--ink-2);
 }
 
 .agent-text {
@@ -1143,6 +1100,36 @@ button {
   gap: 8px;
   margin: 10px 0 8px;
   font-size: 12px;
+}
+
+/* An elided result: the row holds a preview, the blob holds the original. */
+.tool-elided {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 8px;
+  font-size: 11px;
+}
+
+.tool-expand {
+  padding: 3px 9px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink-2);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.tool-expand:hover:not(:disabled) {
+  background: var(--hover);
+}
+
+.tool-expand:disabled {
+  cursor: progress;
+  color: var(--ink-3);
 }
 
 .chip {
@@ -2079,10 +2066,217 @@ button {
 .cm-right .cm-item {
   overflow: hidden;
   text-overflow: ellipsis;
+  /* The row can get crowded (turns, tokens, cache, context): let the text items
+     give way instead of pushing the percentage out of the panel. */
+  min-width: 0;
+}
+
+/* Four chips need less air than two on a narrow window. */
+@media (max-width: 1180px) {
+  .cm-right {
+    gap: 10px;
+  }
 }
 
 .cm-item svg {
   color: var(--ink-3);
+}
+
+/* ---------- context breakdown (composer meta) ---------- */
+
+.ctx-meter {
+  position: relative;
+  display: inline-flex;
+}
+
+.ctx-trigger {
+  padding: 2px 5px;
+  margin: -2px -5px;
+  border-radius: 6px;
+  color: inherit;
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: background 110ms ease, color 110ms ease;
+}
+
+.ctx-trigger:hover,
+.ctx-trigger.open {
+  background: var(--hover);
+  color: var(--ink-2);
+}
+
+.ctx-menu {
+  position: fixed;
+  z-index: 40;
+  width: 292px;
+  padding: 12px 13px 11px;
+  border: 1px solid var(--line-strong);
+  border-radius: 11px;
+  background: color-mix(in srgb, var(--panel) 86%, transparent);
+  -webkit-backdrop-filter: blur(30px) saturate(130%);
+  backdrop-filter: blur(30px) saturate(130%);
+  box-shadow: 0 18px 44px -26px rgba(20, 38, 32, 0.5);
+  color: var(--ink);
+  text-align: left;
+  animation: rise 140ms ease both;
+}
+
+.ctx-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.ctx-title {
+  font-size: 12.5px;
+  color: var(--ink-2);
+}
+
+.ctx-title strong {
+  margin-left: 4px;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.ctx-count {
+  color: var(--ink-3);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ctx-bar {
+  display: flex;
+  align-items: stretch;
+  gap: 1px;
+  height: 6px;
+  margin: 9px 0 11px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--inset-2);
+}
+
+.ctx-seg {
+  display: block;
+  height: 100%;
+  min-width: 2px;
+}
+
+.ctx-rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ctx-rows li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--ink);
+}
+
+.ctx-quiet {
+  color: var(--ink-3);
+}
+
+.ctx-swatch {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 3px;
+}
+
+.ctx-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ctx-quiet .ctx-label {
+  color: var(--ink-3);
+}
+
+.ctx-value {
+  flex: none;
+  color: var(--ink-2);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ctx-quiet .ctx-value {
+  color: var(--ink-3);
+}
+
+.ctx-note {
+  margin: 10px 0 0;
+  color: var(--ink-3);
+  font-size: 10.5px;
+  line-height: 1.6;
+}
+
+/* One hue per layer, cool to warm: the prompt is quiet, the work is loud. */
+.ctx-part-system {
+  background: #9aa0a6;
+}
+
+.ctx-part-tools {
+  background: #8a7bd8;
+}
+
+.ctx-part-memory {
+  background: #c08a3e;
+}
+
+.ctx-part-history {
+  background: #1a73e8;
+}
+
+.ctx-part-working {
+  background: #2f9e8f;
+}
+
+.ctx-part-reserved {
+  background: color-mix(in srgb, var(--ink) 22%, transparent);
+}
+
+.ctx-part-free {
+  background: transparent;
+}
+
+.ctx-swatch.ctx-part-free {
+  box-shadow: inset 0 0 0 1px var(--line-strong);
+}
+
+.ctx-part-empty {
+  background: var(--ink-3);
+}
+
+:root[data-theme='dark'] .ctx-part-system {
+  background: #9aa0a6;
+}
+
+:root[data-theme='dark'] .ctx-part-tools {
+  background: #a99bf0;
+}
+
+:root[data-theme='dark'] .ctx-part-memory {
+  background: #d8a55c;
+}
+
+:root[data-theme='dark'] .ctx-part-history {
+  background: #6aa5ff;
+}
+
+:root[data-theme='dark'] .ctx-part-working {
+  background: #5cc0b2;
 }
 
 /* ---------- docs ---------- */
@@ -2915,6 +3109,12 @@ body.resizing-docs {
   color: var(--ink);
 }
 
+/* A toggle that is currently on (the terminal panel) reads as pressed. */
+.ghost.active {
+  background: var(--active);
+  color: var(--ink);
+}
+
 .ghost.icon {
   padding: 6px;
 }
@@ -3214,7 +3414,7 @@ body.resizing-docs {
 }
 
 .theme-card.light .theme-preview {
-  background: #fdfefd;
+  background: #fbfbfb;
 }
 
 .theme-card.dark .theme-preview {
@@ -3227,7 +3427,7 @@ body.resizing-docs {
 }
 
 .theme-card.light .theme-preview-rail {
-  background: #fdfefd;
+  background: #fbfbfb;
 }
 
 .theme-card.dark .theme-preview-rail {
@@ -3283,6 +3483,72 @@ body.resizing-docs {
   margin: 0;
   color: var(--ink);
   font-size: 16px;
+}
+
+/* Long-term memory: the 50M gate, the queue and the manual pass. */
+.settings-memory {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+
+.settings-memory header {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.settings-memory h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.settings-memory header .dim {
+  max-width: 62ch;
+  font-size: 11.5px;
+  line-height: 1.7;
+}
+
+.settings-memory-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  color: var(--ink-3);
+  font-size: 11px;
+}
+
+.settings-memory-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 11.5px;
+}
+
+.settings-ghost {
+  padding: 6px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink-2);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.settings-ghost:hover:not(:disabled) {
+  background: var(--hover);
+}
+
+.settings-ghost:disabled {
+  cursor: progress;
+  color: var(--ink-3);
 }
 
 .settings-about {
@@ -4360,7 +4626,7 @@ body.resizing-docs {
 .tiny-copy {
   width: 24px;
   height: 24px;
-  border-radius: 6px;
+  border-radius: 7px;
 }
 
 .docs-search {
@@ -4804,12 +5070,6 @@ body.resizing-docs {
   margin-top: 0;
 }
 
-.turn-actions .copy-btn {
-  width: 28px;
-  height: 28px;
-  border-radius: 8px;
-}
-
 .turn-block:hover .turn-actions,
 .turn-actions:focus-within {
   opacity: 1;
@@ -5025,10 +5285,12 @@ body.resizing-rail {
 }
 
 /* ---------- settings: model rows ---------- */
+/* The rows are already cards. A frame around them put a second border 1px
+   inside the last row's bottom edge, which read as that edge being covered. */
 .model-panel {
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: var(--panel);
+  border: 0;
+  border-radius: 0;
+  background: transparent;
   overflow: visible;
 }
 
@@ -5127,11 +5389,6 @@ body.resizing-rail {
   align-items: center;
   gap: 12px;
   padding: 14px 16px;
-  border-bottom: 1px dashed var(--line);
-}
-
-.model-row:last-child {
-  border-bottom: 0;
 }
 
 .model-row.disabled {
@@ -5557,7 +5814,9 @@ body.resizing-rail {
 .minimap {
   position: absolute;
   top: 16px;
-  bottom: 16px;
+  /* The tick rail belongs to the visible part of the transcript, which stops
+     where the docked composer begins. */
+  bottom: calc(var(--dock-h, 150px) + 12px);
   right: 2px;
   width: 26px;
   z-index: 4;
@@ -5674,7 +5933,7 @@ body.resizing-rail {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 5px 10px;
+  padding: 4px 10px;
   background: var(--inset);
   border-bottom: 1px solid var(--line);
 }
@@ -5718,15 +5977,16 @@ body.resizing-rail {
 
 .queue-list {
   max-height: 176px;
+  margin: 0;
   overflow-y: auto;
-  padding: 2px 6px;
+  padding: 1px 6px;
 }
 
 .queue-item {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 2px 8px;
+  padding: 1px 8px;
   border-radius: 8px;
 }
 
@@ -6168,15 +6428,10 @@ body.resizing-rail {
 
 .message-actions {
   margin-top: 0;
-  height: 20px;
+  height: 26px;
   align-items: center;
 }
 
-.message-copy {
-  width: 24px;
-  height: 24px;
-  border-radius: 7px;
-}
 
 
 .turn-head {
@@ -6209,10 +6464,14 @@ body.resizing-rail {
 }
 
 .composer-dock {
+  /* Floating, not in flow: the transcript viewport runs all the way to the
+     bottom edge of the input, so history scrolls behind the glass the way it
+     does in DeepSeek Harness. `--dock-h` (written by the app) is what keeps the
+     tail clear of it, so nothing is ever hidden at rest. */
   position: absolute;
-  left: 0;
   right: 0;
   bottom: 0;
+  left: 0;
   z-index: 6;
   display: flex;
   flex-direction: column;
@@ -6247,7 +6506,9 @@ body.resizing-rail {
 }
 
 .transcript {
-  padding-bottom: calc(var(--dock-h, 120px) + 24px);
+  /* Reserve the dock's height at the tail: scrolled to the end, the last line
+     sits just above the input instead of underneath it. */
+  padding-bottom: calc(var(--dock-h, 150px) + 12px);
 }
 
 .composer {
@@ -6279,7 +6540,10 @@ body.resizing-rail {
 }
 
 .composer-dock {
-  background: linear-gradient(to bottom, transparent calc(100% - 30px), var(--panel) 100%);
+  /* Scrim behind the stats line under the input: the transcript runs under this
+     dock now, so the bottom band has to turn solid before it meets bare text —
+     ramping, so the fade itself never reads as a grey stripe. */
+  background: linear-gradient(to bottom, transparent calc(100% - 78px), var(--panel) calc(100% - 44px));
 }
 
 .composer {
@@ -6307,7 +6571,9 @@ body.resizing-rail {
 }
 
 .jump-bottom {
-  bottom: calc(var(--dock-h, 120px) + 10px);
+  /* Anchored inside the transcript viewport, which now runs to the panel's
+     bottom edge: lift it clear of the dock, whatever cards are stacked there. */
+  bottom: calc(var(--dock-h, 150px) + 10px);
   z-index: 7;
   background: color-mix(in srgb, var(--panel) 82%, transparent);
   -webkit-backdrop-filter: blur(14px) saturate(120%);
@@ -6416,13 +6682,11 @@ body.resizing-rail {
 }
 
 /* Conversation column lines up with the composer's corner ends (16px dock
-   inset + 16px radius), and its scroll viewport ends at the composer bottom. */
-.session {
-  --dock-bottom: 12px;
-}
-
+   inset + 16px radius). The dock floats over the transcript, so the breathing
+   room between the last visible line and the topmost card above the input is
+   the transcript's own tail padding, sized from `--dock-h`. */
 .transcript-holder {
-  margin-bottom: var(--dock-gap, 38px);
+  margin-bottom: 0;
 }
 
 .transcript {
@@ -6466,14 +6730,685 @@ body.resizing-rail {
   backdrop-filter: none;
 }
 
+/* 70%, not 86%: the transcript now scrolls behind this card, and a faint echo of
+   the text under the input is the point — the blur does the reading-blocking, the
+   tint only sets the temperature. */
 .composer::before {
   content: '';
   position: absolute;
   inset: -1px;
   z-index: -1;
   border-radius: 16px;
-  background: color-mix(in srgb, var(--panel) 86%, transparent);
-  -webkit-backdrop-filter: blur(30px) saturate(130%);
-  backdrop-filter: blur(30px) saturate(130%);
+  background: color-mix(in srgb, var(--panel) 70%, transparent);
+  /* 22px, not 30: at 30 the line under the input dissolves into a cloud; at 22
+     you can read its shape but never its words. */
+  -webkit-backdrop-filter: blur(22px) saturate(130%);
+  backdrop-filter: blur(22px) saturate(130%);
   pointer-events: none;
+}
+
+/* Typing is the one moment the echo becomes noise: thicken the same glass so the
+   line being written never competes with whatever is sliding past underneath. */
+.composer:focus-within::before {
+  background: color-mix(in srgb, var(--panel) 84%, transparent);
+}
+
+/* ---------- terminal dock ---------- */
+
+.panel-row {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.work-column {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.work-column > .session {
+  flex: 1;
+  min-height: 0;
+}
+
+.term-dock {
+  position: relative;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.term-resize {
+  position: absolute;
+  top: -4px;
+  right: 0;
+  left: 0;
+  height: 8px;
+  z-index: 2;
+  cursor: row-resize;
+}
+
+.term-resize::after {
+  content: '';
+  position: absolute;
+  top: 3px;
+  right: 0;
+  left: 0;
+  height: 1px;
+  background: transparent;
+  transition: background 120ms ease;
+}
+
+.term-resize:hover::after {
+  background: var(--line-strong);
+}
+
+.term-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+  padding: 0 6px 0 8px;
+  flex: none;
+  background: var(--panel);
+}
+
+.term-tabs {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+  align-self: stretch;
+  padding-top: 6px;
+}
+
+.term-tabs::-webkit-scrollbar {
+  height: 0;
+}
+
+/* A tab pill on the terminal surface; no rule under the header. */
+.term-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  height: 26px;
+  padding: 0 6px 0 9px;
+  border: 0;
+  border-radius: 7px;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.term-tab svg {
+  flex: none;
+}
+
+.term-tab:hover {
+  color: var(--ink-2);
+  background: var(--inset);
+}
+
+.term-tab.open {
+  color: var(--ink-2);
+}
+
+.term-tab.active {
+  background: var(--inset);
+  color: var(--ink);
+}
+
+.term-tab-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
+  opacity: 0.45;
+  cursor: pointer;
+}
+
+.term-tab:hover .term-tab-close,
+.term-tab-close:focus-visible {
+  opacity: 1;
+}
+
+.term-tab-close:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.term-add {
+  flex: none;
+}
+
+.term-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+}
+
+.term-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.term-body.split-row {
+  flex-direction: row;
+}
+
+.term-body.split-column {
+  flex-direction: column;
+}
+
+.term-pane {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.term-body.split-row .term-pane + .term-pane {
+  border-left: 1px solid var(--line);
+}
+
+.term-body.split-column .term-pane + .term-pane {
+  border-top: 1px solid var(--line);
+}
+
+.term-log {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px 10px 2px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.62;
+  cursor: text;
+}
+
+.term-line {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--ink-2);
+}
+
+.term-cmd {
+  color: var(--ink);
+}
+
+.term-err {
+  color: var(--danger);
+}
+
+.term-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink-3);
+}
+
+.term-stop {
+  height: 18px;
+  padding: 0 6px;
+  gap: 4px;
+  font-size: 10.5px;
+}
+
+.term-input-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 10px 8px;
+  flex: none;
+}
+
+/* The prompt is drawn inside the transcript, as the last line. */
+.term-prompt-line {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-height: 19px;
+}
+
+.term-prompt-line .term-prompt {
+  color: var(--ink-2);
+}
+
+.term-input {
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.62;
+  outline: none;
+  caret-color: var(--ink);
+}
+
+.term-input::placeholder {
+  color: var(--ink-3);
+}
+
+.term-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 100%;
+  margin: 0;
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.term-slot {
+  display: flex;
+  flex: none;
+  min-height: 0;
+}
+
+/* The dock is a workspace-wide row: it must take the panel's full width. */
+.term-slot > .term-dock {
+  flex: 1;
+  min-width: 0;
+}
+
+.term-slot.hidden {
+  display: none;
+}
+/* ---------- docs: editor + file tree ---------- */
+
+.docs-split {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+}
+
+.docs-split.single {
+  display: block;
+}
+
+.docs-main {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  padding: 0 14px 10px;
+}
+
+.docs-split.single .docs-main {
+  height: 100%;
+}
+
+.docs-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.docs-scroll.editing {
+  overflow: hidden;
+  display: flex;
+}
+
+.docs-crumb {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink-2);
+}
+
+/* The editor is a textarea beside a line-number gutter, scrolled in step. */
+.doc-editor {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+.doc-gutter {
+  flex: none;
+  overflow: hidden;
+  padding: 8px 6px 8px 10px;
+  border-right: 1px solid var(--line);
+  color: var(--ink-3);
+  font-size: 11.5px;
+  line-height: 1.7;
+  text-align: right;
+  user-select: none;
+}
+
+.doc-gutter span {
+  display: block;
+}
+
+.doc-textarea {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 12px;
+  border: 0;
+  outline: none;
+  resize: none;
+  background: transparent;
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.7;
+  white-space: pre;
+  overflow: auto;
+  tab-size: 2;
+}
+
+/* The explorer column on the left of the editor. */
+.file-tree {
+  display: flex;
+  flex-direction: column;
+  flex: none;
+  width: 196px;
+  min-height: 0;
+  border-right: 1px solid var(--line);
+}
+
+.tree-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 8px;
+  flex: none;
+  border-bottom: 1px solid var(--line);
+}
+
+.tree-search {
+  flex: 1;
+  min-width: 0;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--inset);
+  color: var(--ink);
+  font: inherit;
+  font-size: 11.5px;
+  outline: none;
+}
+
+.tree-search:focus {
+  border-color: color-mix(in srgb, var(--ink-3) 45%, var(--line));
+}
+
+.tree-search::placeholder {
+  color: var(--ink-3);
+}
+
+.tree-list {
+  list-style: none;
+  margin: 0;
+  padding: 4px 4px 8px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.tree-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  width: 100%;
+  height: 24px;
+  padding-right: 6px;
+  border-radius: 6px;
+  color: var(--ink-2);
+  font-size: 12px;
+  text-align: left;
+}
+
+.tree-row:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.tree-row.active {
+  background: var(--active);
+  color: var(--ink);
+}
+
+.tree-chevron {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  flex: none;
+  color: var(--ink-3);
+}
+
+.tree-chevron svg {
+  transition: transform 120ms ease;
+}
+
+.tree-chevron svg.open {
+  transform: rotate(90deg);
+}
+
+.tree-icon {
+  display: inline-flex;
+  flex: none;
+  color: var(--ink-3);
+}
+
+.tree-row.dir .tree-icon {
+  color: color-mix(in srgb, var(--ink-3) 80%, var(--ink));
+}
+
+.tree-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tree-size {
+  flex: none;
+  color: var(--ink-3);
+  font-size: 10px;
+}
+
+.tree-empty {
+  margin: 10px 8px;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+
+/* An inline file path in a reply: looks like inline code, behaves like a link. */
+.md-file-ref {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 3px;
+  padding: 1px 5px 1px 4px;
+  border: 1px solid color-mix(in srgb, var(--line) 80%, transparent);
+  border-radius: 4px;
+  background: var(--inset);
+  color: var(--accent-deep);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+  transition: background 110ms ease, border-color 110ms ease, color 110ms ease;
+}
+
+.md-file-ref svg {
+  flex: none;
+  align-self: center;
+  opacity: 0.7;
+}
+
+.md-file-ref:hover {
+  border-color: color-mix(in srgb, var(--accent) 60%, var(--line));
+  background: color-mix(in srgb, var(--accent) 8%, var(--inset));
+  color: var(--accent-deep);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+/* The workspace's right column is an IDE: tree left, editor right. */
+.docs-ide {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.docs-editor-pane {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+
+.term-prompt {
+  flex: none;
+  font-size: 12px;
+}
+
+.term-log {
+  padding-bottom: 10px;
+}
+
+
+/* xterm fills its pane; the surface colour comes from the xterm theme, which
+   follows the app theme. */
+.term-pane {
+  position: relative;
+}
+
+.term-xterm {
+  position: absolute;
+  inset: 0;
+  padding: 6px 4px 4px 10px;
+}
+
+.term-xterm .xterm,
+.term-xterm .xterm-viewport,
+.term-xterm .xterm-screen {
+  height: 100%;
+}
+
+.term-xterm .xterm-viewport {
+  scrollbar-width: thin;
+}
+/* Shell picker next to the + button. */
+.term-shell-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.term-shell-caret {
+  width: 16px;
+  padding: 0;
+}
+
+.term-shell-menu {
+  position: absolute;
+  right: 0;
+  top: 26px;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  min-width: 168px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--panel);
+  box-shadow: 0 12px 30px rgb(0 0 0 / 0.16);
+}
+
+.term-shell-menu button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  color: var(--ink-2);
+  font-size: 12px;
+  text-align: left;
+}
+
+.term-shell-menu button:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.term-shell-menu button.active {
+  color: var(--ink);
+}
+/* xterm.css hard-codes a black viewport; paint it with the theme surface instead
+   so the area below the last row never turns into a dark strip. */
+.term-xterm .xterm-viewport {
+  background-color: var(--panel);
+}
+
+.term-pane {
+  background: var(--panel);
+}
+
+/* The edit affordance is a labelled button, not a lone icon. */
+.edit-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 11.5px;
+}
+
+.edit-button:disabled {
+  opacity: 0.45;
+}
+
+.docs-scroll:not(.editing) .code-row:hover {
+  background: color-mix(in srgb, var(--ink) 4%, transparent);
+}
+/* Tool output is shown in full; the chevron folds it, the reader decides. */
+.tool-elided {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 2px 0 4px;
+  font-size: 11px;
+  color: var(--ink-3);
+}
+
+.tool-body pre.output {
+  max-height: none;
+  overflow: visible;
+  white-space: pre-wrap;
+  word-break: break-word;
 }

@@ -1,12 +1,10 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
-  Brain,
   FileText,
   Folder,
   FolderOpen,
   FolderPlus,
   Check,
-  Gauge,
   Loader2,
   LogOut,
   Moon,
@@ -15,11 +13,10 @@ import {
   SlidersHorizontal,
   Trash2,
   Pin,
-  PanelRight,
   Plus,
   PlusCircle,
   Search,
-  Settings2,
+  Settings,
   Sun,
   Terminal,
   TriangleAlert,
@@ -32,10 +29,8 @@ interface HistoryRailProps {
   width: number;
   threads: Thread[];
   activeId: string | null;
-  model: string;
   user: string;
   theme: 'dark' | 'light';
-  usage: { turns: number; steps: number; tokens: number; percent: number };
   onSelect: (threadId: string) => void;
   onRename: (threadId: string) => void;
   onPin: (threadId: string, pinned: boolean) => void;
@@ -61,10 +56,8 @@ interface HistoryRailProps {
 export function HistoryRail({
   threads,
   activeId,
-  model,
   user,
   theme,
-  usage,
   width,
   onSelect,
   onRename,
@@ -91,7 +84,6 @@ export function HistoryRail({
   const [searching, setSearching] = useState(false);
   const [userMenu, setUserMenu] = useState(false);
   const [confirmSignOut, setConfirmSignOut] = useState(false);
-  const [usageOpen, setUsageOpen] = useState(false);
   const [rowMenu, setRowMenu] = useState<string | null>(null);
   const [workspaceMenu, setWorkspaceMenu] = useState(false);
   const [workspaceQuery, setWorkspaceQuery] = useState('');
@@ -197,15 +189,6 @@ export function HistoryRail({
 
   return (
     <aside className="rail" style={{ width }}>
-      <div className="rail-modes">
-        <span className="mode active">
-          <Terminal size={15} strokeWidth={1.6} />
-          编码
-        </span>
-        <button type="button" className="mode" onClick={() => onOpenTab('files')} title="打开文档区" aria-label="打开文档区">
-          <PanelRight size={15} strokeWidth={1.6} />
-        </button>
-      </div>
 
       <button type="button" className="rail-new" onClick={onNew}>
         <PlusCircle size={15} strokeWidth={1.6} />
@@ -220,10 +203,6 @@ export function HistoryRail({
         <button type="button" onClick={() => onOpenTab('files')}>
           <FileText size={16} strokeWidth={1.5} />
           文档
-        </button>
-        <button type="button" onClick={() => onOpenTab('memory')}>
-          <Brain size={16} strokeWidth={1.5} />
-          记忆
         </button>
       </nav>
 
@@ -597,7 +576,7 @@ export function HistoryRail({
                   onOpenSettings();
                 }}
               >
-                <Settings2 size={14} strokeWidth={1.6} />
+                <Settings size={14} strokeWidth={1.6} />
                 设置
               </button>
               <button
@@ -641,36 +620,6 @@ export function HistoryRail({
           </>
         ) : null}
 
-        {usageOpen ? (
-          <>
-            <div className="rail-menu-backdrop" onClick={() => setUsageOpen(false)} />
-            <div className="usage-pop" role="dialog" aria-label="本会话用量">
-              <div className="usage-head">
-                <span>本会话用量</span>
-                <span className="mono dim">{model}</span>
-              </div>
-              <dl>
-                <div>
-                  <dt>轮次</dt>
-                  <dd className="mono">{usage.turns}</dd>
-                </div>
-                <div>
-                  <dt>步数</dt>
-                  <dd className="mono">{usage.steps}</dd>
-                </div>
-                <div>
-                  <dt>累计 token</dt>
-                  <dd className="mono">{usage.tokens.toLocaleString('en-US')}</dd>
-                </div>
-                <div>
-                  <dt>上下文已用</dt>
-                  <dd className="mono">{usage.percent}%</dd>
-                </div>
-              </dl>
-            </div>
-          </>
-        ) : null}
-
         <button
           type="button"
           className="rail-user"
@@ -688,14 +637,11 @@ export function HistoryRail({
           <button
             type="button"
             className="ghost icon"
-            onClick={() => setUsageOpen((value) => !value)}
-            aria-label="本会话用量"
-            title="本会话用量"
+            onClick={onOpenSettings}
+            aria-label="设置"
+            title="设置"
           >
-            <Gauge size={15} strokeWidth={1.5} />
-          </button>
-          <button type="button" className="ghost icon" onClick={onOpenSettings} aria-label="设置" title="设置">
-            <Settings2 size={15} strokeWidth={1.5} />
+            <Settings size={15} strokeWidth={1.5} />
           </button>
         </div>
       </div>

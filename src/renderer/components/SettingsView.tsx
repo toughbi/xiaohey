@@ -12,8 +12,9 @@ import {
   Settings2,
   Trash2,
 } from 'lucide-react';
-import type { ActivityResult, EmbeddingSettings, ModelProfile, Settings } from '../../shared/types';
+import type { ActivityResult, EmbeddingSettings, ModelProfile, RequestMap, Settings } from '../../shared/types';
 import { ActivityCard } from './ActivityHeatmap';
+import { call } from '../lib/client';
 import { ModelEditor } from './ModelEditor';
 import { providerById } from '../lib/providers';
 import { effectiveProvider, modelTitle } from '../lib/modelLabel';
@@ -99,6 +100,33 @@ export function SettingsView({
   const [rowMenu, setRowMenu] = useState<string | null>(null);
   const [embedding, setEmbedding] = useState<EmbeddingSettings>(settings.embedding ?? EMPTY_EMBEDDING);
   const [embeddingDirty, setEmbeddingDirty] = useState(false);
+  /** Today's spend against the 50M gate, and what is queued for consolidation. */
+  const [memoryUsage, setMemoryUsage] = useState<RequestMap['memory/usage']['result'] | null>(null);
+  const [memoryBusy, setMemoryBusy] = useState(false);
+  const [memoryNote, setMemoryNote] = useState('');
+
+  useEffect(() => {
+    if (page !== 'usage') return;
+    void call('memory/usage', {})
+      .then((value) => setMemoryUsage(value))
+      .catch(() => undefined);
+  }, [page]);
+
+  const consolidateNow = async (): Promise<void> => {
+    setMemoryBusy(true);
+    setMemoryNote('');
+    try {
+      const report = await call('memory/consolidate', {});
+      const wrote = report.written;
+      const skipped = report.skipped.length > 0 ? `，${report.skipped.length} 个工作区未达门槛` : '';
+      setMemoryNote(`已检查 ${report.considered} 个“工作区 × 日”，写入 ${wrote} 条长期记忆${skipped}。`);
+      setMemoryUsage(await call('memory/usage', {}));
+    } catch (error) {
+      setMemoryNote((error as Error).message);
+    } finally {
+      setMemoryBusy(false);
+    }
+  };
 
   useEffect(() => {
     setEmbedding(settings.embedding ?? EMPTY_EMBEDDING);
@@ -437,6 +465,61 @@ export function SettingsView({
                 <dd className="mono">{activity?.summary.records ?? 0}</dd>
               </div>
             </dl>
+
+            <div className="settings-memory">
+              <header>
+                <h3>记忆整合</h3>
+                <span className="dim">
+                  每工作区每天用量达到 {Math.round((memoryUsage?.threshold ?? 50_000_000) / 1_000_000)}M tokens 才调用模型沉淀长期记忆；否则标记为
+                  deferred，可手动触发。
+                </span>
+              </header>
+              <dl className="settings-stats">
+                <div>
+                  <dt>今日用量</dt>
+                  <dd className="mono">
+                    {Math.round((memoryUsage?.todayTokens ?? 0) / 1000).toLocaleString()}k /{' '}
+                    {Math.round((memoryUsage?.threshold ?? 50_000_000) / 1_000_000)}M
+                  </dd>
+                </div>
+                <div>
+                  <dt>待整合</dt>
+                  <dd className="mono">{memoryUsage?.pending.length ?? 0}</dd>
+                </div>
+                <div>
+                  <dt>已完成日</dt>
+                  <dd className="mono">{memoryUsage?.days.filter((day) => day.status === 'done').length ?? 0}</dd>
+                </div>
+              </dl>
+              {memoryUsage && memoryUsage.pending.length > 0 ? (
+                <ul className="settings-memory-list">
+                  {memoryUsage.pending.slice(0, 4).map((mark) => (
+                    <li key={`${mark.workspace}:${mark.dayKey}:${mark.sid}`} className="mono">
+                      {mark.dayKey} · {mark.workspace.split(/[\\/]/).pop() || mark.workspace} · {mark.reason}
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+              {memoryUsage && memoryUsage.days.length > 0 ? (
+                <ul className="settings-memory-list">
+                  {[...memoryUsage.days]
+                    .sort((a, b) => b.dayKey.localeCompare(a.dayKey))
+                    .slice(0, 3)
+                    .map((day) => (
+                      <li key={`${day.workspace}:${day.dayKey}`} className="mono">
+                        {day.dayKey} · {day.workspace.split(/[\\/]/).pop() || day.workspace} · {day.status}
+                        {day.reason ? ` · ${day.reason}` : ''}
+                      </li>
+                    ))}
+                </ul>
+              ) : null}
+              <div className="settings-memory-actions">
+                <button type="button" className="settings-ghost" disabled={memoryBusy} onClick={() => void consolidateNow()}>
+                  {memoryBusy ? '整合中…' : '立即整合（前一天）'}
+                </button>
+                {memoryNote ? <span className="dim">{memoryNote}</span> : null}
+              </div>
+            </div>
           </div>
         ) : null}
 

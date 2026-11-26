@@ -78,6 +78,8 @@ export function ModelEditor({
   const [showKey, setShowKey] = useState(false);
   const [customBaseUrl, setCustomBaseUrl] = useState('');
   const [customName, setCustomName] = useState('');
+  /** The vendor string stored on the profile when the catalogue has no entry. */
+  const [customProvider, setCustomProvider] = useState('');
   const [collapsed, setCollapsed] = useState(false);
 
   const [providerOpen, setProviderOpen] = useState(false);
@@ -219,6 +221,9 @@ export function ModelEditor({
 
   const candidates: ModelProfile[] = draftsFrom(provider, baseUrl, chosen, apiKey, limits).map((entry) => ({
     ...entry,
+    // A custom model's provenance is whatever the user typed; the catalogue id
+    // ('custom') is only the protocol, and it must not survive into the profile.
+    provider: provider.id === 'custom' ? customProvider.trim() || 'custom' : provider.id,
     name: customName.trim() || chosen[0],
     enabled: true,
   }));
@@ -305,7 +310,7 @@ export function ModelEditor({
                   <span>供应商</span>
                   <div className="select select-static">
                     <span className="provider-badge" style={{ background: editProvider.color }}>
-                      {editProvider.name.slice(0, 1)}
+                      {editProvider.name.slice(0, 1).toUpperCase()}
                     </span>
                     {editProvider.name}
                     <ChevronDown size={14} strokeWidth={1.7} className="select-chevron" />
@@ -440,7 +445,7 @@ export function ModelEditor({
                       aria-expanded={providerOpen}
                     >
                       <span className="provider-badge" style={{ background: provider.color }}>
-                        {provider.name.slice(0, 1)}
+                        {provider.name.slice(0, 1).toUpperCase()}
                       </span>
                       {provider.name}
                       <ChevronDown size={14} strokeWidth={1.7} className="select-chevron" />
@@ -463,7 +468,7 @@ export function ModelEditor({
                                 }}
                               >
                                 <span className="provider-badge" style={{ background: item.color }}>
-                                  {item.name.slice(0, 1)}
+                                  {item.name.slice(0, 1).toUpperCase()}
                                 </span>
                                 {item.name}
                                 {item.id === provider.id ? <Check size={14} strokeWidth={1.8} className="select-check" /> : null}
@@ -475,6 +480,19 @@ export function ModelEditor({
                     ) : null}
                   </div>
                 </div>
+
+                {provider.id === 'custom' ? (
+                  <label className="field">
+                    <span>供应商名称</span>
+                    <input
+                      value={customProvider}
+                      onChange={(event) => setCustomProvider(event.target.value)}
+                      placeholder="例如 Moonshot、本地 vLLM"
+                      spellCheck={false}
+                    />
+                    <em>写进模型的 provider 字段：列表和模型菜单按它归组；留空则显示为「自定义」。</em>
+                  </label>
+                ) : null}
 
                 {provider.id === 'custom' ? (
                   <label className="field">

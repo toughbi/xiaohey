@@ -178,13 +178,26 @@ app.whenReady().then(async () => {
   });
 });
 
+let shuttingDown = false;
+
+/** Run the exit pass (interrupted rounds + consolidation + flush) once, then quit. */
+async function quitAfterShutdown(): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  try {
+    await server?.shutdown();
+  } catch {
+    // Exiting must not be blocked by a memory/flush failure.
+  }
+  app.quit();
+}
+
 app.on('window-all-closed', () => {
-  void server?.agent.memory.flush();
-  void server?.store.flushAll();
-  if (process.platform !== 'darwin') app.quit();
+  if (process.platform !== 'darwin') void quitAfterShutdown();
 });
 
-app.on('before-quit', () => {
-  void server?.agent.memory.flush();
-  void server?.store.flushAll();
+app.on('before-quit', (event) => {
+  if (shuttingDown) return;
+  event.preventDefault();
+  void quitAfterShutdown();
 });

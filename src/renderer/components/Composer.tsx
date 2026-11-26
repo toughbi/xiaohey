@@ -9,6 +9,7 @@ import {
   Database,
   Folder,
   GitBranch,
+  Layers,
   Plus,
   RotateCw,
   Search,
@@ -16,10 +17,11 @@ import {
   ShieldCheck,
   Unlock,
 } from 'lucide-react';
-import type { ApprovalPolicy, ApprovalRequest, FileEntry, ModelProfile } from '../../shared/types';
+import type { ApprovalPolicy, ApprovalRequest, ContextGauge, FileEntry, ModelProfile } from '../../shared/types';
 import { tokens } from '../lib/format';
 import { PROVIDERS, providerById } from '../lib/providers';
 import { call } from '../lib/client';
+import { ContextMeter } from './ContextMeter';
 
 interface ComposerMeta {
   turns: number;
@@ -28,6 +30,8 @@ interface ComposerMeta {
   percent: number;
   workspace: string;
   branch: string | null;
+  /** Session prompt tokens and how many the provider served from its cache. */
+  cache: { prompt: number; cached: number } | null;
 }
 
 interface ComposerProps {
@@ -42,6 +46,9 @@ interface ComposerProps {
   approval: ApprovalRequest | null;
   policy: ApprovalPolicy;
   meta: ComposerMeta;
+  /** Token composition behind the percentage in the meta row. */
+  context?: ContextGauge | null;
+  onContextOpen?: () => void;
   onSend: (text: string) => boolean | Promise<boolean>;
   onQueue: (text: string) => boolean | Promise<boolean>;
   onStop: () => void;
@@ -111,6 +118,8 @@ export function Composer({
   approval,
   policy,
   meta,
+  context = null,
+  onContextOpen,
   onSend,
   onQueue,
   onStop,
@@ -709,32 +718,18 @@ export function Composer({
             <Database size={11} strokeWidth={1.7} />
             {tokens(meta.tokens)} tok
           </span>
-          <span className="cm-item" title="上下文已用 / 窗口大小">
-            <ContextRing percent={meta.percent} />
-            {meta.percent}%
-          </span>
+          {meta.cache && meta.cache.prompt > 0 ? (
+            <span
+              className="cm-item"
+              title={`本会话 prompt 共 ${meta.cache.prompt.toLocaleString('en-US')} tokens，其中 ${meta.cache.cached.toLocaleString('en-US')} 由上游缓存命中（按量计费时这部分更便宜）`}
+            >
+              <Layers size={11} strokeWidth={1.7} />
+              缓存命中 {((meta.cache.cached / meta.cache.prompt) * 100).toFixed(1)}%
+            </span>
+          ) : null}
+          <ContextMeter gauge={context ?? null} percent={meta.percent} onOpen={onContextOpen} />
         </span>
       </div>
     </div>
-  );
-}
-
-function ContextRing({ percent }: { percent: number }) {
-  const radius = 5;
-  const circumference = 2 * Math.PI * radius;
-  return (
-    <svg width={12} height={12} viewBox="0 0 14 14" className="cm-ring" aria-hidden="true">
-      <circle cx={7} cy={7} r={radius} fill="none" stroke="currentColor" strokeWidth={1.6} opacity={0.25} />
-      <circle
-        cx={7}
-        cy={7}
-        r={radius}
-        fill="none"
-        stroke="currentColor"
-        strokeWidth={1.6}
-        strokeDasharray={`${(percent / 100) * circumference} ${circumference}`}
-        transform="rotate(-90 7 7)"
-      />
-    </svg>
   );
 }

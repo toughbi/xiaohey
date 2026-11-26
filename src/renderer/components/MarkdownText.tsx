@@ -1,14 +1,35 @@
 import { memo, type ReactNode } from 'react';
+import { FileCode2 } from 'lucide-react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { call } from '../lib/client';
+import { fileTargetOf, openFileTarget } from '../lib/fileLinks';
 import { CodeFence } from './CodeBlock';
 
 const REMARK_PLUGINS = [remarkGfm];
 
 const COMPONENTS: Components = {
   pre: CodeFence,
-  code: ({ children }: { children?: ReactNode }) => <code className="md-inline-code">{children}</code>,
+  code: ({ children, className }: { children?: ReactNode; className?: string }) => {
+    // Inline code that names a file becomes a door into the document panel; a
+    // fenced block never does, and neither does anything that reads as a command.
+    const text = String(Array.isArray(children) ? children.join('') : children ?? '');
+    const target = className ? null : fileTargetOf(text);
+    if (target) {
+      return (
+        <button
+          type="button"
+          className="md-file-ref"
+          title={`在文档区打开 ${target}`}
+          onClick={() => openFileTarget(target)}
+        >
+          <FileCode2 size={11} strokeWidth={1.7} aria-hidden="true" />
+          {text}
+        </button>
+      );
+    }
+    return <code className="md-inline-code">{children}</code>;
+  },
   table: ({ children }: { children?: ReactNode }) => (
     <div className="md-table-wrap">
       <table>{children}</table>

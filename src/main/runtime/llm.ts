@@ -30,7 +30,7 @@ export interface CompletionResult {
   content: string;
   reasoning: string;
   toolCalls: ToolCall[];
-  usage: { promptTokens: number; completionTokens: number };
+  usage: { promptTokens: number; completionTokens: number; cachedTokens: number };
   finishReason: string;
   servedModel: string;
 }
@@ -90,7 +90,12 @@ interface SsePayload {
     delta?: { content?: string | null; reasoning_content?: string | null; tool_calls?: Array<{ index: number; id?: string; function?: { name?: string; arguments?: string } }> };
     finish_reason?: string | null;
   }>;
-  usage?: { prompt_tokens?: number; completion_tokens?: number };
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    prompt_tokens_details?: { cached_tokens?: number };
+    prompt_cache_hit_tokens?: number;
+  };
   model?: string;
   error?: { message?: string };
 }
@@ -190,7 +195,7 @@ async function once(
   let reasoning = '';
   let finishReason = '';
   let servedModel = settings.model;
-  const usage = { promptTokens: 0, completionTokens: 0 };
+  const usage = { promptTokens: 0, completionTokens: 0, cachedTokens: 0 };
   const calls: Array<{ id: string; name: string; args: string }> = [];
 
   for (;;) {
@@ -217,6 +222,11 @@ async function once(
       if (payload.usage) {
         usage.promptTokens = payload.usage.prompt_tokens ?? usage.promptTokens;
         usage.completionTokens = payload.usage.completion_tokens ?? usage.completionTokens;
+        // OpenAI-compatible providers nest it; DeepSeek also returns a flat pair.
+        usage.cachedTokens =
+          payload.usage.prompt_tokens_details?.cached_tokens ??
+          payload.usage.prompt_cache_hit_tokens ??
+          usage.cachedTokens;
       }
       const choice = payload.choices?.[0];
       if (!choice) continue;

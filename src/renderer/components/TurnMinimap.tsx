@@ -27,7 +27,10 @@ export function TurnMinimap({ scroller, turns, version }: TurnMinimapProps) {
   const measure = useCallback(() => {
     const node = scroller.current;
     if (!node) return;
-    setHeight(node.clientHeight);
+    // The viewport runs under the floating dock; the rail belongs to the part
+    // that is actually visible, so subtract the dock's height (`--dock-h`).
+    const reserved = Number.parseFloat(getComputedStyle(node).getPropertyValue('--dock-h')) || 0;
+    setHeight(Math.max(0, node.clientHeight - reserved));
   }, [scroller]);
 
   useLayoutEffect(() => {
@@ -36,6 +39,8 @@ export function TurnMinimap({ scroller, turns, version }: TurnMinimapProps) {
     if (!node) return;
     const observer = new ResizeObserver(() => measure());
     observer.observe(node);
+    const dock = node.parentElement?.querySelector('.composer-dock');
+    if (dock) observer.observe(dock);
     return () => observer.disconnect();
   }, [measure, version, scroller]);
 

@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "workspaceRoot": "E:\\code\\xiaohei\\.probe-home-tools-1795711905317\\demo-workspace",
+  "active": "thr_demo_northwind",
+  "order": [
+    "thr_demo_northwind"
+  ],
+  "sessions": {
+    "thr_demo_northwind": {
+      "sid": "thr_demo_northwind",
+      "workspace": "E:\\code\\xiaohei\\.probe-home-tools-1795711905317\\demo-workspace",
+      "title": "把概览页做成设计过的样子",
+      "createdAt": 1795709385482,
+      "updatedAt": 1795712109461,
+      "turnCount": 1,
+      "status": "idle",
+      "steps": 9,
+      "totalTokens": 21480,
+      "model": "DeepSeek",
+      "lastPrompt": "把概览页做成设计过的样子，不要新增功能"
+    }
+  }
+}

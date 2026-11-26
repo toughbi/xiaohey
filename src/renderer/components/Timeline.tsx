@@ -21,6 +21,7 @@ import {
 import { CopyButton } from './CopyButton';
 import { MarkdownText } from './MarkdownText';
 import { QuestionCard } from './QuestionCard';
+import { useTypewriter } from '../lib/typewriter';
 import type {
   ApprovalItem,
   CheckpointItem,
@@ -38,6 +39,8 @@ import { duration } from '../lib/format';
 
 interface TimelineProps {
   items: Item[];
+  /** Context level per turn id, from the compression manifest. */
+  levels?: Record<string, 0 | 1 | 2 | 3>;
   turn?: Turn | null;
   running: boolean;
   /** Tick used for the live elapsed counter. */
@@ -46,7 +49,10 @@ interface TimelineProps {
   onOpenPath: (path: string) => void;
   onReview: (path: string, snapshotId?: string) => void;
   onAnswerQuestion: (questionId: string, answer: string) => Promise<void>;
+  /** Fetch the original behind an elided tool result. */
+  onLoadHandle?: (handle: string) => Promise<string | null>;
 }
+
 
 const TOOL_ICON: Record<string, ReactNode> = {
   read_file: <FileText size={15} strokeWidth={1.5} />,
@@ -121,19 +127,51 @@ function ToolCard({
   result,
   live,
   onOpenPath,
+  onLoadHandle,
 }: {
   call: ToolCallItem;
   result?: ToolResultItem;
   live: boolean;
   onOpenPath: (path: string) => void;
+  onLoadHandle?: (handle: string) => Promise<string | null>;
 }) {
+  // Folded by default, like the run itself: one line per call, and the complete
+  // output is one click away. Nothing is summarised or dropped.
   const [open, setOpen] = useState(false);
+  const [loaded, setLoaded] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [loadFailed, setLoadFailed] = useState(false);
   // A call only counts as running while its turn is live. Once the turn is
   // over, a call without a result is a failed/cancelled step, never a spinner.
   const running = live && !result && call.status === 'running';
   const cancelled = result?.status === 'cancelled' || (!result && call.status === 'cancelled');
   const failed = !cancelled && (Boolean(result && !result.ok) || (!running && !result));
   const files = result?.files ?? [];
+  const handle = result?.elided?.handle;
+
+  // The stored preview is a convenience, not the whole story: once the reader opens
+  // the card, fetch the original blob so the output is always complete.
+  useEffect(() => {
+    if (!open || !handle || !onLoadHandle || loaded || loading) return;
+    let cancelled = false;
+    setLoading(true);
+    void onLoadHandle(handle)
+      .then((text) => {
+        if (cancelled) return;
+        if (text) setLoaded(text);
+        else setLoadFailed(true);
+      })
+      .catch(() => {
+        if (!cancelled) setLoadFailed(true);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [handle]);
 
   return (
     <div className={`tool-card ${failed ? 'tool-failed' : ''}`}>
@@ -170,7 +208,14 @@ function ToolCard({
                 {result.layer !== 'none' ? <span className="chip chip-quiet mono">{result.layer}</span> : null}
               </div>
               {failed && result.hint ? <pre className="hint">{result.hint}</pre> : null}
-              <pre className="output">{result.output || '(无输出)'}</pre>
+              {handle ? (
+                <div className="tool-elided">
+                  {loading ? <span className="dim mono">正在载入完整输出…</span> : null}
+                  {loadFailed ? <span className="dim mono">完整输出读取失败，下面是已保存的预览</span> : null}
+                  {loaded ? <span className="dim mono">完整输出 · {result?.elided?.tokens ? `${Math.round(result.elided.tokens / 100) / 10}k tokens` : ''}</span> : null}
+                </div>
+              ) : null}
+              <pre className="output">{loaded ?? result.output ?? '(无输出)'}</pre>
               {files.length > 0 ? (
                 <div className="tool-files">
                   {files.slice(0, 6).map((file) => (
@@ -373,6 +418,22 @@ function CompactionCard({ item }: { item: CompactionItem }) {
 }
 
 /**
+ * One assistant paragraph. While the reply is still streaming, the text lands in
+ * bursts; `useTypewriter` hands it over at frame rate so the sentence is written
+ * instead of pasted. The caret marks the reveal tip, not the burst tip.
+ */
+function StreamingReply({ item }: { item: MessageItem }) {
+  const streaming = item.status === 'running';
+  const text = useTypewriter(item.text, streaming);
+  return (
+    <>
+      <MarkdownText text={text} />
+      {streaming ? <span className="caret" /> : null}
+    </>
+  );
+}
+
+/**
  * One user turn. The first line of the model's reply is always the process row:
  * thinking, tool calls and other machinery sit behind one expand/collapse
  * control. Everything the model says — intermediate output, clarifications and
@@ -382,28 +443,35 @@ function TurnBlock({
   turnId,
   items,
   live,
+  level,
   elapsed,
   results,
   onRevert,
   onOpenPath,
   onReview,
   onAnswerQuestion,
+  onLoadHandle,
 }: {
   turnId: string;
   items: Item[];
   live: boolean;
+  level?: 0 | 1 | 2 | 3;
   elapsed: number;
   results: Map<string, ToolResultItem>;
   onRevert: (snapshotId: string) => void;
   onOpenPath: (path: string) => void;
   onReview: (path: string, snapshotId?: string) => void;
   onAnswerQuestion: (questionId: string, answer: string) => Promise<void>;
+  onLoadHandle?: (handle: string) => Promise<string | null>;
 }) {
   const stoppedByUser = items.some((item) => item.kind === 'notice' && item.tone === 'stopped');
   const interrupted = stoppedByUser || items.some(
     (item) => item.kind === 'notice' && item.tone === 'warn' && /中断|中止|停止|退出/.test(item.title),
   );
   const failed = interrupted || items.some((item) => item.kind === 'notice' && item.tone === 'error');
+  // Folded by default, both while the turn streams and after it ends: the answer
+  // stays readable, and the whole run — with complete tool output — is one click
+  // away. Nothing is summarised or dropped; it is only folded.
   const [open, setOpen] = useState(false);
   // Once the row has been on screen while the turn ran, keep it: unmounting it
   // when the turn closes pulls the answer up by the row's height, which reads
@@ -413,21 +481,14 @@ function TurnBlock({
     if (live) setEverLive(true);
   }, [live]);
 
-  // A finished turn folds back; while it runs the row stays put so the answer
-  // never jumps from above the fold to below it. Layout effect: the fold must
-  // land in the same frame as the status flip, not one paint later.
-  useLayoutEffect(() => {
-    if (!live) setOpen(false);
-  }, [live]);
-
   const isAssistantText = (item: Item): item is MessageItem =>
     item.kind === 'message' && item.role === 'assistant' && item.text.trim().length > 0;
   const users = items.filter((item): item is MessageItem => item.kind === 'message' && item.role === 'user');
   const assistantMessages = items.filter(isAssistantText);
   const finalMessage = assistantMessages[assistantMessages.length - 1];
-  // Every assistant message before the answer is narration that led into more
-  // tool calls. While the turn runs it stays in the flow so nothing vanishes
-  // under the reader; once the turn ends it folds in with the tools.
+  // Every assistant message before the newest one is narration that led into
+  // more tool calls. It lives in the fold — during the turn as well — so the
+  // reply column never stacks a paragraph per step.
   const interim = assistantMessages.filter((item) => item.id !== finalMessage?.id);
   const interimIds = new Set(interim.map((item) => item.id));
 
@@ -439,13 +500,17 @@ function TurnBlock({
       item.kind === 'compaction' ||
       (item.kind === 'notice' && item.tone === 'info') ||
       (item.kind === 'tool_call' && item.name !== 'ask_user') ||
-      (item.kind === 'message' && !live && interimIds.has(item.id)),
+      (item.kind === 'message' && interimIds.has(item.id)),
   );
   const toolCalls = processItems.filter((item): item is ToolCallItem => item.kind === 'tool_call');
   const toolCount = toolCalls.length;
-  const hasProcess = processItems.length > 0;
   const hasReasoning = processItems.some((item) => item.kind === 'reasoning');
-  const toolSummary = summarizeTools(toolCalls);
+  // A failed call is not work that happened: describe only the calls that
+  // actually returned, so a failed turn cannot read "已读取文件".
+  const failedCalls = new Set(
+    items.filter((item): item is ToolResultItem => item.kind === 'tool_result' && item.ok === false).map((item) => item.callId),
+  );
+  const toolSummary = summarizeTools(toolCalls.filter((call) => !failedCalls.has(call.callId)));
 
   const asking = items.some((item) => item.kind === 'question' && item.status === 'running');
   const streaming = assistantMessages.find((item) => item.status === 'running');
@@ -465,7 +530,14 @@ function TurnBlock({
   for (const item of processItems) {
     if (item.kind === 'tool_call') {
       rows.push(
-        <ToolCard key={item.id} call={item} result={results.get(item.callId)} live={live} onOpenPath={onOpenPath} />,
+        <ToolCard
+                  key={item.id}
+                  call={item}
+                  result={results.get(item.callId)}
+                  live={live}
+                  onOpenPath={onOpenPath}
+                  onLoadHandle={onLoadHandle}
+                />,
       );
       continue;
     }
@@ -483,6 +555,9 @@ function TurnBlock({
       </div>,
     );
   }
+  // Only a fold with something inside it earns a header; an empty "已完成 · 用时 1 秒"
+  // row is noise, not information.
+  const hasProcess = rows.length > 0;
 
   const checkpoints = items.filter((item): item is CheckpointItem => item.kind === 'checkpoint');
   let resultCard: CheckpointItem | null = null;
@@ -522,12 +597,12 @@ function TurnBlock({
         checkpoint.changeStats?.files.some((file) => file.path === path) === true,
     )?.snapshotId ?? resultCard?.snapshotId;
 
-  // The answer is the last assistant message; narration from earlier steps is
-  // in the fold. While the turn runs, that narration stays in the flow so the
-  // reader can follow it live, then it folds away with the tools.
+  // The answer is the last assistant message; every earlier paragraph is
+  // narration and sits in the fold. While the turn runs only the newest
+  // paragraph — the one currently streaming — stays in the reply column.
   const visible = items.filter(
     (item): item is MessageItem | QuestionItem | NoticeItem =>
-      (isAssistantText(item) && (live || item.id === finalMessage?.id)) ||
+      (isAssistantText(item) && item.id === finalMessage?.id) ||
       (item.kind === 'question' && item.status !== 'running') ||
       (item.kind === 'notice' && item.tone !== 'info'),
   );
@@ -599,15 +674,15 @@ function TurnBlock({
 
       {open && hasProcess ? <div className="turn-process">{rows}</div> : null}
 
-      <div className="reply-block">
-        {visible.map((item) => {
+      {visible.length > 0 ? (
+        <div className="reply-block">
+          {visible.map((item) => {
           if (isAssistantText(item)) {
             const isFinal = item.id === finalMessage?.id;
             return (
               <article key={item.id} className={`turn turn-reply${isFinal ? ' turn-final' : ''}`}>
                 <div className="agent-text">
-                  <MarkdownText text={item.text} />
-                  {item.status === 'running' ? <span className="caret" /> : null}
+                  <StreamingReply item={item} />
                 </div>
                 {isFinal && item.evidence && item.evidence.length > 0 ? (
                   <div className="evidence mono">
@@ -624,7 +699,8 @@ function TurnBlock({
           }
           return <NoticeCard key={item.id} item={item} />;
         })}
-      </div>
+        </div>
+      ) : null}
 
       {!live && resultCard ? (
         <div className="turn-result">
@@ -643,7 +719,7 @@ function TurnBlock({
   );
 }
 
-export function Timeline({ items, turn, running, now, onRevert, onOpenPath, onReview, onAnswerQuestion }: TimelineProps) {
+export function Timeline({ items, levels, turn, running, now, onRevert, onOpenPath, onReview, onAnswerQuestion, onLoadHandle }: TimelineProps) {
   const results = useMemo(() => {
     const map = new Map<string, ToolResultItem>();
     for (const item of items) {
@@ -676,12 +752,14 @@ export function Timeline({ items, turn, running, now, onRevert, onOpenPath, onRe
             turnId={group.id}
             items={group.items}
             live={live}
+            level={levels?.[group.id]}
             elapsed={Math.max(0, ended - started)}
             results={results}
             onRevert={onRevert}
             onOpenPath={onOpenPath}
             onReview={onReview}
             onAnswerQuestion={onAnswerQuestion}
+            onLoadHandle={onLoadHandle}
           />
         );
       })}

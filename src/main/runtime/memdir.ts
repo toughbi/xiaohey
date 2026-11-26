@@ -19,11 +19,9 @@ export function memoryRoot(explicit?: string): string {
 export const MEMORY_FILE = 'memory.md';
 export const MEMORY_ARCHIVE_FILE = 'memory-archive.md';
 export const MEMORY_VECTOR_FILE = 'memory-vectors.json';
-export const PROGRESS_FILE = 'progress.md';
 export const SESSION_DIR = 'session';
 
 export const memoryFile = (root: string): string => join(root, MEMORY_FILE);
 export const memoryArchiveFile = (root: string): string => join(root, MEMORY_ARCHIVE_FILE);
 export const memoryVectorFile = (root: string): string => join(root, MEMORY_VECTOR_FILE);
-export const progressFile = (root: string): string => join(root, PROGRESS_FILE);
 export const sessionDir = (root: string): string => join(root, SESSION_DIR);

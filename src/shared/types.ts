@@ -12,7 +12,7 @@ export type ApprovalDecision = 'allow_once' | 'allow_always' | 'deny';
  * How much the runtime asks before it acts.
  * `ask`  — every command waits for a decision.
  * `auto` — only commands that match a known risk pattern ask.
- * `full` — nothing asks; working memory still records every step.
+ * `full` — nothing asks; the runtime still records every step.
  */
 export type ApprovalPolicy = 'ask' | 'auto' | 'full';
 
@@ -146,6 +146,11 @@ export interface ToolResultItem extends ItemBase {
   /** Paths the tool touched, for checkpoints and the document panel. */
   files?: string[];
   durationMs?: number;
+  /**
+   * Set when the body lives in a blob: `output` is only a preview, and the UI
+   * fetches the original on demand instead of loading it with the transcript.
+   */
+  elided?: { handle: string; tokens: number };
 }
 
 export interface PlanStep {
@@ -255,6 +260,24 @@ export interface Turn {
   step: number;
   /** Why the turn stopped: model finished, budget, guard, error. */
   stopReason?: string;
+  /** How this turn is represented in the model context: L0–L3. */
+  contextLevel?: 0 | 1 | 2 | 3;
+}
+
+/** Per-turn context level, shown as a badge in the transcript. */
+export interface TurnLevel {
+  turn: number;
+  level: 0 | 1 | 2 | 3;
+  status: string;
+}
+
+/** Which part of the prompt a slice of context belongs to. */
+export type ContextPartId = 'system' | 'tools' | 'memory' | 'history' | 'working';
+
+/** One slice of the assembled prompt, for the context breakdown. */
+export interface ContextPart {
+  id: ContextPartId;
+  tokens: number;
 }
 
 export interface ContextGauge {
@@ -264,6 +287,13 @@ export interface ContextGauge {
   memoryFacts: number;
   evidence: number;
   toolCalls: number;
+  /** The model's window, so the breakdown can draw what is still free. */
+  window: number;
+  /** Held back for the answer itself, and for tokenizer drift. */
+  outputReserve: number;
+  safetyMargin: number;
+  /** Token estimate per prompt component; sums to `tokensUsed`. */
+  parts: ContextPart[];
 }
 
 export interface RuntimeStatus {
@@ -398,7 +428,9 @@ export type RuntimeEvent =
   | { type: 'approval/requested'; approval: ApprovalRequest }
   | { type: 'settings/updated'; settings: Settings }
   | { type: 'memory/updated'; threadId: string; facts: MemoryFact[] }
-  | { type: 'snapshot/updated'; threadId: string; snapshots: SnapshotMeta[] };
+  | { type: 'snapshot/updated'; threadId: string; snapshots: SnapshotMeta[] }
+  | { type: 'terminal/data'; id: string; data: string }
+  | { type: 'terminal/exit'; id: string; code: number };
 
 export interface RequestMap {
   'app/info': {
@@ -416,7 +448,15 @@ export interface RequestMap {
   'thread/set-workspace': { params: { threadId: string; workspace: string }; result: Thread };
   'thread/open': {
     params: { threadId: string };
-    result: { thread: Thread; items: Item[]; turn?: Turn; contract: TaskContract | null; plan: PlanStep[] };
+    result: {
+      thread: Thread;
+      items: Item[];
+      turn?: Turn;
+      contract: TaskContract | null;
+      plan: PlanStep[];
+      /** Context level per completed turn, derived from the compression manifest. */
+      turns: TurnLevel[];
+    };
   };
   'thread/rename': { params: { threadId: string; title: string }; result: Thread };
   'thread/delete': { params: { threadId: string }; result: { ok: boolean } };
@@ -441,6 +481,15 @@ export interface RequestMap {
   'approval/respond': { params: { approvalId: string; decision: ApprovalDecision }; result: { ok: boolean } };
   'question/respond': { params: { questionId: string; answer: string }; result: { ok: boolean } };
   'context/get': { params: { threadId: string }; result: ContextGauge };
+  /** Prompt tokens this session sent, and how many the provider had cached. */
+  'usage/thread': { params: { threadId: string }; result: { prompt: number; cached: number } };
+  'terminal/create': {
+    params: { cwd: string; cols: number; rows: number; shell?: 'cmd' | 'powershell' };
+    result: { id: string; cwd: string; shell: string; kind: 'cmd' | 'powershell' };
+  };
+  'terminal/input': { params: { id: string; data: string }; result: { ok: boolean } };
+  'terminal/resize': { params: { id: string; cols: number; rows: number }; result: { ok: boolean } };
+  'terminal/close': { params: { id: string }; result: { ok: boolean } };
   'tools/list': { params: Record<string, never>; result: ToolDescriptor[] };
   'memory/list': { params: { threadId?: string; includeArchived?: boolean }; result: MemoryFact[] };
   'memory/delete': { params: { threadId?: string; slot: string }; result: MemoryFact[] };
@@ -448,6 +497,7 @@ export interface RequestMap {
   'snapshot/revert': { params: { threadId: string; snapshotId: string }; result: { ok: boolean; message: string; undoSnapshotId?: string } };
   'fs/list': { params: { threadId: string; path: string }; result: FileEntry[] };
   'fs/read': { params: { threadId: string; path: string }; result: DocumentPayload };
+  'fs/write': { params: { threadId: string; path: string; text: string }; result: { ok: boolean; size: number } };
   'fs/read-image': { params: { threadId: string; path: string }; result: { dataUrl: string; mime: string } | null };
   'fs/diff': { params: { threadId: string; path: string; snapshotId?: string }; result: DiffPayload };
   'ui/state': { params: Record<string, never>; result: { settings: Settings; threads: Thread[]; tools: ToolDescriptor[] } };
@@ -470,6 +520,27 @@ export interface RequestMap {
     };
   };
   'app/open-external': { params: { url: string }; result: { ok: boolean } };
+  /** Fetch the original behind an elided tool result. */
+  'session/handle': {
+    params: { threadId: string; handle: string; offset?: number; limit?: number };
+    result: { text: string; total: number; offset: number; tokens: number; truncated: boolean } | null;
+  };
+  /** Today's spend, the 50M gate and the consolidation queue. */
+  'memory/usage': {
+    params: Record<string, never>;
+    result: {
+      dayKey: string;
+      threshold: number;
+      todayTokens: number;
+      pending: Array<{ workspace: string; dayKey: string; sid: string; reason: string }>;
+      days: Array<{ workspace: string; dayKey: string; status: string; tokens: number; reason?: string; completedAt?: number }>;
+    };
+  };
+  /** Manual consolidation pass (the settings button). */
+  'memory/consolidate': {
+    params: { dayKey?: string };
+    result: { dayKey: string; considered: number; consolidated: string[]; skipped: Array<{ workspace: string; tokens: number; reason: string }>; written: number };
+  };
 }
 
 export type RequestName = keyof RequestMap;

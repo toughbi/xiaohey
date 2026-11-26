@@ -1,0 +1,20 @@
+{
+  "sid": "thr_c0874ebbbf41",
+  "workspace": "E:\\code\\hooo",
+  "root": "E:\\code\\hooo",
+  "title": "使用kratos框架创建一个经典的http服务",
+  "createdAt": 1795607802707,
+  "updatedAt": 1795712765442,
+  "turnCount": 6,
+  "status": "idle",
+  "schema": 2,
+  "epoch": 1,
+  "revertChain": [],
+  "totalTokens": 957892,
+  "steps": 76,
+  "lastPrompt": "继续",
+  "model": "deepseek-v4.1-flash-1017",
+  "migratedFrom": "threads",
+  "migratedAt": 1795712217150,
+  "worktree": null
+}

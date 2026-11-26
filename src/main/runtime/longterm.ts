@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import type { MemoryFact } from '../../shared/types.js';
 import { clamp, ensureDir, uid, writeTextAtomic } from '../util.js';
+import { redactSecrets } from './redact.js';
 import { ConfiguredEmbedder, cosineSimilarity, type Embedder } from './embedding.js';
 import { normalizeScores, MAX_RERANK_DOCUMENTS, type Reranker } from './rerank.js';
 import { classify, scopeKeyOf, type MemoryRecord, type MemoryScope } from './memory.js';
@@ -76,6 +77,17 @@ export interface MemoryEntry {
   archiveReason?: ArchiveReason;
   supersededBy?: string;
   conflictWith?: string;
+  /** Consolidation lineage: one key per (kind, session, turn range, title). */
+  dedupeKey?: string;
+  sourceSession?: string;
+  sourceTurns?: [number, number];
+  /** The session that produced this memory was deleted; the memory is kept. */
+  sourceDeleted?: boolean;
+  /** The source turns were reverted, so the memory needs a second look. */
+  sourceReverted?: boolean;
+  confidence?: 'high' | 'medium' | 'low';
+  /** Where the statement came from: user statement, tool output, model inference. */
+  trust?: 'user' | 'tool' | 'assistant';
 }
 
 export interface MemoryWriteArgs {
@@ -101,6 +113,11 @@ export interface MemoryWriteInput extends Omit<MemoryWriteArgs, 'scope'> {
   source: string;
   /** Set only by the UI to edit an existing entry in place. */
   id?: string;
+  dedupeKey?: string;
+  sourceSession?: string;
+  sourceTurns?: [number, number];
+  confidence?: 'high' | 'medium' | 'low';
+  trust?: 'user' | 'tool' | 'assistant';
 }
 
 export type WriteVerdict = 'created' | 'supersede' | 'contradict' | 'distinct';
@@ -295,6 +312,17 @@ function sanitizeEntry(raw: Record<string, unknown>, now = Date.now()): MemoryEn
   const conflictWith = text(raw.conflictWith);
   if (supersededBy) entry.supersededBy = supersededBy;
   if (conflictWith) entry.conflictWith = conflictWith;
+  const dedupeKey = text(raw.dedupeKey);
+  const sourceSession = text(raw.sourceSession);
+  if (dedupeKey) entry.dedupeKey = dedupeKey;
+  if (sourceSession) entry.sourceSession = sourceSession;
+  if (Array.isArray(raw.sourceTurns) && raw.sourceTurns.length === 2 && raw.sourceTurns.every((value) => typeof value === 'number')) {
+    entry.sourceTurns = [raw.sourceTurns[0] as number, raw.sourceTurns[1] as number];
+  }
+  if (raw.sourceDeleted === true) entry.sourceDeleted = true;
+  if (raw.sourceReverted === true) entry.sourceReverted = true;
+  if (raw.confidence === 'high' || raw.confidence === 'medium' || raw.confidence === 'low') entry.confidence = raw.confidence;
+  if (raw.trust === 'user' || raw.trust === 'tool' || raw.trust === 'assistant') entry.trust = raw.trust;
   return entry;
 }
 
@@ -672,6 +700,31 @@ export class LongTermMemory {
     return this.entries.length;
   }
 
+  /** Memory written for a session that no longer exists, kept but marked. */
+  findBySourceSession(sessionId: string): MemoryEntry[] {
+    return [...this.entries, ...this.archive].filter((entry) => entry.sourceSession === sessionId);
+  }
+
+  /** Deleting a session keeps its derived memories and marks them. */
+  async markSourceDeleted(sessionId: string): Promise<number> {
+    const hits = this.findBySourceSession(sessionId);
+    if (hits.length === 0) return 0;
+    for (const entry of hits) entry.sourceDeleted = true;
+    await this.save();
+    return hits.length;
+  }
+
+  /** A revert invalidates what was distilled from the reverted turns. */
+  async markSourceReverted(sessionId: string, upToTurn: number): Promise<number> {
+    const hits = this.findBySourceSession(sessionId).filter(
+      (entry) => !entry.sourceTurns || entry.sourceTurns[1] >= upToTurn,
+    );
+    if (hits.length === 0) return 0;
+    for (const entry of hits) entry.sourceReverted = true;
+    await this.save();
+    return hits.length;
+  }
+
   countByKind(): Record<MemoryKind, number> {
     const counts: Record<MemoryKind, number> = { episodic: 0, relational: 0, knowledge: 0 };
     for (const entry of this.entries) counts[entry.kind] += 1;
@@ -735,6 +788,11 @@ export class LongTermMemory {
     if (input.tags?.length) {
       entry.tags = [...new Set(input.tags.map((tag) => tag.trim().slice(0, 40)).filter(Boolean))].slice(0, MAX_TAGS);
     }
+    if (input.dedupeKey?.trim()) entry.dedupeKey = input.dedupeKey.trim().slice(0, 200);
+    if (input.sourceSession?.trim()) entry.sourceSession = input.sourceSession.trim().slice(0, 80);
+    if (input.sourceTurns) entry.sourceTurns = input.sourceTurns;
+    if (input.confidence) entry.confidence = input.confidence;
+    if (input.trust) entry.trust = input.trust;
     return entry;
   }
 
@@ -746,6 +804,27 @@ export class LongTermMemory {
   async write(input: MemoryWriteInput): Promise<WriteReceipt> {
     await this.load();
     if (!input.detail || !input.detail.trim()) throw new Error('memory detail is empty');
+    // Memory outlives the session: strip secrets before anything is stored.
+    input = {
+      ...input,
+      detail: redactSecrets(input.detail),
+      ...(input.title ? { title: redactSecrets(input.title) } : {}),
+      ...(input.result ? { result: redactSecrets(input.result) } : {}),
+      ...(input.when ? { when: redactSecrets(input.when) } : {}),
+      ...(input.where ? { where: redactSecrets(input.where) } : {}),
+      ...(input.alias ? { alias: redactSecrets(input.alias) } : {}),
+      ...(input.referent ? { referent: redactSecrets(input.referent) } : {}),
+    };
+    // Consolidation is idempotent: the same (kind, session, turn range, title)
+    // never produces a second entry, even if the pass is retried.
+    if (input.dedupeKey && !input.id) {
+      const existing =
+        this.entries.find((entry) => entry.dedupeKey === input.dedupeKey) ??
+        this.archive.find((entry) => entry.dedupeKey === input.dedupeKey);
+      if (existing) {
+        return { kind: 'distinct', entry: existing, note: `已存在同一条记忆（${existing.title}），这次没有重复写入。` };
+      }
+    }
     const now = Date.now();
     const kind = input.kind;
 

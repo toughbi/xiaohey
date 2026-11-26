@@ -1,0 +1,27 @@
+{
+  "models": [
+    {
+      "id": "default",
+      "name": "DeepSeek",
+      "baseUrl": "https://api.deepseek.com/v1",
+      "apiKey": "",
+      "model": "deepseek-chat",
+      "temperature": 0.4,
+      "maxOutputTokens": 0,
+      "contextWindow": 131072,
+      "reasoningEffort": "default"
+    }
+  ],
+  "activeModelId": "default",
+  "approval": "ask",
+  "allowedCommands": [],
+  "recentWorkspaces": [],
+  "embedding": {
+    "enabled": false,
+    "baseUrl": "",
+    "apiKey": "",
+    "model": "",
+    "rerankModel": "",
+    "rerankBaseUrl": ""
+  }
+}

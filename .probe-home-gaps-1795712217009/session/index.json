@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "workspaceRoot": "C:\\Users\\xiaoli\\Documents\\xiaohey",
+  "active": "thr_c0874ebbbf41",
+  "order": [
+    "thr_c0874ebbbf41"
+  ],
+  "sessions": {
+    "thr_c0874ebbbf41": {
+      "sid": "thr_c0874ebbbf41",
+      "workspace": "E:\\code\\hooo",
+      "title": "使用kratos框架创建一个经典的http服务",
+      "createdAt": 1795607802707,
+      "updatedAt": 1795712765442,
+      "turnCount": 6,
+      "status": "idle",
+      "steps": 76,
+      "totalTokens": 957892,
+      "model": "deepseek-v4.1-flash-1017",
+      "lastPrompt": "继续"
+    }
+  }
+}

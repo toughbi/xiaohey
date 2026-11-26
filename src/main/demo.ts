@@ -2,7 +2,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import type { ChangeStats, Item, Thread } from '../shared/types.js';
-import type { ThreadDoc } from './store.js';
+import type { SeedDoc } from './store.js';
 import { Checkpoints, countLineDiff } from './runtime/checkpoint.js';
 import { buildContract } from './runtime/contract.js';
 import { emptyState } from './store.js';
@@ -164,7 +164,7 @@ function demoChangeStats(): ChangeStats {
   };
 }
 
-export async function buildDemoDoc(home: string, workspace: string): Promise<ThreadDoc> {
+export async function buildDemoDoc(home: string, workspace: string): Promise<SeedDoc> {
   const now = Date.now();
   const thread: Thread = {
     id: 'thr_demo_northwind',
@@ -286,7 +286,7 @@ export async function buildDemoDoc(home: string, workspace: string): Promise<Thr
   });
 
   thread.itemCount = items.length;
-  const doc: ThreadDoc = {
+  const doc: SeedDoc = {
     thread,
     turn: {
       id: turnId,
@@ -354,7 +354,7 @@ export function demoActivity(weeks: number): Array<{ date: string; count: number
   return days;
 }
 
-export async function captureDemoSnapshot(home: string, doc: ThreadDoc): Promise<void> {
+export async function captureDemoSnapshot(home: string, doc: SeedDoc): Promise<void> {
   const checkpoints = new Checkpoints(join(home, 'snapshots'));
   const meta = await checkpoints.capture({
     threadId: doc.thread.id,

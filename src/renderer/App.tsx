@@ -5,6 +5,7 @@ import {
   PanelLeft,
   PanelRight,
   RotateCcw,
+  SquareTerminal,
   TriangleAlert,
 } from 'lucide-react';
 import type {
@@ -38,6 +39,8 @@ import { Timeline } from './components/Timeline';
 import { TurnMinimap } from './components/TurnMinimap';
 import { Composer } from './components/Composer';
 import { DocumentPanel, type DocTab } from './components/DocumentPanel';
+import { TerminalDock } from './components/TerminalDock';
+import { setFileOpener } from './lib/fileLinks';
 import { SettingsView } from './components/SettingsView';
 import { BrandMark } from './components/BrandMark';
 import { ActivityCard } from './components/ActivityHeatmap';
@@ -54,7 +57,7 @@ const PHASE_LABEL: Record<RuntimeStatus['phase'], string> = {
 
 /** Splitter bounds: the docs panel may shrink to a rail, never below a readable column. */
 const DOCS_MIN = 280;
-const DOCS_MAX = 760;
+const DOCS_MAX = 980;
 const DOCS_DEFAULT = 372;
 const RAIL_MIN = 200;
 const RAIL_MAX = 420;
@@ -68,9 +71,13 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
   const [activeId, setActiveId] = useState<string | null>(null);
   const [thread, setThread] = useState<Thread | null>(null);
   const [items, setItems] = useState<Item[]>([]);
+  /** Context level per turn id (L0–L3), from the compression manifest. */
+  const [turnLevels, setTurnLevels] = useState<Record<string, 0 | 1 | 2 | 3>>({});
   const [turn, setTurn] = useState<Turn | null>(null);
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [gauge, setGauge] = useState<ContextGauge | null>(null);
+  /** Prompt tokens this session sent, and how many the provider had cached. */
+  const [cacheHit, setCacheHit] = useState<{ prompt: number; cached: number } | null>(null);
   const [approval, setApproval] = useState<ApprovalRequest | null>(null);
   /** Approvals belong to a thread; switching away must not lose the request. */
   const pendingApprovals = useRef<Record<string, ApprovalRequest>>({});
@@ -104,16 +111,19 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
     setRailWidth(clamped);
     if (persist) window.localStorage.setItem('xiaohey-rail-width', String(clamped));
   }, []);
-  const [docsOpen, setDocsOpen] = useState<boolean>(() => window.localStorage.getItem('xiaohey-docs-open') === '1');
+  // The session is the workspace; the IDE column opens on demand (header button,
+  // rail 文档, a file link) and its state is remembered once the reader opens it.
+  // The session is the workspace; the IDE column stays closed until the reader
+  // asks for it (header button, rail 文档, a file link). That is the launch default.
+  const [docsOpen, setDocsOpen] = useState(false);
+  const [terminalOpen, setTerminalOpen] = useState(false);
+  /** Once opened, the dock stays mounted: closing it hides the panel, not the shells. */
+  const [terminalMounted, setTerminalMounted] = useState(false);
   const [docsWidth, setDocsWidth] = useState<number>(() => {
     const stored = Number(window.localStorage.getItem('xiaohey-docs-width'));
     return Number.isFinite(stored) && stored >= DOCS_MIN ? Math.min(stored, DOCS_MAX) : 372;
   });
   const splitDrag = useRef<{ startX: number; startWidth: number } | null>(null);
-
-  useEffect(() => {
-    window.localStorage.setItem('xiaohey-docs-open', docsOpen ? '1' : '0');
-  }, [docsOpen]);
 
   const applyDocsWidth = useCallback((next: number, persist: boolean): void => {
     const maxByWindow = Math.max(DOCS_MIN, window.innerWidth - 560);
@@ -139,22 +149,10 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
   const [queues, setQueues] = useState<Record<string, QueuedMessage[]>>({});
   const [queueMode, setQueueMode] = useState<'queue' | 'insert'>('queue');
   const [workspaceMenuRequest, setWorkspaceMenuRequest] = useState<{ id: number; rect: { left: number; top: number; bottom: number } } | null>(null);
-  const dockRef = useRef<HTMLDivElement | null>(null);
   /** A revert reloads the thread; sending before it lands would race it. */
   const openingThread = useRef<Promise<boolean> | null>(null);
   const reverting = useRef<Promise<void> | null>(null);
-  const [dockHeight, setDockHeight] = useState(0);
-  const [dockGap, setDockGap] = useState(38);
 
-  useEffect(() => {
-    const node = dockRef.current;
-    if (!node) return;
-    const sync = (): void => setDockHeight(node.offsetHeight);
-    sync();
-    const observer = new ResizeObserver(sync);
-    observer.observe(node);
-    return () => observer.disconnect();
-  }, []);
   const [version, setVersion] = useState('');
   const [platform, setPlatform] = useState('');
   const [maximized, setMaximized] = useState(false);
@@ -164,21 +162,55 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
   });
 
   const scroller = useRef<HTMLDivElement>(null);
+  /** The dock floats over the transcript; its height is published as `--dock-h`. */
+  const dockRef = useRef<HTMLDivElement | null>(null);
   const stickToBottom = useRef(true);
+  /**
+   * The reader owns the scroll position, not the layout. Only a gesture (wheel,
+   * touch, scrollbar drag) may detach the view from the bottom; a resize, a
+   * growing dock or a reflow must never be mistaken for "the user scrolled up".
+   */
+  const userScrollUntil = useRef(0);
+  const scrollbarDrag = useRef(false);
+  /** Set while the "回到最新" glide runs, so the frame follower keeps its hands off. */
+  const smoothUntil = useRef(0);
+  const noteUserScroll = (): void => {
+    userScrollUntil.current = Date.now() + 220;
+  };
+  const distanceToBottom = (node: HTMLElement): number =>
+    node.scrollHeight - node.scrollTop - node.clientHeight;
 
   const running = turn?.status === 'running' || thread?.status === 'running';
 
   const startingQueued = useRef(false);
+  const queueRetry = useRef(0);
+  const [queueTick, setQueueTick] = useState(0);
   useEffect(() => {
     if (running || !activeId || startingQueued.current) return;
     const next = queues[activeId]?.[0];
     if (!next) return;
     startingQueued.current = true;
-    setQueues((current) => ({ ...current, [activeId]: (current[activeId] ?? []).slice(1) }));
-    void send(next.text).finally(() => {
-      startingQueued.current = false;
-    });
-  }, [running, queues, activeId]);
+    // Dequeue only once the turn really started. A refused start (the
+    // previous turn still committing) must not swallow what was queued.
+    void send(next.text)
+      .then((ok) => {
+        if (ok) {
+          queueRetry.current = 0;
+          setQueues((current) => ({
+            ...current,
+            [activeId]: (current[activeId] ?? []).filter((item) => item.id !== next.id),
+          }));
+          return;
+        }
+        if (queueRetry.current < 3) {
+          queueRetry.current += 1;
+          window.setTimeout(() => setQueueTick((tick) => tick + 1), 800);
+        }
+      })
+      .finally(() => {
+        startingQueued.current = false;
+      });
+  }, [running, queues, activeId, queueTick]);
 
   useEffect(() => {
     if (!running) return;
@@ -196,7 +228,10 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
     return () => window.removeEventListener('resize', sync);
   }, []);
 
-  useEffect(() => {
+  // Layout effect: the theme attribute must be on the document *before* children's
+  // passive effects read the CSS variables (the terminal paints its surface from
+  // --panel, and would otherwise repaint with the previous theme's colours).
+  useLayoutEffect(() => {
     document.documentElement.dataset.theme = theme;
     window.localStorage.setItem('xiaohey-theme', theme);
     void window.xiaohey.setTheme(theme);
@@ -314,6 +349,8 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
     mode: 'source' | 'diff' = 'source',
     snapshotId?: string,
     quiet = false,
+    /** Keep the current tab: the files tab shows the tree beside the content. */
+    stay = false,
   ): Promise<void> => {
     if (!threadId) return;
     try {
@@ -324,8 +361,10 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
       setDoc(document);
       setDiff(delta);
       setView(mode);
-      setTab('preview');
-      setDocsOpen(true);
+      if (!stay) setTab('preview');
+      // A quiet (background) restore of the last edited file must not open the IDE
+      // column by itself: the session opens alone until the reader asks for it.
+      if (!quiet) setDocsOpen(true);
     } catch (reason) {
       const message = (reason as Error).message;
       // The thread can be deleted while its document request is in flight, and
@@ -343,7 +382,22 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
       setActiveId(threadId);
       setThread(opened.thread);
       setItems(opened.items);
+      // Turn ids appear in order, and `turns` is the same order by number: zip
+      // them so the badge on a user message can name its context level.
+      {
+        const order: string[] = [];
+        for (const item of opened.items) {
+          if (item.kind === 'message' && item.role === 'user' && !order.includes(item.turnId)) order.push(item.turnId);
+        }
+        const levels: Record<string, 0 | 1 | 2 | 3> = {};
+        opened.turns.forEach((entry, index) => {
+          const id = order[index];
+          if (id) levels[id] = entry.level;
+        });
+        setTurnLevels(levels);
+      }
       stickToBottom.current = true;
+      setShowJump(false);
       setTurn(opened.turn ?? null);
       setApproval(pendingApprovals.current[threadId] ?? null);
       setError(null);
@@ -442,22 +496,37 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
     // status row settles, narration folds) without touching `items`.
   }, [items, turn]);
 
-  // The dock can grow mid-turn (task list, queued messages) or just after a
-  // turn ends (the plan arrives on the last step). Keep the tail clear only
-  // when the reader is still anchored to the bottom.
-  useLayoutEffect(() => {
-    const node = scroller.current;
-    if (!node) return;
-    if (stickToBottom.current) node.scrollTop = node.scrollHeight;
-  }, [dockHeight]);
+  // The dock can grow mid-turn (task list, queued messages, a question card).
+  // It floats over the transcript, so the scroller cannot reserve room by being
+  // shorter: publish the dock's height as `--dock-h`, and the transcript pads its
+  // tail by that much, the minimap and the jump pill lift themselves above it.
+  // Written straight to the node — a React state hop would re-render the whole
+  // session every time a task row lands mid-turn.
+  useEffect(() => {
+    const dock = dockRef.current;
+    const session = dock?.parentElement;
+    if (!dock || !session) return;
+    const sync = (): void => {
+      const height = Math.round(dock.getBoundingClientRect().height);
+      session.style.setProperty('--dock-h', `${height}px`);
+      // The dock changed, not the scroller's box: re-anchor the tail here.
+      const node = scroller.current;
+      if (node && stickToBottom.current) node.scrollTop = node.scrollHeight;
+    };
+    sync();
+    const observer = new ResizeObserver(sync);
+    observer.observe(dock);
+    return () => {
+      observer.disconnect();
+      session.style.removeProperty('--dock-h');
+    };
+  }, []);
 
-  // A reflow makes the content taller without touching `items` or `dockHeight`:
-  // the window resizes, the docs panel takes width away, a font swaps in. The
-  // old scrollTop then sits above the new bottom and the answer's tail slides
-  // under the glass dock — the one case the item/dock effects cannot see.
-  // Watch the scroller's own box only: its width/height changes exactly when a
-  // reflow can move the tail, while expanding a fold (height-only content
-  // change) must not scroll the reader away.
+  // A reflow makes the content taller without touching `items`: the window
+  // resizes, the docs panel takes width away, a font swaps in.
+  // Watch the scroller's own box — its width/height changes exactly when the
+  // viewport can move the tail — and keep the bottom anchored when the reader
+  // has not taken over.
   useEffect(() => {
     const node = scroller.current;
     if (!node) return;
@@ -473,6 +542,26 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
     };
   }, []);
 
+  // The reply is revealed between deltas now, so the answer grows on frames where
+  // `items` did not change. Pinning only on data events would let the caret drift
+  // below the fold and snap back on every delta; while the reader is following,
+  // follow at frame rate instead. A press on 回到最新 glides, so stand down then.
+  useEffect(() => {
+    if (!running) return;
+    let frame = 0;
+    const follow = (): void => {
+      frame = requestAnimationFrame(follow);
+      const node = scroller.current;
+      // Never fight a gesture: while a wheel/touch is in flight, the reader owns
+      // the scrollbar even if following was still on a moment ago.
+      if (!node || !stickToBottom.current) return;
+      if (Date.now() < smoothUntil.current || Date.now() < userScrollUntil.current) return;
+      if (node.scrollHeight - node.scrollTop - node.clientHeight > 1) node.scrollTop = node.scrollHeight;
+    };
+    frame = requestAnimationFrame(follow);
+    return () => cancelAnimationFrame(frame);
+  }, [running]);
+
   const navigate = async (path: string): Promise<void> => {
     if (!activeId) return;
     const list = await call('fs/list', { threadId: activeId, path });
@@ -480,6 +569,12 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
     setFiles(list);
     setTab('files');
   };
+
+  // The docs column is an IDE (tree + editor): give it room whenever it opens.
+  useEffect(() => {
+    if (docsOpen && docsWidth < 620) applyDocsWidth(620, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [docsOpen]);
 
   // Switching or binding a workspace changes the file root; refresh the docs list.
   useEffect(() => {
@@ -504,7 +599,12 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
       return false;
     }
     try {
+      // Sending is an explicit "follow the conversation again": re-anchor even
+      // if the reader had scrolled up, and drop the jump hint.
       stickToBottom.current = true;
+      setShowJump(false);
+      const node = scroller.current;
+      if (node) node.scrollTop = node.scrollHeight;
       // The first screen has no session yet; send creates one so the composer
       // is usable from the very first keystroke.
       let threadId = activeId;
@@ -556,16 +656,15 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
   const enqueue = async (text: string): Promise<boolean> => {
     if (!text.trim() || !activeId) return false;
     if (queueMode === 'insert' && running) {
-      await steerNow(text);
-      return true;
+      return await steerNow(text);
     }
     const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
     setQueues((current) => ({ ...current, [activeId]: [...(current[activeId] ?? []), { id, text }] }));
     return true;
   };
 
-  const steerNow = async (text: string): Promise<void> => {
-    if (!activeId) return;
+  const steerNow = async (text: string): Promise<boolean> => {
+    if (!activeId) return false;
     if (running) {
       await call('turn/cancel', { threadId: activeId });
       for (let attempt = 0; attempt < 60; attempt += 1) {
@@ -574,10 +673,9 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
         const current = list.find((entry) => entry.id === activeId);
         if (current && current.status !== 'running') break;
       }
-      await send(text);
-      return;
+      return send(text);
     }
-    await send(text);
+    return send(text);
   };
 
   const editQueued = (id: string, text: string): void => {
@@ -597,8 +695,10 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
     if (!activeId) return;
     const item = (queues[activeId] ?? []).find((entry) => entry.id === id);
     if (!item) return;
-    deleteQueued(id);
-    void steerNow(item.text);
+    // Keep the row until the turn starts, so a refused start cannot lose it.
+    void steerNow(item.text).then((ok) => {
+      if (ok) deleteQueued(id);
+    });
   };
 
   const approve = async (approvalId: string, decision: 'allow_once' | 'allow_always' | 'deny'): Promise<void> => {
@@ -837,6 +937,7 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
     if (result.undoSnapshotId) setUndoRevert({ snapshotId: result.undoSnapshotId, message: result.message });
     await openThread(activeId);
     stickToBottom.current = true;
+    setShowJump(false);
     requestAnimationFrame(() => {
       if (scroller.current) scroller.current.scrollTop = scroller.current.scrollHeight;
     });
@@ -1063,6 +1164,41 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
     return Math.min(100, Math.round((gauge.tokensUsed / gauge.tokensBudget) * 100));
   }, [gauge]);
 
+  // Inline file paths in a reply open the document panel through this slot, so a
+  // memoized Markdown block never has to re-render just to pick up a new thread.
+  useEffect(() => {
+    setFileOpener((path) => void openFile(path));
+    return () => setFileOpener(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeId]);
+
+  /** Fresh breakdown when the context panel opens: the gauge on screen may be stale. */
+  const refreshContext = async (): Promise<void> => {
+    if (!activeId) return;
+    const value = await call('context/get', { threadId: activeId }).catch(() => null);
+    if (value) setGauge(value);
+  };
+
+  // Cache hits are a session total in the usage ledger, not a live counter: read
+  // them when the thread changes and after a turn adds to its token spend.
+  useEffect(() => {
+    if (!activeId) {
+      setCacheHit(null);
+      return;
+    }
+    let cancelled = false;
+    void call('usage/thread', { threadId: activeId })
+      .then((value) => {
+        if (!cancelled) setCacheHit(value);
+      })
+      .catch(() => {
+        if (!cancelled) setCacheHit(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeId, thread?.totalTokens]);
+
   const activeModel = settings?.models.find((profile) => profile.id === settings.activeModelId) ?? settings?.models[0];
 
   return (
@@ -1161,15 +1297,8 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
           onDeleteWorkspace={(path) => void deleteWorkspace(path)}
           onNewWorkspace={() => void pickNewWorkspace()}
           onOpenWorkspace={(path) => void openWorkspace(path)}
-          model={activeModel?.model ?? '—'}
           user={user || '本机用户'}
           theme={theme}
-          usage={{
-            turns: thread?.turnCount ?? 0,
-            steps: thread?.steps ?? 0,
-            tokens: thread?.totalTokens ?? 0,
-            percent: contextPercent,
-          }}
           onSelect={(id) => void openThread(id)}
           onRename={(id) => void startRename(id)}
           onPin={(id, pinned) => void pinThread(id, pinned)}
@@ -1229,7 +1358,9 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
         ) : null}
 
         <section className="panel">
-          <main className="session" style={{ '--dock-h': `${dockHeight}px`, '--dock-gap': `${dockGap}px` } as React.CSSProperties}>
+          <div className="panel-row">
+          <div className="work-column">
+          <main className="session">
         <header className="session-head">
           <div className="session-head-left">
             {renaming !== null ? (
@@ -1269,8 +1400,25 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
             ) : null}
             <button
               type="button"
+              className={`ghost icon ${terminalOpen ? 'active' : ''}`}
+              onClick={() => {
+                setTerminalMounted(true);
+                setTerminalOpen((value) => !value);
+              }}
+              aria-label="切换终端面板"
+              aria-pressed={terminalOpen}
+              title="切换终端面板"
+            >
+              <SquareTerminal size={16} strokeWidth={1.5} />
+            </button>
+            <button
+              type="button"
               className="ghost icon"
-              onClick={() => setDocsOpen((value) => !value)}
+              onClick={() => {
+                setDocsOpen((value) => !value);
+                // The panel is an IDE now: a narrow column would squeeze the tree.
+                if (!docsOpen) applyDocsWidth(Math.max(docsWidth, 560), true);
+              }}
               aria-label="切换文档区"
               title="切换文档区"
             >
@@ -1318,9 +1466,57 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
             ref={scroller}
             onScroll={(event) => {
               const node = event.currentTarget;
-              const distance = node.scrollHeight - node.scrollTop - node.clientHeight;
+              const distance = distanceToBottom(node);
+              // Back at the tail — by wheel, drag or the jump button — means
+              // "follow again", whoever moved the view there.
+              if (distance <= 8) {
+                stickToBottom.current = true;
+                setShowJump(false);
+              }
+              const byUser = scrollbarDrag.current || Date.now() <= userScrollUntil.current;
+              if (!byUser) {
+                // A layout-induced scroll (font swap, fold, dock growth) is not
+                // the reader leaving: put the tail back if we follow it.
+                if (stickToBottom.current && distance > 24) node.scrollTop = node.scrollHeight;
+                return;
+              }
               stickToBottom.current = distance < 32;
               setShowJump(distance > 240);
+            }}
+            onWheel={(event) => {
+              noteUserScroll();
+              // Any upward wheel means "stop following", even at the very bottom:
+              // otherwise the next streamed delta yanks the page back down and the
+              // two fight over the scrollbar. Following resumes when the reader
+              // scrolls back to the tail, or sends a new message.
+              if (event.deltaY < 0) {
+                stickToBottom.current = false;
+                setShowJump(true);
+              }
+            }}
+            onTouchStart={noteUserScroll}
+            onTouchMove={noteUserScroll}
+            onPointerDown={(event) => {
+              // A press on the scroller itself (not on a row) is a scrollbar drag.
+              if (event.target === event.currentTarget) {
+                scrollbarDrag.current = true;
+                noteUserScroll();
+              }
+            }}
+            onPointerUp={() => {
+              if (!scrollbarDrag.current) return;
+              scrollbarDrag.current = false;
+              const node = scroller.current;
+              if (!node) return;
+              const distance = distanceToBottom(node);
+              stickToBottom.current = distance < 32;
+              setShowJump(distance > 240);
+            }}
+            onPointerCancel={() => {
+              scrollbarDrag.current = false;
+            }}
+            onPointerLeave={() => {
+              scrollbarDrag.current = false;
             }}
           >
             {items.length === 0 ? (
@@ -1344,6 +1540,7 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
             ) : (
               <Timeline
                 items={items}
+                levels={turnLevels}
                 turn={turn}
                 running={Boolean(running)}
                 now={now}
@@ -1351,27 +1548,36 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
                 onOpenPath={(path) => void openFile(path)}
                 onReview={(path, snapshotId) => void openFile(path, activeId, 'diff', snapshotId)}
                 onAnswerQuestion={answerQuestion}
+                onLoadHandle={async (handle) => {
+                  if (!activeId) return null;
+                  const payload = await call('session/handle', { threadId: activeId, handle }).catch(() => null);
+                  return payload?.text ?? null;
+                }}
               />
             )}
           </div>
 
           <TurnMinimap scroller={scroller} version={items.length} turns={minimapTurns} />
-        </div>
 
-        {showJump ? (
-          <button
-            type="button"
-            className="jump-bottom"
-            onClick={() => {
-              stickToBottom.current = true;
-              setShowJump(false);
-              const node = scroller.current;
-              if (node) node.scrollTo({ top: node.scrollHeight, behavior: 'smooth' });
-            }}
-          >
-            回到最新
-          </button>
-        ) : null}
+          {/* Anchored to the transcript viewport, so it always floats just
+              above the dock — whatever cards the dock is showing. */}
+          {showJump ? (
+            <button
+              type="button"
+              className="jump-bottom"
+              onClick={() => {
+                stickToBottom.current = true;
+                setShowJump(false);
+                const node = scroller.current;
+                if (!node) return;
+                smoothUntil.current = Date.now() + 520;
+                node.scrollTo({ top: node.scrollHeight, behavior: 'smooth' });
+              }}
+            >
+              回到最新
+            </button>
+          ) : null}
+        </div>
 
         <div className="composer-dock" ref={dockRef}>
         {workspacePrompt ? (
@@ -1427,6 +1633,7 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
                 ? workspaceInfo.name
                 : '不指定工作区',
             branch: workspaceInfo?.branch ?? null,
+            cache: cacheHit,
           }}
           onSend={(text) => send(text)}
           onQueue={(text) => enqueue(text)}
@@ -1441,6 +1648,8 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
           onAllowAlways={(request) => void allowAlways(request)}
           threadId={activeId}
           onPolicy={(policy) => void changePolicy(policy)}
+          context={gauge}
+          onContextOpen={() => void refreshContext()}
           onSelectModel={(id) => void selectModel(id)}
           onUpdateModel={(id, patch) => void updateModel(id, patch)}
           onOpenFiles={() => {
@@ -1450,6 +1659,7 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
         />
         </div>
       </main>
+      </div>
 
       {docsOpen ? (
         <>
@@ -1496,7 +1706,11 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
           <DocumentPanel
             width={docsWidth}
             tab={tab}
-            onTab={setTab}
+            onTab={(next) => {
+              setTab(next);
+              // The files tab is a two-column editor: 372px would squeeze the code.
+              if (next === 'files') applyDocsWidth(Math.max(docsWidth, 640), true);
+            }}
             dir={dir}
             files={files}
             doc={doc}
@@ -1509,6 +1723,8 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
             onView={setView}
             onNavigate={(path) => void navigate(path)}
             onOpenFile={(path) => void openFile(path)}
+            onOpenFileHere={(path) => void openFile(path, activeId, 'source', undefined, false, true)}
+            onError={(message) => setError(message)}
             onDeleteMemory={(slot) => void deleteMemory(slot)}
             onRevert={(id) => void revert(id)}
             onMemorySet={(slot, value) => void saveMemoryFact(slot, value)}
@@ -1518,6 +1734,17 @@ export function App() {  const [settings, setSettings] = useState<Settings | nul
             onOpenExternal={(url) => void call('app/open-external', { url })}
           />
         </>
+      ) : null}
+      </div>
+
+      {terminalMounted ? (
+        <div className={`term-slot${terminalOpen ? '' : ' hidden'}`}>
+          <TerminalDock
+            cwd={thread?.cwd || workspaceInfo?.path || ''}
+            theme={theme}
+            onClose={() => setTerminalOpen(false)}
+          />
+        </div>
       ) : null}
 
         </section>

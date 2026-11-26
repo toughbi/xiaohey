@@ -1,7 +1,7 @@
-import { useState, type CSSProperties } from 'react';
-import { Check, ChevronLeft, Eye, Upload, CornerDownRight, File, FileCode2, Folder, FolderOpen, Pencil, RefreshCw, RotateCcw, Trash2, X } from 'lucide-react';
+import { useEffect, useRef, useState, type CSSProperties } from 'react';
+import { Check, Eye, CornerDownRight, FileCode2, FolderOpen, PanelLeft, Pencil, RotateCcw, Trash2, Upload, X } from 'lucide-react';
 import { FilePreview } from './FilePreview';
-import { CopyButton } from './CopyButton';
+import { FileTree } from './FileTree';
 import { call } from '../lib/client';
 import type {
   ApprovalItem,
@@ -34,6 +34,8 @@ interface DocumentPanelProps {
   onView: (view: 'source' | 'diff') => void;
   onNavigate: (path: string) => void;
   onOpenFile: (path: string) => void;
+  /** Open without leaving the files tab, so the tree stays beside the content. */
+  onOpenFileHere: (path: string) => void;
   onDeleteMemory: (slot: string) => void;
   onRevert: (snapshotId: string) => void;
   onMemorySet: (slot: string, value: string) => void;
@@ -41,6 +43,8 @@ interface DocumentPanelProps {
   approvals: ApprovalItem[];
   threadId: string;
   onOpenExternal: (url: string) => void;
+  /** Surface a failed save in the app banner. */
+  onError?: (message: string) => void;
 }
 
 const TABS: Array<{ id: DocTab; label: string }> = [
@@ -64,15 +68,27 @@ const MEMORY_OUTCOME_LABEL: Record<string, string> = {
 };
 
 export function DocumentPanel(props: DocumentPanelProps) {
-  const { width, tab, onTab, dir, files, doc, diff, memory, snapshots, approvals, view, onView, threadId, onOpenExternal, onMemorySet, onRefreshFiles } = props;
-  const parent = dir.includes('/') ? dir.slice(0, dir.lastIndexOf('/')) : '.';
+  const { width, tab, onTab, doc, diff, memory, snapshots, approvals, view, onView, threadId, onOpenExternal, onMemorySet } = props;
   const [memorySlot, setMemorySlot] = useState('');
   const [memoryValue, setMemoryValue] = useState('');
   const [editing, setEditing] = useState<{ slot: string; value: string } | null>(null);
-  const [fileQuery, setFileQuery] = useState('');
   const [revertPreview, setRevertPreview] = useState<{ snapshotId: string; entries: Array<{ path: string; status: 'restore' | 'delete'; additions: number; deletions: number; before: string; after: string }> } | null>(null);
   const [openPreviewFile, setOpenPreviewFile] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [editingFile, setEditingFile] = useState(false);
+  const [draft, setDraft] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [treeToken, setTreeToken] = useState(0);
+  // The explorer can be folded away: some files want the whole column.
+  const [treeOpen, setTreeOpen] = useState(() => window.localStorage.getItem('xiaohey-docs-tree') !== 'closed');
+  const toggleTree = (): void => {
+    setTreeOpen((open) => {
+      window.localStorage.setItem('xiaohey-docs-tree', open ? 'closed' : 'open');
+      return !open;
+    });
+  };
+  const gutter = useRef<HTMLDivElement | null>(null);
+  const textarea = useRef<HTMLTextAreaElement | null>(null);
 
   const previewRevert = async (snapshotId: string): Promise<void> => {
     setBusy(true);
@@ -109,284 +125,240 @@ export function DocumentPanel(props: DocumentPanelProps) {
     setEditing(null);
   };
 
-  return (
-    <aside className="docs" style={{ width }}>
-      <div className="docs-tabs" role="tablist">
-        {TABS.map((entry) => (
-          <button
-            key={entry.id}
-            type="button"
-            role="tab"
-            aria-selected={tab === entry.id}
-            className={`docs-tab ${tab === entry.id ? 'active' : ''}`}
-            onClick={() => onTab(entry.id)}
-          >
-            {entry.label}
-            {entry.id === 'memory' && memory.length > 0 ? <span className="mono dim">{memory.length}</span> : null}
-            {entry.id === 'checkpoints' && snapshots.length > 0 ? <span className="mono dim">{snapshots.length}</span> : null}
-          </button>
+  // A different file cancels any edit in progress: the draft belongs to the old path.
+  useEffect(() => {
+    setEditingFile(false);
+    setDraft('');
+  }, [doc?.path]);
+
+  const startEdit = (caret?: number): void => {
+    if (!doc) return;
+    const text = doc.content;
+    setDraft(text);
+    setEditingFile(true);
+    window.setTimeout(() => {
+      const node = textarea.current;
+      if (!node) return;
+      node.focus();
+      const at = typeof caret === 'number' ? Math.max(0, Math.min(caret, text.length)) : text.length;
+      node.selectionStart = at;
+      node.selectionEnd = at;
+    }, 0);
+  };
+
+  /** Clicking a line of the read view opens the editor with the caret on it. */
+  const editAtClick = (event: React.MouseEvent<HTMLDivElement>): void => {
+    if (!doc || editingFile) return;
+    if (doc.language === 'binary' || doc.truncated) return;
+    const target = event.target as HTMLElement;
+    if (target.closest('a, button, img, .md-table-wrap')) return;
+    if ((window.getSelection()?.toString() ?? '').trim().length > 0) return;
+    const row = target.closest('.code-row');
+    let caret: number | undefined;
+    if (row && row.parentElement) {
+      const index = Array.prototype.indexOf.call(row.parentElement.children, row);
+      if (index >= 0) {
+        const lines = doc.content.split('\n');
+        caret = lines.slice(0, index).reduce((sum, line) => sum + line.length + 1, 0);
+      }
+    }
+    startEdit(caret);
+  };
+
+  const cancelEdit = (): void => {
+    setEditingFile(false);
+    setDraft('');
+  };
+
+  const save = async (): Promise<void> => {
+    if (!doc) return;
+    setSaving(true);
+    try {
+      await call('fs/write', { threadId, path: doc.path, text: draft });
+      setEditingFile(false);
+      setTreeToken((value) => value + 1);
+      props.onOpenFileHere(doc.path);
+    } catch (reason) {
+      props.onError?.(`保存失败：${(reason as Error).message}`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const indent = (element: HTMLTextAreaElement): void => {
+    const start = element.selectionStart;
+    const end = element.selectionEnd;
+    setDraft((current) => `${current.slice(0, start)}  ${current.slice(end)}`);
+    window.requestAnimationFrame(() => {
+      element.selectionStart = start + 2;
+      element.selectionEnd = start + 2;
+    });
+  };
+
+  const editor = (
+    <div className="doc-editor">
+      <div className="doc-gutter mono" ref={gutter} aria-hidden="true">
+        {draft.split('\n').map((_, index) => (
+          <span key={index}>{index + 1}</span>
         ))}
       </div>
+      <textarea
+        ref={textarea}
+        className="doc-textarea mono"
+        value={draft}
+        spellCheck={false}
+        wrap="off"
+        aria-label="编辑文件内容"
+        onChange={(event) => setDraft(event.target.value)}
+        onScroll={(event) => {
+          if (gutter.current) gutter.current.scrollTop = event.currentTarget.scrollTop;
+        }}
+        onKeyDown={(event) => {
+          if (event.key === 'Tab') {
+            event.preventDefault();
+            indent(event.currentTarget);
+            return;
+          }
+          if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
+            event.preventDefault();
+            void save();
+            return;
+          }
+          if (event.key === 'Escape') {
+            event.preventDefault();
+            cancelEdit();
+          }
+        }}
+      />
+    </div>
+  );
 
-      {tab === 'files' ? (
-        <div className="docs-body">
-          <div className="docs-path">
-            <button type="button" className="ghost icon" onClick={() => props.onNavigate(parent)} aria-label="上一级">
-              <ChevronLeft size={14} strokeWidth={1.6} />
-            </button>
-            <span className="mono">{dir === '.' ? '工作区根目录' : dir}</span>
-            <span className="path-actions">
-              <label className="ghost icon tiny upload-btn" title="上传文件到 uploads/" aria-label="上传文件">
-                <Upload size={13} strokeWidth={1.6} />
-                <input type="file" multiple hidden onChange={(event) => void uploadFiles(event.target.files)} />
-              </label>
-              <button type="button" className="ghost icon tiny" onClick={() => props.onRefreshFiles()} aria-label="刷新" title="刷新">
-                <RefreshCw size={13} strokeWidth={1.6} />
+  // The editor column: the file, or the session overview when nothing is open.
+  // The tree is a sibling (left), not part of this column.
+  const editorColumn = (
+    <div className="docs-editor-pane">
+      <div className="docs-main">
+        {doc ? (
+          <>
+            <div className="docs-path">
+              <button
+                type="button"
+                className="ghost icon tiny"
+                onClick={toggleTree}
+                aria-label={treeOpen ? '隐藏文件目录' : '显示文件目录'}
+                title={treeOpen ? '隐藏文件目录' : '显示文件目录'}
+              >
+                <PanelLeft size={13} strokeWidth={1.6} />
               </button>
-            </span>
-          </div>
-          <input
-            className="docs-search"
-            value={fileQuery}
-            onChange={(event) => setFileQuery(event.target.value)}
-            placeholder="筛选文件…"
-            aria-label="筛选文件"
-          />
-          <ul className="file-list">
-            {files
-              .filter((entry) => !fileQuery.trim() || entry.name.toLowerCase().includes(fileQuery.trim().toLowerCase()))
-              .map((entry) => (
-              <li key={entry.path}>
-                <button
-                  type="button"
-                  className="file-row"
-                  draggable={!entry.dir}
-                  onDragStart={(event) => {
-                    event.dataTransfer.setData('text/x-xiaohei-path', entry.path);
-                    event.dataTransfer.effectAllowed = 'copy';
-                  }}
-                  onClick={() => (entry.dir ? props.onNavigate(entry.path) : props.onOpenFile(entry.path))}
-                >
-                  <span className="file-icon">
-                    {entry.dir ? <Folder size={15} strokeWidth={1.5} /> : <File size={15} strokeWidth={1.5} />}
-                  </span>
-                  <span className="file-name">{entry.name}</span>
-                  <span className="mono dim file-meta">{entry.dir ? '' : fileSize(entry.size)}</span>
-                </button>
-              </li>
-              ))}
-          </ul>
-          {files.length === 0 ? <p className="docs-empty">这个目录是空的。</p> : null}
-        </div>
-      ) : null}
-
-      {tab === 'preview' ? (
-        <div className="docs-body">
-          {doc ? (
-            <>
-              <div className="docs-path">
-                <FileCode2 size={14} strokeWidth={1.5} />
-                <span className="mono">{doc.path}</span>
-                <span className="mono dim">{doc.language}</span>
-                <span className="mono dim">{relativeTime(doc.updatedAt)}</span>
-                <span className="path-actions">
-                  <button
-                    type="button"
-                    className="ghost icon tiny"
-                    onClick={() => void call('app/reveal', { path: doc.path, threadId })}
-                    aria-label="在资源管理器中显示"
-                    title="在资源管理器中显示"
-                  >
-                    <FolderOpen size={13} strokeWidth={1.6} />
-                  </button>
-                  <CopyButton text={doc.content} label="复制文件内容" className="tiny-copy" />
-                </span>
-              </div>
-              {diff && (view === 'diff' || diff.additions > 0 || diff.deletions > 0) ? (
-                <div className="segmented">
-                  <button type="button" className={view === 'source' ? 'active' : ''} onClick={() => onView('source')}>
-                    原文
-                  </button>
-                  <button type="button" className={view === 'diff' ? 'active' : ''} onClick={() => onView('diff')}>
-                    改动 <span className="mono dim">+{diff.additions} −{diff.deletions}</span>
-                  </button>
-                </div>
-              ) : null}
-              {view === 'diff' && diff ? <DiffView diff={diff} /> : <FilePreview doc={doc} threadId={threadId} onOpenExternal={onOpenExternal} />}
-            </>
-          ) : (
-            <Overview contract={props.contract} plan={props.plan} snapshots={snapshots} onOpenFile={props.onOpenFile} />
-          )}
-        </div>
-      ) : null}
-
-      {tab === 'memory' ? (
-        <div className="docs-body">
-          <div className="docs-note">
-            <CornerDownRight size={14} strokeWidth={1.5} />
-            <span>长期记忆分情景 / 关系 / 知识三类，模型需要时会自己读；冲突的会标出来，不会自动挑一个。</span>
-          </div>
-          <div className="memory-form">
-            <input
-              value={memorySlot}
-              onChange={(event) => setMemorySlot(event.target.value)}
-              placeholder="槽位，例如 env.packageManager"
-              aria-label="记忆槽位"
-            />
-            <input
-              value={memoryValue}
-              onChange={(event) => setMemoryValue(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') saveMemory(memorySlot, memoryValue);
-              }}
-              placeholder="要记住的事实或约束"
-              aria-label="记忆内容"
-            />
-            <button type="button" className="mini" onClick={() => saveMemory(memorySlot, memoryValue)} disabled={!memoryValue.trim()}>
-              记下
-            </button>
-          </div>
-          <ul className="memory-list">
-            {memory.map((fact) => (
-              <li key={fact.id} className={fact.conflicts ? 'disputed' : ''}>
-                <div className="memory-head">
-                  <span className="chip chip-quiet mono">{MEMORY_KIND_LABEL[fact.kind]}</span>
-                  <span className="mono memory-slot">{fact.slot}</span>
-                  <span className="chip chip-quiet mono">{fact.importance}</span>
-                  {fact.kind === 'knowledge' ? (
-                    <button type="button" className="ghost icon tiny" onClick={() => setEditing({ slot: fact.slot, value: fact.value })} aria-label="编辑">
-                      <Pencil size={13} strokeWidth={1.5} />
+              <FileCode2 size={14} strokeWidth={1.5} />
+              <span className="mono docs-crumb" title={doc.path}>
+                {doc.path}
+              </span>
+              <span className="mono dim">{doc.language}</span>
+              <span className="path-actions">
+                {editingFile ? (
+                  <>
+                    <button type="button" className="mini" onClick={() => void save()} disabled={saving}>
+                      {saving ? '保存中…' : '保存'}
                     </button>
-                  ) : null}
-                  <button type="button" className="ghost icon tiny" onClick={() => props.onDeleteMemory(fact.slot)} aria-label="删除">
-                    <Trash2 size={13} strokeWidth={1.5} />
-                  </button>
-                </div>
-                {fact.title && fact.title !== fact.slot ? <p className="memory-value memory-title">{fact.title}</p> : null}
-                {editing?.slot === fact.slot ? (
-                  <div className="memory-edit">
-                    <input
-                      autoFocus
-                      value={editing.value}
-                      onChange={(event) => setEditing({ slot: fact.slot, value: event.target.value })}
-                      onKeyDown={(event) => {
-                        if (event.key === 'Enter') saveMemory(fact.slot, editing.value);
-                        if (event.key === 'Escape') setEditing(null);
-                      }}
-                    />
-                    <button type="button" className="ghost icon tiny" onClick={() => saveMemory(fact.slot, editing.value)} aria-label="保存">
-                      <Check size={13} strokeWidth={2} />
+                    <button type="button" className="ghost small" onClick={cancelEdit}>
+                      取消
                     </button>
-                    <button type="button" className="ghost icon tiny" onClick={() => setEditing(null)} aria-label="取消">
-                      <X size={13} strokeWidth={1.6} />
-                    </button>
-                  </div>
+                  </>
                 ) : (
-                  <p className="memory-value">{fact.value}</p>
-                )}
-                <div className="mono dim memory-meta">
-                  {fact.source} · {relativeTime(fact.updatedAt)}
-                  {fact.outcome ? ` · ${MEMORY_OUTCOME_LABEL[fact.outcome] ?? fact.outcome}` : ''}
-                  {fact.conflicts ? ' · 冲突待澄清' : ''}
-                  {fact.archived ? ' · 已归档' : ''}
-                </div>
-              </li>
-            ))}
-          </ul>
-          {memory.length === 0 ? <p className="docs-empty">还没有记住任何事。任务完成后模型会写入情景记忆，稳定的偏好和约束会写成知识记忆。</p> : null}
-        </div>
-      ) : null}
-
-      {tab === 'checkpoints' ? (
-        <div className="docs-body">
-          <div className="docs-note">
-            <CornerDownRight size={14} strokeWidth={1.5} />
-            <span>每一步一份完整快照，回退会同时还原文件与会话状态。</span>
-          </div>
-          {revertPreview ? (
-            <div className="revert-preview">
-              <div className="revert-preview-head">
-                <span>回退到 {revertPreview.snapshotId} 会改动 {revertPreview.entries.length} 个文件</span>
-                <span className="revert-preview-actions">
-                  <button type="button" className="mini" onClick={() => props.onRevert(revertPreview.snapshotId)} disabled={busy}>
-                    确认回退
-                  </button>
-                  <button type="button" className="mini" onClick={() => setRevertPreview(null)}>
-                    取消
-                  </button>
-                </span>
-              </div>
-              <ul className="revert-preview-list">
-                {revertPreview.entries.map((entry) => (
-                  <li key={entry.path}>
-                    <button type="button" className="revert-preview-row" onClick={() => setOpenPreviewFile(openPreviewFile === entry.path ? null : entry.path)}>
-                      <span className={`chip ${entry.status === 'delete' ? 'chip-danger' : 'chip-quiet'} mono`}>{entry.status === 'delete' ? '删除' : '还原'}</span>
-                      <span className="mono revert-preview-path">{entry.path}</span>
-                      <span className="mono dim">+{entry.additions} −{entry.deletions}</span>
+                  <>
+                    <button
+                      type="button"
+                      className="ghost small edit-button"
+                      onClick={() => startEdit()}
+                      title="编辑文件（也可以直接点内容里的某一行）"
+                      disabled={doc.language === 'binary' || doc.truncated}
+                    >
+                      <Pencil size={13} strokeWidth={1.6} />
+                      编辑
                     </button>
-                    {openPreviewFile === entry.path ? (
-                      <pre className="revert-preview-diff">{renderPreviewDiff(entry.before, entry.after)}</pre>
-                    ) : null}
-                  </li>
-                ))}
-              </ul>
-              {revertPreview.entries.length === 0 ? <p className="docs-empty">这个快照和当前状态一致，回退不会改动文件。</p> : null}
+                    <button
+                      type="button"
+                      className="ghost icon tiny"
+                      onClick={() => void call('app/reveal', { path: doc.path, threadId })}
+                      aria-label="在资源管理器中显示"
+                      title="在资源管理器中显示"
+                    >
+                      <FolderOpen size={13} strokeWidth={1.6} />
+                    </button>
+                  </>
+                )}
+              </span>
             </div>
-          ) : null}
-          <ul className="snapshot-list">
-            {[...snapshots].reverse().map((snapshot) => (
-              <li key={snapshot.id}>
-                <div>
-                  <div className="snapshot-head">
-                    <span className="mono">{snapshot.id}</span>
-                    <span className="mono dim">{fileSize(snapshot.sizeBytes)}</span>
-                    {snapshot.additiveOnly ? <span className="chip chip-quiet">仅新增</span> : null}
-                  </div>
-                  <p className="snapshot-label">{snapshot.label}</p>
-                  <div className="mono dim snapshot-meta">
-                    {snapshot.files.length} 个文件 · {relativeTime(snapshot.at)}
-                  </div>
-                </div>
-                <span className="snapshot-actions">
-                  <button type="button" className="ghost small" onClick={() => void previewRevert(snapshot.id)} disabled={busy}>
-                    <Eye size={13} strokeWidth={1.6} />
-                    预览
-                  </button>
-                  <button type="button" className="ghost small" onClick={() => props.onRevert(snapshot.id)}>
-                    <RotateCcw size={13} strokeWidth={1.6} />
-                    回退
-                  </button>
-                </span>
-              </li>
-            ))}
-          </ul>
-          {snapshots.length === 0 ? <p className="docs-empty">还没有检查点。第一次写入之后会自动生成。</p> : null}
-        </div>
-      ) : null}
+            {!editingFile && diff && (view === 'diff' || diff.additions > 0 || diff.deletions > 0) ? (
+              <div className="segmented">
+                <button type="button" className={view === 'source' ? 'active' : ''} onClick={() => onView('source')}>
+                  原文
+                </button>
+                <button type="button" className={view === 'diff' ? 'active' : ''} onClick={() => onView('diff')}>
+                  改动 <span className="mono dim">+{diff.additions} −{diff.deletions}</span>
+                </button>
+              </div>
+            ) : null}
+            <div
+              className={`docs-scroll${editingFile ? ' editing' : ''}`}
+              onClick={editAtClick}
+              title={
+                !editingFile && doc.language !== 'binary' && !doc.truncated
+                  ? '点击任意一行即可编辑'
+                  : undefined
+              }
+            >
+              {editingFile ? (
+                editor
+              ) : view === 'diff' && diff ? (
+                <DiffView diff={diff} />
+              ) : (
+                <FilePreview doc={doc} threadId={threadId} onOpenExternal={onOpenExternal} />
+              )}
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="docs-path">
+              <button
+                type="button"
+                className="ghost icon tiny"
+                onClick={toggleTree}
+                aria-label={treeOpen ? '隐藏文件目录' : '显示文件目录'}
+                title={treeOpen ? '隐藏文件目录' : '显示文件目录'}
+              >
+                <PanelLeft size={13} strokeWidth={1.6} />
+              </button>
+              <FileCode2 size={14} strokeWidth={1.5} />
+              <span className="mono docs-crumb">本会话</span>
+              <span className="mono dim">概览</span>
+            </div>
+            <div className="docs-scroll">
+              <Overview contract={props.contract} plan={props.plan} snapshots={snapshots} onOpenFile={props.onOpenFile} />
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
 
-      {tab === 'approvals' ? (
-        <div className="docs-body">
-          <div className="docs-note">
-            <CornerDownRight size={14} strokeWidth={1.5} />
-            <span>本会话被拦下审批过的命令；「总是允许」的会写进设置，之后同类命令不再询问。</span>
-          </div>
-          <ul className="approval-list">
-            {approvals.map((entry) => (
-              <li key={entry.id}>
-                <div className="approval-row-head">
-                  <span className="mono">{entry.name}</span>
-                  <span className={`chip ${entry.decision === 'deny' ? 'chip-danger' : 'chip-quiet'} mono`}>
-                    {entry.decision === 'deny' ? '已拒绝' : entry.decision === 'allow_always' ? '本会话允许' : entry.decision === 'allow_once' ? '允许一次' : '待处理'}
-                  </span>
-                </div>
-                <pre className="approval-row-command mono">{entry.command}</pre>
-                {entry.reason ? <p className="approval-row-reason">{entry.reason}</p> : null}
-              </li>
-            ))}
-          </ul>
-          {approvals.length === 0 ? <p className="docs-empty">还没有需要审批的动作。</p> : null}
-        </div>
-      ) : null}
+  return (
+    <aside className="docs" style={{ width }}>
+      {/* The right side of the workspace is an IDE: the tree on the left, the
+          editor on the right. Session internals (memory, checkpoints, approvals)
+          live in the conversation itself, not here. */}
+      <div className={`docs-ide${treeOpen ? '' : ' no-tree'}`}>
+        {treeOpen ? (
+          <FileTree
+            threadId={threadId}
+            activePath={doc?.path ?? null}
+            onOpen={props.onOpenFileHere}
+            refreshToken={treeToken}
+          />
+        ) : null}
+        {editorColumn}
+      </div>
     </aside>
   );
 }

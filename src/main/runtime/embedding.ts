@@ -212,6 +212,44 @@ export function cosineSimilarity(a: readonly number[], b: readonly number[]): nu
 }
 
 /**
+ * Turn-path recall must not wait on a slow embedding provider: once the shared
+ * budget is spent every embed rejects, and the callers fall back to keyword
+ * ranking. The inner request keeps running but its result is simply unused.
+ */
+export function boundedEmbedder(inner: Embedder, budgetMs: number): Embedder {
+  const deadline = Date.now() + budgetMs;
+  const spent = (): Error => new Error('embedding budget exhausted');
+  return {
+    get id() {
+      return inner.id;
+    },
+    get label() {
+      return inner.label;
+    },
+    get local() {
+      return inner.local;
+    },
+    embed(texts) {
+      const left = deadline - Date.now();
+      if (left <= 0) return Promise.reject(spent());
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(spent()), left);
+        inner.embed(texts).then(
+          (vectors) => {
+            clearTimeout(timer);
+            resolve(vectors);
+          },
+          (error) => {
+            clearTimeout(timer);
+            reject(error);
+          },
+        );
+      });
+    },
+  };
+}
+
+/**
  * Resolves the active embedding configuration on every call, so changing the
  * model in Settings takes effect without recreating the memory service.
  */

@@ -43,6 +43,14 @@ export interface ToolExecContext {
   remember: (entry: MemoryWriteArgs) => Promise<{ kind: string; note: string }>;
   /** Long-term recall: the model asks for memory, memory does not volunteer. */
   recall: (input: RecallArgs) => Promise<RecallResult>;
+  /** Read blob content through a handle, budgeted per turn. */
+  readHandle: (handle: string, offset?: number, limit?: number) => Promise<ToolOutcome>;
+  /** Expand a completed turn: cached L2 summary, or raw events within budget. */
+  expandTurn: (turn: number, mode: 'summary' | 'raw') => Promise<ToolOutcome>;
+  /** Keyword search over this session's ledger and its L2 summaries. */
+  searchSession: (query: string, limit: number) => Promise<ToolOutcome>;
+  /** Full blob text for a handle; used by write_file_from_handle. */
+  blobText: (handle: string) => Promise<string | null>;
   setPlan: (steps: PlanStep[]) => Promise<void>;
   markTouched: (files: string[]) => void;
   evidence: (tag: string) => void;
@@ -293,6 +301,191 @@ export const tools: ToolDefinition[] = [
         summary: `${hits.length} hit${hits.length === 1 ? '' : 's'} in ${filesTouched.length} file${filesTouched.length === 1 ? '' : 's'}`,
         output: hits.join('\n') || '(no matches)',
         files: filesTouched,
+      };
+    },
+  },
+  {
+    name: 'read_handle',
+    risk: 'read',
+    mutating: false,
+    summary: 'Read a blob through its handle, in budgeted slices.',
+    useWhen:
+      'A tool result in the context was elided to `handle=h_…`, or turn_expand returned a handle, and you now need the original text.',
+    avoidWhen:
+      'The file still exists — read_file gives you the current truth; the blob is what it was at that step. Do not re-fetch the same handle over and over.',
+    examples: ['read_handle { handle: "h_7f3a9c" }', 'read_handle { handle: "h_7f3a9c", offset: 4000, limit: 2000 }'],
+    schema: {
+      type: 'object',
+      properties: {
+        handle: { type: 'string', minLength: 3, pattern: '^h_[A-Za-z0-9_]+$', description: 'Handle from an elided result, e.g. h_7f3a9c' },
+        offset: { type: 'integer', minimum: 0, description: 'Character offset into the original text, default 0' },
+        limit: { type: 'integer', minimum: 200, maximum: 4000, description: 'Token budget for this slice, default 4000' },
+      },
+      required: ['handle'],
+      additionalProperties: false,
+    },
+    async run(ctx, args) {
+      return ctx.readHandle(
+        String(args.handle ?? '').trim(),
+        typeof args.offset === 'number' ? args.offset : undefined,
+        typeof args.limit === 'number' ? args.limit : undefined,
+      );
+    },
+  },
+  {
+    name: 'turn_expand',
+    risk: 'read',
+    mutating: false,
+    summary: 'Expand a completed turn: its L2 summary, or its raw events within budget.',
+    useWhen:
+      'A history turn is shown as a compressed summary or a pointer, and you need the decisions, failures or file names behind it.',
+    avoidWhen: 'The detail is in a file you can read; re-reading the file is the ground truth, an old turn is not.',
+    examples: ['turn_expand { turn: 3 }', 'turn_expand { turn: 3, mode: "raw" }'],
+    schema: {
+      type: 'object',
+      properties: {
+        turn: { type: 'integer', minimum: 1, description: 'Turn number from the history badge' },
+        mode: {
+          type: 'string',
+          enum: ['summary', 'raw'],
+          description: 'summary (default) returns the structured L2 digest; raw returns the events when they fit the budget',
+        },
+      },
+      required: ['turn'],
+      additionalProperties: false,
+    },
+    async run(ctx, args) {
+      const turn = Number(args.turn);
+      if (!Number.isInteger(turn) || turn < 1) return domainFailure('turn 必须是正整数', 'Pass the turn number shown in the history lines.');
+      return ctx.expandTurn(turn, args.mode === 'raw' ? 'raw' : 'summary');
+    },
+  },
+  {
+    name: 'session_search',
+    risk: 'read',
+    mutating: false,
+    summary: 'Search this session\'s ledger for a keyword and return turns plus snippets.',
+    useWhen:
+      'The user refers to something from an earlier turn ("昨天那个登录 bug", "我刚才说的那个配置"), or a detail slid out of the eight-turn window.',
+    avoidWhen: 'You can grep the workspace instead — this searches the conversation, not the code.',
+    examples: ['session_search { query: "refresh token" }'],
+    schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', minLength: 1, description: 'Keyword or phrase; Chinese and English both work' },
+        limit: { type: 'integer', minimum: 1, maximum: 10, description: 'Maximum hits, default 5' },
+      },
+      required: ['query'],
+      additionalProperties: false,
+    },
+    async run(ctx, args) {
+      const query = String(args.query ?? '').trim();
+      if (!query) return domainFailure('query 是空的', 'Pass the words you remember in `query`.');
+      return ctx.searchSession(query, typeof args.limit === 'number' ? args.limit : 5);
+    },
+  },
+  {
+    name: 'write_file_from_handle',
+    risk: 'write',
+    mutating: true,
+    summary: 'Write a file from blob content addressed by a handle.',
+    useWhen:
+      'You already produced the content once (a big tool result, a previous draft) and need it written to disk without retyping it.',
+    avoidWhen: 'You have the text at hand — write_file keeps the content visible in the transcript.',
+    schema: {
+      type: 'object',
+      properties: {
+        handle: { type: 'string', minLength: 3, description: 'Handle that points at the content' },
+        path: pathArg,
+      },
+      required: ['handle', 'path'],
+      additionalProperties: false,
+    },
+    async run(ctx, args) {
+      const handle = String(args.handle ?? '').trim();
+      const content = await ctx.blobText(handle);
+      if (content === null) {
+        return domainFailure(
+          `handle ${handle} 没有原文`,
+          'The blob expired or the handle is wrong. Use read_handle to check, or write the content directly.',
+        );
+      }
+      const target = resolveInside(ctx.workspace, String(args.path));
+      return commitText(ctx, 'write_file_from_handle', target, content, '从 handle 写入');
+    },
+  },
+  {
+    name: 'write_file_chunk',
+    risk: 'write',
+    mutating: true,
+    summary: 'Write a long file in chunks: append, or splice at a character offset.',
+    useWhen: 'The file is too long for one write_file call, or you are appending a large block to an existing file.',
+    avoidWhen: 'The change is a small edit inside an existing file — edit_file keeps the rest intact and is safer.',
+    examples: ['write_file_chunk { path: "src/a.ts", content: "…", mode: "append" }'],
+    schema: {
+      type: 'object',
+      properties: {
+        path: pathArg,
+        content: { type: 'string', description: 'The chunk itself' },
+        mode: {
+          type: 'string',
+          enum: ['append', 'splice'],
+          description: 'append (default) adds at the end and creates the file; splice replaces a range at `offset`',
+        },
+        offset: { type: 'integer', minimum: 0, description: 'Character offset for splice, default end of file' },
+        removeLength: { type: 'integer', minimum: 0, description: 'Characters to remove at offset for splice, default 0' },
+      },
+      required: ['path', 'content'],
+      additionalProperties: false,
+    },
+    async run(ctx, args) {
+      const target = resolveInside(ctx.workspace, String(args.path));
+      const chunk = String(args.content ?? '');
+      const prior = await readFile(target, 'utf8').catch(() => null);
+      const mode = args.mode === 'splice' ? 'splice' : 'append';
+      let next: string;
+      if (mode === 'append') {
+        next = (prior ?? '') + chunk;
+      } else {
+        if (prior === null) {
+          return readDomainFailure('文件不存在，无法按偏移写', 'Use mode: "append" to create the file, or write_file for a fresh file.');
+        }
+        const offset = Math.max(0, Math.min(prior.length, Number(args.offset ?? prior.length)));
+        const removeLength = Math.max(0, Number(args.removeLength ?? 0));
+        next = `${prior.slice(0, offset)}${chunk}${prior.slice(offset + removeLength)}`;
+      }
+      const relative = rel(ctx, target);
+      const change = prior === null ? null : countLineDiff(prior, next);
+      const verdict = classifyWrite({
+        path: relative,
+        kind: prior === null ? 'create' : 'edit',
+        addedLines: change?.additions ?? next.split(/\r?\n/).length,
+        deletedLines: change?.deletions ?? 0,
+        totalLinesBefore: prior ? prior.split(/\r?\n/).length : 0,
+      });
+      const decision = await ctx.approve({
+        name: 'write_file_chunk',
+        command: relative,
+        reason: `${verdict.reason} · ${mode === 'append' ? '追加' : '按偏移替换'} ${chunk.length} 字符`,
+        risk: 'write',
+        tier: verdict.tier,
+      });
+      if (decision === 'deny') {
+        return domainFailure('写入未获批准', `The user declined writing \`${relative}\`. Do not retry the same chunk.`);
+      }
+      const committed = await ctx.commitFile(target, next, prior === null ? 'absent' : textFingerprint(prior));
+      if (!committed.ok) {
+        return domainFailure(
+          committed.reason === 'busy' ? '工作区正忙，没有写入' : '文件在写入前被改过，没有写入',
+          `${committed.detail} Re-read the file and recompute the offset; do not replay the old chunk.`,
+        );
+      }
+      ctx.markTouched([relative]);
+      return {
+        ok: true,
+        summary: `${mode === 'append' ? 'appended to' : 'spliced'} ${relative} · ${chunk.length} chars`,
+        output: `${relative} written (${next.length} chars total)`,
+        files: [relative],
       };
     },
   },
@@ -581,7 +774,7 @@ export const tools: ToolDefinition[] = [
     useWhen:
       'Use when a task or project is finished (success or failure) to record what happened and what it taught; when the user corrects how to refer to a person/thing; or when a durable fact or constraint becomes clear and is worth keeping across sessions. Importance is your judgement, 1–100.',
     avoidWhen:
-      'Not for one-off instructions for this turn, not for what a workspace file already records, and not for every intermediate step — working memory already logs the steps. Do not write the same memory twice.',
+      'Not for one-off instructions for this turn, not for what a workspace file already records, and not for every intermediate step — this turn\'s tool trace already logs the steps. Do not write the same memory twice.',
     examples: [
       'kind: "episodic", when: "2026-11-23 下午", where: "E:/code/xiaohei", detail: "重构记忆管理，新增长期/短期/工作三层", result: "typecheck、测试、构建均通过", outcome: "success", importance: 72 — record a finished task.',
       'kind: "relational", alias: "阿姨", referent: "妈妈的同学", relation: "长辈", detail: "那天打招呼、戴眼镜的卷发女士就是她", episode_id: "mem_xxx", importance: 65 — pin a reference to the episode that introduced it.',
@@ -743,6 +936,44 @@ export const tools: ToolDefinition[] = [
 ];
 
 export const toolByName = new Map(tools.map((tool) => [tool.name, tool]));
+
+/** Shared confirmed-write path for tools whose content comes from a handle. */
+async function commitText(
+  ctx: ToolExecContext,
+  name: string,
+  target: string,
+  content: string,
+  reason: string,
+): Promise<ToolOutcome> {
+  const relative = rel(ctx, target);
+  const prior = await readFile(target, 'utf8').catch(() => null);
+  const change = prior === null ? null : countLineDiff(prior, content);
+  const verdict = classifyWrite({
+    path: relative,
+    kind: prior === null ? 'create' : 'overwrite',
+    addedLines: change?.additions ?? content.split(/\r?\n/).length,
+    deletedLines: change?.deletions ?? 0,
+    totalLinesBefore: prior ? prior.split(/\r?\n/).length : 0,
+  });
+  const decision = await ctx.approve({ name, command: relative, reason: `${verdict.reason} · ${reason}`, risk: 'write', tier: verdict.tier });
+  if (decision === 'deny') {
+    return domainFailure('写入未获批准', `The user declined writing \`${relative}\`. Do not retry the same write unchanged.`);
+  }
+  const committed = await ctx.commitFile(target, content, prior === null ? 'absent' : textFingerprint(prior));
+  if (!committed.ok) {
+    return domainFailure(
+      committed.reason === 'busy' ? '工作区正忙，没有写入' : '文件在写入前被改过，没有写入',
+      `${committed.detail} Re-read the file and decide again; do not overwrite with stale content.`,
+    );
+  }
+  ctx.markTouched([relative]);
+  return {
+    ok: true,
+    summary: `wrote ${relative} · ${content.split(/\r?\n/).length} lines · ${reason}`,
+    output: `${relative} written (${content.length} chars)`,
+    files: [relative],
+  };
+}
 
 /** OpenAI-compatible tool definitions. */
 export function toolSpecs(): Array<{ type: 'function'; function: { name: string; description: string; parameters: unknown } }> {

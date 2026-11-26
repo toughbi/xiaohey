@@ -9,7 +9,7 @@ const shared = {
   platform: 'node',
   format: 'cjs',
   target: 'node22',
-  external: ['electron'],
+  external: ['electron', 'node-pty'],
   logLevel: 'info',
   sourcemap: 'inline',
   define: { 'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV ?? 'development') },

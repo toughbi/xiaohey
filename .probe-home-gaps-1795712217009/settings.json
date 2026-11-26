@@ -1,0 +1,88 @@
+{
+  "models": [
+    {
+      "id": "m-mwmavuro-0",
+      "name": "deepseek-flash",
+      "baseUrl": "https://api.deepseek.com/v1",
+      "apiKey": "sk-edf3429f71474e12aa4354f01e3e7c22",
+      "model": "deepseek-flash",
+      "temperature": 0.4,
+      "maxOutputTokens": 393216,
+      "contextWindow": 1048576,
+      "reasoningEffort": "medium",
+      "provider": "deepseek",
+      "enabled": true,
+      "contextWindowSource": "user",
+      "maxOutputTokensSource": "metadata"
+    },
+    {
+      "id": "m-mwmavuro-1",
+      "name": "deepseek-flash",
+      "baseUrl": "https://api.deepseek.com/v1",
+      "apiKey": "sk-edf3429f71474e12aa4354f01e3e7c22",
+      "model": "deepseek-v4-pro",
+      "temperature": 0.4,
+      "maxOutputTokens": 393216,
+      "contextWindow": 1048576,
+      "reasoningEffort": "default",
+      "provider": "deepseek",
+      "enabled": true,
+      "contextWindowSource": "metadata",
+      "maxOutputTokensSource": "metadata"
+    },
+    {
+      "id": "m-mww2nkup-0",
+      "name": "deepseek-v4.1-flash-1017",
+      "baseUrl": "https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1",
+      "apiKey": "sk-sp-H.HEEHME.veXn.MEYCIQDE4lyeyHGhF95VpJeVXVCegNRGbRy-WZxRZBG0A_LO9AIhAN_tZt3TRj9mqIwHJcIWd2MJnSuYjI1J_xW6slJYNs3i",
+      "model": "deepseek-v4.1-flash-1017",
+      "temperature": 0.4,
+      "maxOutputTokens": 0,
+      "contextWindow": 0,
+      "reasoningEffort": "high",
+      "provider": "custom",
+      "enabled": true
+    },
+    {
+      "id": "m-mww2nkup-1",
+      "name": "deepseek-v4.1-flash-1017",
+      "baseUrl": "https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1",
+      "apiKey": "sk-sp-H.HEEHME.veXn.MEYCIQDE4lyeyHGhF95VpJeVXVCegNRGbRy-WZxRZBG0A_LO9AIhAN_tZt3TRj9mqIwHJcIWd2MJnSuYjI1J_xW6slJYNs3i",
+      "model": "glm-5.3",
+      "temperature": 0.4,
+      "maxOutputTokens": 0,
+      "contextWindow": 0,
+      "reasoningEffort": "default",
+      "provider": "custom",
+      "enabled": true
+    },
+    {
+      "id": "m-mww2nkup-2",
+      "name": "deepseek-v4.1-flash-1017",
+      "baseUrl": "https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1",
+      "apiKey": "sk-sp-H.HEEHME.veXn.MEYCIQDE4lyeyHGhF95VpJeVXVCegNRGbRy-WZxRZBG0A_LO9AIhAN_tZt3TRj9mqIwHJcIWd2MJnSuYjI1J_xW6slJYNs3i",
+      "model": "qwen4-max",
+      "temperature": 0.4,
+      "maxOutputTokens": 0,
+      "contextWindow": 0,
+      "reasoningEffort": "high",
+      "provider": "custom",
+      "enabled": true
+    }
+  ],
+  "activeModelId": "m-mww2nkup-2",
+  "approval": "full",
+  "allowedCommands": [],
+  "recentWorkspaces": [
+    "E:\\code\\qoqo",
+    "E:\\code\\hooo"
+  ],
+  "embedding": {
+    "enabled": true,
+    "baseUrl": "https://ws-1z7bh8ssxnk27sln.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+    "apiKey": "sk-ws-H.YHPPYDH.zHaQ.MEUCIQDHoyXK8_sjcbQyQiAyKo8XMtkKKIY0QlF6xdBI0VJ5bAIgWoZ8hWdk9l96bRLy_c3NDDwc-VvsdZrOXQGHx2bcEPY",
+    "model": "qwen3.7-text-embedding",
+    "rerankModel": "qwen3.7-text-rerank",
+    "rerankBaseUrl": ""
+  }
+}

@@ -6,15 +6,14 @@ import type {
   ApprovalItem,
   ApprovalRequest,
   CheckpointItem,
-  CompactionItem,
   ContextGauge,
+  ContextPart,
   Item,
   MessageItem,
   NoticeItem,
   PlanItem,
   PlanStep,
   QuestionItem,
-  QuestionOption,
   RuntimeEvent,
   RuntimeStatus,
   Thread,
@@ -29,24 +28,30 @@ import { buildContract, checkDrift, MILESTONE_EVERY } from './contract.js';
 import { LongTermMemory, memoryFacts } from './longterm.js';
 import { ConfiguredEmbedder, type EmbeddingConfig } from './embedding.js';
 import { ConfiguredReranker, type RerankConfig } from './rerank.js';
-import { ShortTermMemory, SHORT_TERM_SUMMARY_PROMPT, mechanicalRoundSummary, type RoundRecord } from './shortterm.js';
-import { WorkingMemory } from './working.js';
-import { memoryRoot } from './memdir.js';
-import { stamp } from './memmark.js';
-import { extractEvents, mergeResolution, parseRelativeTime, resolveEntities } from './resolve.js';
-import { audits } from '../audit.js';
+import { Assembler, L1_TRIGGER, TOOL_RESULT_TOKENS, type Assembly } from './assembler.js';
+import { renderDigest as renderTurnDigest } from './compressor.js';
+import { Compressor } from './compressor.js';
+import { previewOf } from './blobs.js';
 import {
-  auditClaims,
-  buildSystemPrompt,
-  contextBudget,
-  DEFAULT_CONTEXT_WINDOW,
-  gaugeOf,
-  shouldCompressHistory,
-  toMessages,
-  tokensOf,
-} from './context.js';
+  ConsolidationService,
+  beijingParts,
+  isConsolidationMinute,
+  localDayKey,
+  pastConsolidationTime,
+  CONSOLIDATION_TOKEN_THRESHOLD,
+  type ConsolidationReport,
+} from './consolidate.js';
+import { SessionSearch } from './sessionsearch.js';
+import { detectPreference, nudgeText } from './preferences.js';
+import { SessionLog, sessionPaths } from './sessionlog.js';
+import { BlobStore } from './blobs.js';
+import type { ArgsRef, BlobRef, InlineRef } from './events.js';
+import { memoryRoot } from './memdir.js';
+import { oneLine } from './memmark.js';
+import { extractEvents, mergeResolution, parseRelativeTime, resolveEntities } from './resolve.js';
+import { auditClaims, buildSystemPrompt, contextBudget, DEFAULT_CONTEXT_WINDOW, gaugeOf, promptParts, tokensOf, type ContextBudget } from './context.js';
 import { complete, LlmError, type ChatMessage, type ToolCall } from './llm.js';
-import { classifyCommand, autoDecision, writeDecision } from './policy.js';
+import { autoDecision, writeDecision } from './policy.js';
 import { guardedCommit, normalizeWorkspace, workspaceKey } from './commit.js';
 import {
   commitWorktree,
@@ -57,9 +62,9 @@ import {
   type WorktreeState,
 } from './worktree.js';
 import { toolByName, toolSpecs, tools, type ToolExecContext, type ToolDefinition } from './tools.js';
-import { noteAttempt, parseArguments, readDomainFailure, schemaRetriesLeft, validateArgs, type RetryLedger, type ToolFailure } from './toolerrors.js';
+import { domainFailure, noteAttempt, parseArguments, readDomainFailure, schemaRetriesLeft, validateArgs, type RetryLedger, type ToolFailure, type ToolOutcome } from './toolerrors.js';
 import { fileFingerprint } from '../fingerprint.js';
-import { clamp, estimateTokens, formatDuration, resolveInside, truncate, uid } from '../util.js';
+import { clamp, estimateTokens, formatDuration, resolveInside, stableStringify, truncate, uid } from '../util.js';
 
 export interface AgentDeps {
   store: Store;
@@ -94,6 +99,17 @@ interface PreparedCall {
  */
 const PARALLEL_READ_TOOLS = new Set(['read_file', 'list_dir', 'glob_files', 'grep_text']);
 const MAX_PARALLEL_READS = 8;
+/** A new turn waits this long for the previous one to finish committing/merging. */
+const SETTLE_WAIT_MS = 30_000;
+/**
+ * Contract scope is the session (ADR-14): it survives turns and is only rebuilt
+ * when the user explicitly starts another task. Auto-rebuilding every turn
+ * would silently change the goal the model is working against.
+ */
+const RESTART_PATTERN = /(?:^|[\s。；;，,：:])(?:新任务|重新开始|从头开始|换个任务|换个话题|start over|new task)/i;
+/** Tools whose whole purpose is to return text back into the context. */
+const FETCH_TOOLS = new Set(['read_handle', 'turn_expand', 'session_search']);
+
 export { PARALLEL_READ_TOOLS, MAX_PARALLEL_READS };
 
 /**
@@ -117,9 +133,11 @@ export class AgentService {
   private readonly runningCwd = new Map<string, string>();
   /** threadId → normalized *effective* tree (worktree path when isolated), for merge/revert addressing. */
   private readonly trees = new Map<string, string>();
-  private readonly sessions = new Map<string, ShortTermMemory>();
+  private readonly compressors = new Map<string, Compressor>();
+  private readonly assemblers = new Map<string, Assembler>();
   readonly memory: LongTermMemory;
-  readonly working: WorkingMemory;
+  /** Pending marks, the 50M gate, the 01:19 pass and idempotency. */
+  readonly consolidation: ConsolidationService;
 
   constructor(private readonly deps: AgentDeps) {
     this.locks = new LockTable(join(deps.home, 'leases.json'));
@@ -129,7 +147,40 @@ export class AgentService {
       embedder: new ConfiguredEmbedder(() => this.embeddingConfig()),
       reranker: new ConfiguredReranker(() => this.rerankConfig()),
     });
-    this.working = new WorkingMemory(root);
+    this.consolidation = new ConsolidationService({
+      root: deps.home,
+      usage: deps.store.usage,
+      model: () => this.deps.store.activeModel(),
+      sessionsFor: async (workspace) => {
+        const sessions = [];
+        for (const entry of this.deps.store.sessions.list()) {
+          if (normalizeWorkspace(entry.workspace) !== workspace) continue;
+          const log = await SessionLog.open(this.deps.home, entry.sid, { write: false });
+          if (!log) continue;
+          const lastTurn = [...log.turnEntries()].reverse().find((turn) => turn.status !== 'running');
+          sessions.push({
+            sid: entry.sid,
+            workspace: entry.workspace,
+            lastTurnDayKey: lastTurn ? localDayKey(lastTurn.endedAt ?? lastTurn.startedAt) : '',
+            lastSeq: log.lastSeq,
+          });
+        }
+        return sessions;
+      },
+      openLog: (sid) => SessionLog.open(this.deps.home, sid),
+      writeMemory: (input) => this.memory.write(input),
+      recordUsage: async (workspace, input, output) => {
+        await this.deps.store.usage.append({
+          dayKey: localDayKey(),
+          workspace,
+          sid: '',
+          turn: 0,
+          kind: 'consolidate',
+          input,
+          output,
+        });
+      },
+    });
   }
 
   /** The embedding provider is the configured one, or the active chat model's endpoint. */
@@ -169,24 +220,6 @@ export class AgentService {
     } catch {
       // Memory tool calls will surface the real error if the user asks for them.
     }
-    try {
-      await this.working.load();
-    } catch {
-      // Working memory is a recovery aid; the turn loop still works without it.
-    }
-
-    const interrupted = await this.working.settleInterrupted().catch(() => []);
-    for (const threadId of interrupted) {
-      const doc = await this.deps.store.load(threadId).catch(() => null);
-      if (!doc) continue;
-      const task = this.working.get(threadId);
-      this.emitNotice(threadId, {
-        tone: 'warn',
-        title: '上一次任务中断，工作记忆已保留',
-        body: `进度写在 ${this.working.file}，最近一步：${task?.steps.at(-1)?.tool ?? '无'}。下一步：${task?.next || '先读工作记忆再继续'}。`,
-      });
-      await this.deps.store.saveNow(threadId);
-    }
 
     await this.locks.load();
     if (this.locks.droppedOnLoad > 0) {
@@ -198,102 +231,70 @@ export class AgentService {
     }
     await this.recoverInterrupted();
     await this.recoverWorktrees();
+    // Retention is background work: a 90-day-old blob is cold by definition.
+    void this.gcBlobs().catch(() => undefined);
+    this.startConsolidationScheduler();
+    this.catchUpConsolidation();
   }
 
+
   /**
-   * The old store kept facts inside each thread's JSON. Move every live record
-   * into `memory.md` once, so a user who upgrades does not lose their facts and
-   * the new UI has something to show.
+   * The old per-thread `state.memory` array was already imported into
+   * `memory.md` by the previous release; the entry point stays so the boot path
+   * and the demo can still call it.
    */
   async migrateLegacyMemory(): Promise<void> {
-    for (const thread of await this.deps.store.listThreads()) {
-      const doc = await this.deps.store.load(thread.id);
-      if (doc) await this.migrateDocMemory(doc);
+    await this.memory.saveIfDirty();
+  }
+
+  /** Drop blobs untouched for 90 days; their handles then read as expired. */
+  private async gcBlobs(maxAgeDays = 90): Promise<void> {
+    for (const entry of this.deps.store.sessions.list()) {
+      const paths = sessionPaths(this.deps.home, entry.sid);
+      await new BlobStore(paths.blobs, 0).gc(maxAgeDays).catch(() => undefined);
     }
-    await this.memory.saveIfDirty();
   }
 
-  private async migrateDocMemory(doc: ThreadDoc): Promise<void> {
-    if (doc.state.memory.length === 0) return;
-    for (const record of doc.state.memory) this.memory.importLegacy(record, doc.thread.id, doc.thread.cwd);
-    doc.state.memory = [];
-    await this.memory.saveIfDirty();
-    void this.memory.ensureVectors().catch(() => undefined);
-    await this.deps.store.saveNow(doc.thread.id);
-  }
-
-  /** A deleted session takes its short-term file and progress section with it. */
+  /** Deleting a session keeps what was distilled from it, marked as orphaned. */
   async purgeSessionMemory(threadId: string): Promise<void> {
-    const stm = this.sessions.get(threadId) ?? new ShortTermMemory(this.memory.root, threadId);
-    this.sessions.delete(threadId);
-    try {
-      await stm.deleteFile();
-    } catch {
-      // Deleting a session must not fail because a memory file is unreadable.
-    }
-    try {
-      await this.working.remove(threadId);
-    } catch {
-      // Same for the progress file.
-    }
+    await this.memory.markSourceDeleted(threadId).catch(() => 0);
   }
 
   /**
-   * The short-term file is the model's conversation window. It is seeded from
-   * the transcript the first time a session is opened after this upgrade, and
-   * rebuilt after a checkpoint revert.
-   */
-  private async shortTermFor(doc: ThreadDoc): Promise<ShortTermMemory> {
-    const cached = this.sessions.get(doc.thread.id);
-    if (cached) return cached;
-    const stm = new ShortTermMemory(this.memory.root, doc.thread.id, {
-      title: doc.thread.title,
-      workspace: doc.thread.cwd,
-    });
-    await stm.load({ title: doc.thread.title, workspace: doc.thread.cwd, turnCount: doc.thread.turnCount }).catch(() => undefined);
-    if (!stm.hasContent() && doc.items.length > 0) {
-      if (stm.seedFromItems(doc.thread, doc.items, doc.state.context.summary)) {
-        await stm.save().catch(() => undefined);
-      }
-    }
-    this.sessions.set(doc.thread.id, stm);
-    return stm;
-  }
-
-  /** A turn that was still running when the app quit stays `running` on disk. On
-   * the next launch the composer then offers a stop button that nothing can
-   * answer — there is no controller in this process — so the session looks
-   * permanently busy. Settle every orphaned turn at boot instead.
+   * Boot recovery: settle every ledger the previous process left mid-turn. The
+   * repair is written into the ledger — an unfinished turn gets `interrupted`,
+   * an unpaired tool call gets an explicit result with `applied=unknown` — so a
+   * later reader sees the same story the runtime saw.
    */
   private async recoverInterrupted(): Promise<void> {
-    for (const thread of await this.deps.store.listThreads()) {
-      if (this.running.has(thread.id)) continue;
-      const doc = await this.deps.store.load(thread.id);
-      if (!doc) continue;
-      const orphaned = doc.turn?.status === 'running' || doc.thread.status === 'running';
-      if (!orphaned) continue;
-      this.markInterrupted(
-        doc,
-        'interrupted by app shutdown',
-        '上一轮已中断',
-        '应用在这一轮结束前被关闭，未完成的步骤已标记为中断，会话恢复为空闲。',
-      );
-      await this.deps.store.saveNow(thread.id);
+    await this.deps.store.recoverInterrupted();
+    for (const doc of this.deps.store.docs.values()) {
+      if (doc.thread.status !== 'running' && doc.thread.status !== 'waiting_approval' && doc.turn?.status !== 'running') continue;
+      doc.thread.status = 'idle';
+      if (doc.turn && doc.turn.status === 'running') {
+        doc.turn.status = 'cancelled';
+        doc.turn.endedAt = Date.now();
+        doc.turn.stopReason = 'interrupted by app shutdown';
+      }
+      for (const item of doc.items) {
+        if (item.status === 'running') item.status = 'cancelled';
+      }
+      this.emitThread(doc.thread);
     }
   }
 
   /**
    * Return a session to idle when the turn that owned it lost its executor. Used
-   * both by boot recovery and by a stop click on a session this process is not
+   * both by recovery and by a stop click on a session this process is not
    * actually running.
    */
-  private markInterrupted(
+  private async markInterrupted(
     doc: ThreadDoc,
     stopReason: string,
     title: string,
     body: string,
     tone: 'warn' | 'stopped' = 'warn',
-  ): void {
+  ): Promise<void> {
     const threadId = doc.thread.id;
     for (const [id, pending] of this.questions) {
       if (pending.threadId === threadId) {
@@ -311,9 +312,9 @@ export class AgentService {
       item.status = 'cancelled';
       this.emitItem(item);
     }
-    this.deps.store.closeOpenToolCalls(doc);
+    await this.deps.store.settleLog(doc.log).catch(() => undefined);
     doc.thread.status = 'idle';
-    this.emitNotice(threadId, { tone, title, body });
+    await this.recordNotice(doc, { tone, title, body });
     if (doc.turn) this.deps.emit({ type: 'turn/updated', turn: doc.turn });
     this.emitThread(doc.thread);
     this.deps.emit({
@@ -333,7 +334,7 @@ export class AgentService {
     const doc = this.deps.store.docs.get(threadId) ?? (await this.deps.store.load(threadId));
     if (!doc) return false;
     if (doc.turn?.status !== 'running' && doc.thread.status !== 'running') return false;
-    this.markInterrupted(
+    await this.markInterrupted(
       doc,
       'stopped by the user',
       '本轮已停止',
@@ -380,6 +381,132 @@ export class AgentService {
     };
     doc.items.push(item);
     this.emitItem(item);
+  }
+
+  /**
+   * A durable notice: written to the ledger first, so a reload redraws it. The
+   * transient `emitNotice` above is for UI state that means nothing tomorrow.
+   */
+  private async recordNotice(
+    doc: ThreadDoc,
+    notice: { tone: NoticeItem['tone']; title: string; body: string },
+  ): Promise<NoticeItem> {
+    const item: NoticeItem = {
+      id: uid('itm'),
+      threadId: doc.thread.id,
+      turnId: doc.turn?.id ?? 'system',
+      kind: 'notice',
+      at: Date.now(),
+      status: 'done',
+      tone: notice.tone,
+      title: notice.title,
+      body: notice.body,
+    };
+    await doc.log
+      .append({
+        type: 'notice',
+        tone: notice.tone,
+        title: notice.title,
+        body: notice.body,
+        itemId: item.id,
+        turn: doc.log.activeTurn,
+        step: doc.turn?.step ?? 0,
+      })
+      .catch(() => undefined);
+    doc.items.push(item);
+    this.emitItem(item);
+    return item;
+  }
+
+  private compressorFor(doc: ThreadDoc): Compressor {
+    const cached = this.compressors.get(doc.thread.id);
+    if (cached) return cached;
+    const compressor = new Compressor(doc.log, () => this.deps.store.activeModel(), (input, output) => {
+      void this.deps.store.usage.append({
+        dayKey: localDayKey(),
+        workspace: doc.thread.cwd,
+        sid: doc.thread.id,
+        turn: doc.log.activeTurn,
+        kind: 'context_compress',
+        input,
+        output,
+      });
+    });
+    this.compressors.set(doc.thread.id, compressor);
+    return compressor;
+  }
+
+  private assemblerFor(doc: ThreadDoc): Assembler {
+    const cached = this.assemblers.get(doc.thread.id);
+    if (cached) return cached;
+    const assembler = new Assembler({ log: doc.log, compressor: this.compressorFor(doc) });
+    this.assemblers.set(doc.thread.id, assembler);
+    return assembler;
+  }
+
+  /**
+   * Content reference: inline while small, blob + handle once it would crowd
+   * the ledger. The handle always points at the untruncated original.
+   */
+  private async refContent(
+    doc: ThreadDoc,
+    input: { kind: 'tool_result' | 'tool_args' | 'attachment' | 'assistant_text' | 'reasoning' | 'turn_final'; text: string; limit: number; step: number; tool?: string; callId?: string },
+  ): Promise<InlineRef | BlobRef> {
+    const tokens = estimateTokens(input.text);
+    if (tokens <= input.limit) return { text: input.text, tokens };
+    const put = await doc.log.blobs.put(input.text);
+    const handle = await doc.log.handles.create({
+      text: input.text,
+      kind: input.kind,
+      turn: doc.log.activeTurn,
+      step: input.step,
+      ...(input.tool ? { tool: input.tool } : {}),
+      ...(input.callId ? { callId: input.callId } : {}),
+      blob: put.blob,
+      bytes: put.bytes,
+      tokens: put.tokens,
+    });
+    return {
+      blob: put.blob,
+      bytes: put.bytes,
+      tokens: put.tokens,
+      handle: handle.handle,
+      preview: previewOf(input.text),
+    };
+  }
+
+  /** Tool arguments keep a digest and preview even when the blob holds the rest. */
+  private async argsRef(doc: ThreadDoc, name: string, callId: string, step: number, raw: string): Promise<InlineRef | ArgsRef> {
+    const tokens = estimateTokens(raw);
+    if (tokens <= 4000) return { text: raw, tokens };
+    const put = await doc.log.blobs.put(raw);
+    const handle = await doc.log.handles.create({
+      text: raw,
+      kind: 'tool_args',
+      turn: doc.log.activeTurn,
+      step,
+      tool: name,
+      callId,
+      blob: put.blob,
+      bytes: put.bytes,
+      tokens: put.tokens,
+    });
+    return {
+      digest: put.sha256,
+      blob: put.blob,
+      handle: handle.handle,
+      bytes: put.bytes,
+      tokens: put.tokens,
+      preview: previewOf(raw),
+    };
+  }
+
+  /** Block until a finishing turn releases the session, bounded by a deadline. */
+  private async waitSettled(threadId: string, timeoutMs: number): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.running.has(threadId) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
   }
 
   isRunning(threadId: string): boolean {
@@ -458,12 +585,17 @@ export class AgentService {
     return true;
   }
 
-  async startTurn(threadId: string, prompt: string, attachments: string[] = []): Promise<Turn> {
+async startTurn(threadId: string, prompt: string, attachments: string[] = []): Promise<Turn> {
     const doc = await this.deps.store.load(threadId);
     if (!doc) throw new Error(`unknown thread ${threadId}`);
-    if (this.running.has(threadId)) throw new Error('a turn is already running in this session');
+    if (this.running.has(threadId)) {
+      // The finished turn announces itself before its worktree merge is done, so
+      // the renderer fires a queued message while the session is still settling.
+      // Wait for it instead of refusing a message the user already sent.
+      await this.waitSettled(threadId, SETTLE_WAIT_MS);
+      if (this.running.has(threadId)) throw new Error('上一轮还在收尾，稍后再发送一次');
+    }
     if (!doc.thread.cwd) throw new Error('请选择工作区后再发送');
-    await this.migrateDocMemory(doc).catch(() => undefined);
 
     const turn: Turn = {
       id: uid('trn'),
@@ -479,7 +611,7 @@ export class AgentService {
     doc.thread.status = 'running';
     doc.thread.lastPrompt = prompt;
     doc.thread.title = doc.thread.turnCount === 1 ? prompt.slice(0, 48) || 'New session' : doc.thread.title;
-    this.deps.store.save(threadId);
+    doc.log.activeTurn = turn.index;
     this.emitThread(doc.thread);
     this.deps.emit({ type: 'turn/updated', turn });
 
@@ -510,6 +642,7 @@ export class AgentService {
 
   private async runTurn(doc: ThreadDoc, turn: Turn, prompt: string, attachments: string[] = []): Promise<void> {
     const threadId = doc.thread.id;
+    const log = doc.log;
     this.running.add(threadId);
     this.runningCwd.set(threadId, normalizeWorkspace(doc.thread.cwd));
     const controller = new AbortController();
@@ -530,8 +663,8 @@ export class AgentService {
       }
 
       // 0.5 Isolation: when another session already runs in this workspace, this
-      // turn works in its own git worktree. Tools and checkpoints
-      // follow the effective tree, so the existing safety layers apply unchanged.
+      // turn works in its own git worktree. Tools and checkpoints follow the
+      // effective tree, so the existing safety layers apply unchanged.
       const effectiveWorkspace = await this.setupIsolation(doc, turn);
       this.trees.set(threadId, effectiveWorkspace);
       const worktree = doc.state.worktree;
@@ -547,91 +680,107 @@ export class AgentService {
         this.deps.emit({ type: 'memory/updated', threadId, facts: memoryFacts(this.memory.all()) });
       }
       if (maintenance && maintenance.archived > 0) {
-        push<NoticeItem>({
-          id: uid('itm'),
-          threadId,
-          turnId: turn.id,
-          kind: 'notice',
-          at: Date.now(),
-          status: 'done',
+        await this.recordNotice(doc, {
           tone: 'info',
           title: `长期记忆已归档 ${maintenance.archived} 条`,
           body: '这些记忆长时间没有被召回，按遗忘曲线衰减后移入 memory-archive.md；再次被明确召回时会自动唤醒。',
         });
       }
 
-      // 1. Contract: freeze goal, acceptance, non-goals and forbidden actions.
-      if (!doc.state.contract) {
-        doc.state.contract = buildContract(prompt);
-        const item = push<NoticeItem>({
-          id: uid('itm'),
-          threadId,
-          turnId: turn.id,
-          kind: 'notice',
-          at: Date.now(),
-          status: 'done',
-          tone: 'info',
-          title: '任务契约已写入',
-          body: `目标：${doc.state.contract.goal}\n验收：${doc.state.contract.acceptance.join(' · ')}`,
-        });
-        this.emitItem(item);
-      }
-
-      // 2. Resolution: entities, relative times, event anchors.
-      const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Shanghai';
-      const time = parseRelativeTime(prompt, new Date(), timezone);
-      const events = extractEvents(prompt, new Date(), timezone, 'user_message');
-      const entities = resolveEntities(prompt, this.memory.all());
-      doc.state.resolution = mergeResolution(doc.state.resolution, {
-        times: time ? [time] : [],
-        events,
-        entities: entities.matched,
-      });
-      if (time && time.confidence === 'low') {
-        push<NoticeItem>({
-          id: uid('itm'),
-          threadId,
-          turnId: turn.id,
-          kind: 'notice',
-          at: Date.now(),
-          status: 'done',
-          tone: 'warn',
-          title: '相对时间按推测归一化了',
-          body: `“${time.phrase}”没有给具体钟点，按 ${time.fromIso} … ${time.toIso} 处理。若是别的时间窗，直接说。`,
-        });
-      }
-
-      // Short-term memory is the model-visible conversation window; working
-      // memory is the live task notebook injected into the system prompt.
-      const shortTerm = await this.shortTermFor(doc);
-      await this.working
-        .startTask({
-          threadId,
-          title: doc.thread.title,
-          cwd: effectiveWorkspace,
-          goal: doc.state.contract?.goal ?? prompt,
-        })
-        .catch(() => undefined);
-
+      // 1. Open the turn in the ledger first: the user's words are the anchor
+      // every later event and every replay hangs off.
       const references = await this.readReferences(doc.thread.cwd, attachments);
+      const attachmentRefs: BlobRef[] = [];
+      for (const reference of references) {
+        const ref = await this.refContent(doc, {
+          kind: 'attachment',
+          text: reference.content,
+          limit: 4000,
+          step: 0,
+        });
+        if ('blob' in ref) attachmentRefs.push({ ...ref, preview: reference.path });
+      }
+      const userItemId = uid('itm');
+      const started = await log.append({
+        type: 'turn_started',
+        turnId: turn.id,
+        userText: prompt,
+        ...(attachmentRefs.length > 0 ? { attachments: attachmentRefs } : {}),
+        turn: turn.index,
+        step: 0,
+        itemId: userItemId,
+      });
       const userItem: MessageItem = {
-        id: uid('itm'),
+        id: userItemId,
         threadId,
         turnId: turn.id,
         kind: 'message',
-        at: Date.now(),
+        at: started.ts,
         status: 'done',
         role: 'user',
         text: prompt,
         ...(references.length > 0 ? { references } : {}),
       };
       push(userItem);
+      await this.deps.store.saveNow(threadId);
+
+      // 2. Contract: freeze goal, acceptance, non-goals and forbidden actions.
+      // Session-scoped: an explicit "new task" (or a UI rebuild) starts a new one.
+      const restart = Boolean(doc.state.contract) && RESTART_PATTERN.test(prompt);
+      if (!doc.state.contract || restart) {
+        const contract = buildContract(prompt);
+        doc.state.contract = contract;
+        await log.append({
+          type: 'contract_set',
+          contract,
+          source: restart ? 'reset' : 'first-turn',
+          ...(restart ? { reason: '用户明确开始了新任务' } : {}),
+          turn: turn.index,
+        });
+        await this.recordNotice(doc, {
+          tone: 'info',
+          title: restart ? '任务契约已按新任务重建' : '任务契约已写入',
+          body: `目标：${contract.goal}\n验收：${contract.acceptance.join(' · ')}`,
+        });
+      }
+
+      // 3. Resolution: entities, relative times, event anchors — derived state,
+      // written only when it actually changed.
+      const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Shanghai';
+      const time = parseRelativeTime(prompt, new Date(), timezone);
+      const anchors = extractEvents(prompt, new Date(), timezone, 'user_message');
+      const entities = resolveEntities(prompt, this.memory.all());
+      const merged = mergeResolution(doc.state.resolution, {
+        times: time ? [time] : [],
+        events: anchors,
+        entities: entities.matched,
+      });
+      const hash = stableStringify(merged);
+      if (hash !== doc.state.resolutionHash) {
+        doc.state.resolution = merged;
+        doc.state.resolutionHash = hash;
+        await log.append({ type: 'resolution_updated', state: merged, hash, source: 'turn', turn: turn.index });
+      }
+      if (time && time.confidence === 'low') {
+        await this.recordNotice(doc, {
+          tone: 'warn',
+          title: '相对时间按推测归一化了',
+          body: `“${time.phrase}”没有给具体钟点，按 ${time.fromIso} … ${time.toIso} 处理。若是别的时间窗，直接说。`,
+        });
+      }
+
+      // Preference nudge: one line, once, only when the user stated something
+      // durable. The model decides whether to write it; tool content never does.
+      const preference = detectPreference(prompt);
 
       let assistant: MessageItem | null = null;
       let step = 0;
       let stopReason = 'model finished';
       let lastFinishReason = '';
-      let trimmedNotice = false;
+      let pressureNoticed = false;
+      let lastCheckpointStep = 0;
+      let wroteSinceCheckpoint = false;
+      let lastGauge: Assembly | undefined;
 
       while (true) {
         step += 1;
@@ -642,63 +791,43 @@ export class AgentService {
           break;
         }
 
-        // 3. Context assembly: short-term memory (summary + last rounds) plus
-        // this turn's live trace. Long-term memory stays behind memory_read.
-        // The history budget is derived from the model window, its output cap,
-        // the system/tool template and a safety margin — not a fixed ratio.
+        // 4. Context assembly: fixed prefix + at most eight completed turns at
+        // their sticky level + this turn's live trace. Large observations are
+        // elided to handles as the observation budget fills.
         const thinking = doc.state.context.thinking === true;
         const toolList = tools
           .map((tool) => `- ${tool.name} (${tool.risk}) — ${tool.summary} Use when: ${tool.useWhen} Do NOT use: ${tool.avoidWhen}`)
           .join('\n');
-        const verification = await this.verification(doc);
-        const planText = doc.state.plan.map((entry) => `- [${entry.status}] ${entry.title}`).join('\n');
-        const provisional = buildSystemPrompt({
+        const verification = doc.view.verification();
+        const assembly = await this.assemblerFor(doc).assemble({
+          log,
+          compressor: this.compressorFor(doc),
+          model,
           workspace: effectiveWorkspace,
           contract: doc.state.contract,
-          plan: planText,
-          working: this.working.render(threadId),
-          memoryIndex: this.memory.indexNote(),
+          plan: doc.state.plan,
           resolution: doc.state.resolution,
+          memoryIndex: this.memory.indexNote(),
           verification,
           toolList,
-          step,
-          budget: 0,
-          compacted: doc.state.context.compacted > 0,
-          isolationNote,
-        });
-        const budget = contextBudget({
-          contextWindow: model.contextWindow,
-          maxOutputTokens: model.maxOutputTokens,
-          promptTokens: estimateTokens(provisional) + 256,
           toolTokens: estimateTokens(JSON.stringify(toolSpecs())),
+          step,
+          thinking,
+          ...(isolationNote ? { isolationNote } : {}),
+          ...(step === 1 && preference ? { nudge: nudgeText(preference) } : {}),
         });
-
-        let history = shortTerm.messages(thinking);
-        let messages = [...history, ...this.currentTurnMessages(doc)];
-        if (shouldCompressHistory(tokensOf(messages), budget.historyLimit) || shortTerm.shouldCompressByCount(doc.thread.turnCount)) {
-          this.deps.emit({ type: 'runtime/updated', runtime: this.status(threadId, 'compacting', 'compressing older rounds'), context: this.gauge(doc) });
-          const folded = await this.compressShortTerm(doc, turn, shortTerm);
-          if (folded) {
-            history = shortTerm.messages(thinking);
-            messages = [...history, ...this.currentTurnMessages(doc)];
-          }
-          if (tokensOf(messages) > budget.historyLimit) {
-            // A single turn can outgrow the window by itself. Keep every message
-            // and the newest tool pairs; older pairs survive in working memory.
-            const keep = Math.max(1024, budget.historyLimit - tokensOf(history));
-            messages = [...history, ...this.currentTurnMessages(doc, keep)];
-            if (!trimmedNotice) {
-              trimmedNotice = true;
-              this.emitNotice(threadId, {
-                tone: 'warn',
-                title: '本轮上下文超出预算，旧工具步骤已收起',
-                body: '较早的工具调用与结果不再进入模型上下文，但每一步都还在工作记忆（progress.md）里，可以按需重读文件。',
-              });
-            }
-          }
+        lastGauge = assembly;
+        let messages = assembly.messages;
+        if (!pressureNoticed && assembly.pressure > L1_TRIGGER) {
+          pressureNoticed = true;
+          await this.recordNotice(doc, {
+            tone: 'warn',
+            title: '上下文接近预算，较早的观察已收起为句柄',
+            body: '较早的工具结果不再逐字进入模型上下文，但每一步都还在 events.jsonl 里，可以用 read_handle 或 turn_expand 取回。',
+          });
         }
 
-        // 4. Milestone re-read of the verbatim requirement.
+        // 5. Milestone re-read of the verbatim requirement.
         const atMilestone = step > 1 && step % MILESTONE_EVERY === 0;
         if (atMilestone && doc.state.contract) {
           messages = [
@@ -710,29 +839,15 @@ export class AgentService {
           ];
         }
 
-        const modelMessages: ChatMessage[] = [
-          {
-            role: 'system',
-            content: buildSystemPrompt({
-              workspace: effectiveWorkspace,
-              contract: doc.state.contract,
-              plan: planText,
-              working: this.working.render(threadId),
-              memoryIndex: this.memory.indexNote(),
-              resolution: doc.state.resolution,
-              verification,
-              toolList,
-              step,
-              budget: budget.historyLimit,
-              compacted: doc.state.context.compacted > 0,
-              isolationNote,
-            }),
-          },
-          ...messages,
-        ];
+        const modelMessages: ChatMessage[] = [{ role: 'system', content: assembly.system }, ...messages];
 
-        // 5. Model call, streamed into one assistant item.
-        this.deps.emit({ type: 'runtime/updated', runtime: this.status(threadId, 'thinking', `第 ${step} 步 · 调用 ${model.model}`), context: this.gauge(doc) });
+        // 6. Model call, streamed into one assistant item. The ledger gets one
+        // `assistant_message` when the call completes, never one per token.
+        this.deps.emit({
+          type: 'runtime/updated',
+          runtime: this.status(threadId, 'thinking', `第 ${step} 步 · 调用 ${model.model}`),
+          context: this.gauge(doc, assembly),
+        });
         const assistantItem: MessageItem = {
           id: uid('itm'),
           threadId,
@@ -747,10 +862,6 @@ export class AgentService {
         assistant = assistantItem;
 
         let lastEmit = 0;
-        // The provider pushes tokens far faster than the eye needs, but a 90ms
-        // window made the reply land in 15–25 character blocks — visibly
-        // "paragraph by paragraph" in Chinese. 30ms (~33fps) keeps the IPC
-        // traffic bounded while every frame only advances a few characters.
         const STREAM_EMIT_MS = 16;
         const result = await complete(model, modelMessages, {
           tools: toolSpecs(),
@@ -775,16 +886,28 @@ export class AgentService {
         if (result.reasoning.trim()) assistantItem.reasoning = result.reasoning;
         if (result.reasoning.trim()) doc.state.context.thinking = true;
         this.emitItem(assistantItem);
-        doc.thread.totalTokens += result.usage.promptTokens + result.usage.completionTokens;
-        {
-          const now = new Date();
-          const day = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-          this.deps.store.addTokens(day, result.usage.promptTokens + result.usage.completionTokens);
-        }
 
-        if (result.reasoning.trim()) {
+        const reasoningRef = result.reasoning.trim()
+          ? await this.refContent(doc, {
+              kind: 'reasoning',
+              text: result.reasoning.trim(),
+              limit: 1000,
+              step,
+            })
+          : undefined;
+        await log.append({
+          type: 'assistant_message',
+          text: assistantItem.text,
+          ...(reasoningRef ? { reasoning: reasoningRef } : {}),
+          final: result.toolCalls.length === 0,
+          ...(lastFinishReason === 'length' ? { truncated: true } : {}),
+          turn: turn.index,
+          step,
+          itemId: assistantItem.id,
+        });
+        if (reasoningRef && !('blob' in reasoningRef)) {
           push({
-            id: uid('itm'),
+            id: `${assistantItem.id}_r`,
             threadId,
             turnId: turn.id,
             kind: 'reasoning',
@@ -794,17 +917,13 @@ export class AgentService {
           });
         }
 
+        await this.recordUsage(doc, turn, effectiveWorkspace, 'chat', result.usage);
+
         if (result.toolCalls.length === 0) {
           // Evidence audit: claims about files nobody read.
           const missing = auditClaims(assistantItem.text, doc.state.evidence);
           if (missing.length > 0) {
-            push<NoticeItem>({
-              id: uid('itm'),
-              threadId,
-              turnId: turn.id,
-              kind: 'notice',
-              at: Date.now(),
-              status: 'done',
+            await this.recordNotice(doc, {
               tone: 'warn',
               title: '回答提到了没有读过的文件',
               body: `${missing.join(', ')} — 没有任何 read_file、grep_text 或 glob_files 的结果覆盖它们。核实之后再引用。`,
@@ -813,8 +932,8 @@ export class AgentService {
           break;
         }
 
-        // 6. Tool execution. Consecutive read-only calls run together; anything that
-        // mutates, or blocks on the user, keeps its strict order.
+        // 7. Tool execution. Consecutive read-only calls run together; anything
+        // that mutates, or blocks on the user, keeps its strict order.
         {
           const calls = result.toolCalls;
           let cursor = 0;
@@ -833,16 +952,24 @@ export class AgentService {
                 group.push(calls[cursor]);
                 cursor += 1;
               }
-              await this.executeToolGroup(doc, turn, group, step, result.reasoning, controller.signal);
-              for (const call of group) await this.logToolStep(doc, turn, step, call, result.reasoning);
+              const wrote = await this.executeToolGroup(doc, turn, group, step, result.reasoning, controller.signal);
+              wroteSinceCheckpoint = wroteSinceCheckpoint || wrote;
             } else {
               const call = calls[cursor];
-              await this.executeTool(doc, turn, call, step, result.reasoning, controller.signal);
-              await this.logToolStep(doc, turn, step, call, result.reasoning);
+              const wrote = await this.executeTool(doc, turn, call, step, result.reasoning, controller.signal);
+              wroteSinceCheckpoint = wroteSinceCheckpoint || wrote;
               cursor += 1;
             }
           }
         }
+
+        // 8. Checkpoint: after every write step, and every ten read-only steps.
+        if (wroteSinceCheckpoint || step - lastCheckpointStep >= 10) {
+          await this.writeTurnCheckpoint(doc, turn);
+          lastCheckpointStep = step;
+          wroteSinceCheckpoint = false;
+        }
+
         await this.deps.store.save(threadId);
         this.emitThread(doc.thread);
         if (controller.signal.aborted) {
@@ -855,10 +982,8 @@ export class AgentService {
       // calling tools (or the user stops it). No step or time cap intervenes.
       const aborted = controller.signal.aborted;
       if (aborted) {
-        // A user stop can unwind through the normal loop (no exception): settle
-        // any open rows and leave the same neutral notice as the catch path.
-        this.closeRunningToolCalls(doc, turn, 'stopped by the user', true);
-        this.emitNotice(threadId, {
+        await this.closeRunningToolCalls(doc, turn, 'stopped by the user', true);
+        await this.recordNotice(doc, {
           tone: 'stopped',
           title: '本轮已停止',
           body: '你手动停止了这一轮，已经完成的内容和改动都保留。',
@@ -869,7 +994,7 @@ export class AgentService {
           model.maxOutputTokens > 0
             ? `${Math.round(model.maxOutputTokens / 1024)}K（max_tokens）`
             : '供应商默认的 max_tokens';
-        this.emitNotice(threadId, {
+        await this.recordNotice(doc, {
           tone: 'warn',
           title: truncated ? '输出被截断' : '模型没有返回正文',
           body: truncated
@@ -878,16 +1003,30 @@ export class AgentService {
         });
       }
 
-      turn.status = aborted ? 'cancelled' : 'completed';
+      // A turn that stops right after a failed tool has not reached its goal,
+      // even though the loop ended by itself (the model answered instead of
+      // retrying). Report the failure and name the command.
+      const endedOnFailure = aborted ? null : this.trailingFailure(doc, turn);
+      if (endedOnFailure) {
+        stopReason = `最后一步失败：${endedOnFailure.summary}`;
+        await this.recordNotice(doc, {
+          tone: 'error',
+          title: '本轮以失败的命令结束',
+          body: `${endedOnFailure.summary}\n\n最后这一步没有成功，之后也没有再执行成功的步骤，目标可能还没完成。说「继续」或「重试」，我会从失败的地方接着做。`,
+        });
+      }
+
+      turn.status = aborted ? 'cancelled' : endedOnFailure ? 'failed' : 'completed';
       turn.endedAt = Date.now();
       turn.stopReason = stopReason;
       doc.thread.status = 'idle';
+      await this.finalizeTurn(doc, turn, lastGauge);
       this.deps.emit({ type: 'turn/updated', turn });
       this.emitThread(doc.thread);
       this.deps.emit({
         type: 'runtime/updated',
         runtime: this.status(threadId, 'idle', `耗时 ${formatDuration(turn.endedAt - turn.startedAt)} · ${step} 步`),
-        context: this.gauge(doc),
+        context: this.gauge(doc, lastGauge),
       });
     } catch (error) {
       // Nothing may stay "running" after the loop dies, or the transcript lies
@@ -898,7 +1037,7 @@ export class AgentService {
         : error instanceof LlmError
           ? `${error.message} — ${error.hint}`
           : (error as Error).message;
-      this.closeRunningToolCalls(doc, turn, message, aborted);
+      await this.closeRunningToolCalls(doc, turn, message, aborted);
       for (const item of doc.items) {
         if (item.status === 'running') {
           item.status = aborted ? 'cancelled' : 'error';
@@ -909,11 +1048,12 @@ export class AgentService {
       turn.endedAt = Date.now();
       turn.stopReason = aborted ? 'stopped by the user' : message;
       doc.thread.status = aborted ? 'idle' : 'failed';
-      this.emitNotice(doc.thread.id, {
+      await this.recordNotice(doc, {
         tone: aborted ? 'stopped' : 'error',
         title: aborted ? '本轮已停止' : '本轮失败',
         body: message,
       });
+      await this.finalizeTurn(doc, turn);
       this.deps.emit({ type: 'turn/updated', turn });
       this.emitThread(doc.thread);
       this.deps.emit({
@@ -924,16 +1064,7 @@ export class AgentService {
     } finally {
       try {
         await this.locks.releaseAll(`thread:${threadId}`);
-        // Measure before the round is appended to short-term memory; afterwards
-        // the same round would be counted twice (history + current transcript).
-        const finalGauge = this.gauge(doc);
-        try {
-          await this.commitRound(doc, turn);
-        } catch {
-          // Memory persistence is best-effort here: a disk failure must not
-          // leave the session marked as running. The transcript is saved below.
-        }
-        doc.state.context.tokensUsed = finalGauge.tokensUsed;
+        doc.state.context.tokensUsed = this.gauge(doc).tokensUsed;
         await this.deps.store.saveNow(threadId);
       } finally {
         // Release tree occupancy before settling merges so they see the main
@@ -955,226 +1086,342 @@ export class AgentService {
     }
   }
 
-  private gauge(doc: ThreadDoc): ContextGauge {
-    const stm = this.sessions.get(doc.thread.id);
-    const history = stm?.messages(doc.state.context.thinking === true) ?? [];
-    const messages = [...history, ...this.currentTurnMessages(doc)];
-    return gaugeOf({
+  /** Close the ledger book on one turn: checkpoint, then `turn_finished`. */
+  private async finalizeTurn(doc: ThreadDoc, turn: Turn, assembly?: Assembly): Promise<void> {
+    try {
+      await this.writeTurnCheckpoint(doc, turn);
+      const lastAnswer = [...doc.items]
+        .reverse()
+        .find(
+          (item): item is MessageItem =>
+            item.kind === 'message' && item.role === 'assistant' && item.turnId === turn.id && item.text.trim().length > 0,
+        );
+      await doc.log.append({
+        type: 'turn_finished',
+        status:
+          turn.status === 'completed'
+            ? 'completed'
+            : turn.status === 'cancelled'
+              ? 'cancelled'
+              : turn.status === 'failed'
+                ? 'failed'
+                : 'interrupted',
+        ...(turn.stopReason ? { stopReason: turn.stopReason } : {}),
+        ...(lastAnswer
+          ? {
+              finalText: await this.refContent(doc, {
+                kind: 'turn_final',
+                text: lastAnswer.text,
+                limit: 2000,
+                step: turn.step,
+              }),
+            }
+          : {}),
+        turn: turn.index,
+      });
+      if (assembly) doc.state.context.compacted = Object.values(assembly.levels).filter((level) => level >= 2).length;
+      await doc.log.flush();
+    } catch {
+      // A ledger write failure must not leave the session marked as running.
+    }
+  }
+
+  /**
+   * The checkpoint a resumed turn reads: the goal, the last step, what landed,
+   * the plan line, and the next step. Written at turn start, after writes and
+   * at exit — never as a separate notebook file.
+   */
+  private async writeTurnCheckpoint(doc: ThreadDoc, turn: Turn): Promise<void> {
+    const calls = doc.items.filter(
+      (item): item is ToolCallItem => item.kind === 'tool_call' && item.turnId === turn.id,
+    );
+    const results = new Map(
+      doc.items
+        .filter((item): item is ToolResultItem => item.kind === 'tool_result' && item.turnId === turn.id)
+        .map((item) => [item.callId, item]),
+    );
+    const lastCall = calls.at(-1);
+    const lastResult = lastCall ? results.get(lastCall.callId) : undefined;
+    const activePlan = doc.state.plan.find((step) => step.status === 'active') ?? doc.state.plan.find((step) => step.status === 'pending');
+    const touched = [
+      ...new Set(
+        doc.items
+          .filter((item): item is CheckpointItem => item.kind === 'checkpoint' && item.turnId === turn.id)
+          .flatMap((item) => item.filesTouched),
+      ),
+    ].slice(0, 12);
+    await doc.log
+      .append({
+        type: 'turn_checkpoint',
+        turn: turn.index,
+        step: turn.step,
+        goal: doc.state.contract?.goal ?? oneLine(turn.prompt, 200),
+        ...(lastCall
+          ? {
+              lastStep: {
+                tool: lastCall.name,
+                ...(typeof lastCall.args.path === 'string' ? { target: String(lastCall.args.path) } : {}),
+                ok: lastResult?.ok !== false,
+              },
+            }
+          : {}),
+        ...(touched.length > 0 ? { filesTouched: touched } : {}),
+        ...(activePlan ? { lastPlanLine: `[${activePlan.status}] ${activePlan.title}` } : {}),
+        ...(activePlan ? { next: `继续计划：${activePlan.title}` } : {}),
+      })
+      .catch(() => undefined);
+  }
+
+  /** The last gauge per thread: `context/get` serves this rather than re-assembling. */
+  private lastGauges = new Map<string, ContextGauge>();
+
+  cachedGauge(threadId: string): ContextGauge | null {
+    return this.lastGauges.get(threadId) ?? null;
+  }
+
+  /**
+   * The prompt prefix a fresh step would send, without assembling history. The
+   * composer's breakdown needs the system / tools / memory split for a thread
+   * nobody has run in this process yet.
+   */
+  contextLayout(doc: ThreadDoc): { parts: { system: number; memory: number; tools: number }; budget: ContextBudget } {
+    const model = this.deps.store.activeModel();
+    const window = model?.contextWindow || DEFAULT_CONTEXT_WINDOW;
+    const toolList = tools
+      .map((tool) => `- ${tool.name} (${tool.risk}) — ${tool.summary} Use when: ${tool.useWhen} Do NOT use: ${tool.avoidWhen}`)
+      .join('\n');
+    const toolTokens = estimateTokens(JSON.stringify(toolSpecs()));
+    const budget = contextBudget({
+      contextWindow: window,
+      maxOutputTokens: model?.maxOutputTokens ?? 0,
+      promptTokens: 0,
+      toolTokens,
+    });
+    const memoryIndex = this.memory.indexNote();
+    const system = buildSystemPrompt({
+      workspace: doc.thread.cwd ?? '',
+      contract: doc.state.contract,
+      plan: doc.state.plan.map((step) => `- [${step.status}] ${step.title}`).join('\n'),
+      memoryIndex,
+      resolution: doc.state.resolution,
+      verification: doc.view.verification(),
+      toolList,
+      step: doc.turn?.step ?? 1,
+      budget: budget.historyLimit,
+      compacted: doc.state.context.compacted > 0,
+    });
+    return { parts: promptParts({ system, memoryIndex, toolList, toolTokens }), budget };
+  }
+
+  private gauge(doc: ThreadDoc, assembly?: Assembly): ContextGauge {
+    if (!assembly) {
+      const cached = this.lastGauges.get(doc.thread.id);
+      if (cached) return cached;
+    }
+    const model = this.deps.store.activeModel();
+    const window = assembly?.budget.window ?? model?.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
+    const messages: ChatMessage[] = assembly
+      ? [{ role: 'system', content: assembly.system }, ...assembly.messages]
+      : [];
+    // The prefix is billed in three parts that the assembler already measured;
+    // history and this turn's trace follow. Together they are the used prompt.
+    const parts: ContextPart[] = assembly
+      ? [
+          { id: 'system', tokens: assembly.parts.system },
+          { id: 'tools', tokens: assembly.parts.tools },
+          { id: 'memory', tokens: assembly.parts.memory },
+          { id: 'history', tokens: assembly.historyTokens },
+          { id: 'working', tokens: assembly.observationTokens },
+        ]
+      : [];
+    const gauge = gaugeOf({
       messages,
-      budget: this.deps.store.activeModel()?.contextWindow || DEFAULT_CONTEXT_WINDOW,
-      compacted: doc.state.context.compacted,
+      budget: window,
+      compacted: assembly ? Object.values(assembly.levels).filter((level) => level >= 2).length : doc.state.context.compacted,
       memoryFacts: this.memory.activeCount(),
       evidence: doc.state.evidence.length,
       toolCalls: doc.items.filter((item) => item.kind === 'tool_call').length,
+      window,
+      ...(assembly
+        ? { outputReserve: assembly.budget.outputReserve, safetyMargin: assembly.budget.safetyMargin }
+        : {}),
+      ...(parts.length > 0 ? { parts } : {}),
     });
+    this.lastGauges.set(doc.thread.id, gauge);
+    return gauge;
   }
 
-  /**
-   * Messages for the turn in progress only. Past rounds come from short-term
-   * memory, so `doc.items` (the UI transcript, which can be long) is never sent
-   * wholesale.
-   */
-  private currentTurnMessages(doc: ThreadDoc, maxTokens?: number): ChatMessage[] {
-    const turnId = doc.turn?.id;
-    let items = turnId ? doc.items.filter((item) => item.turnId === turnId) : doc.items;
-    const thinking = doc.state.context.thinking === true;
-    if (maxTokens !== undefined && maxTokens > 0) {
-      const full = toMessages(items, '', thinking);
-      if (tokensOf(full) > maxTokens) items = this.trimToolPairs(items, maxTokens, thinking);
-    }
-    return toMessages(items, '', thinking);
-  }
-
-  /**
-   * Keep every user/assistant message and the newest tool call/result pairs.
-   * A dropped pair is dropped whole, because an orphaned tool call breaks the
-   * OpenAI message contract; the step still exists in working memory.
-   */
-  private trimToolPairs(items: Item[], maxTokens: number, thinking: boolean): Item[] {
-    const messageTokens = tokensOf(toMessages(items.filter((item) => item.kind === 'message'), '', thinking));
-    const allowed = new Set<string>();
-    let remaining = Math.max(512, maxTokens - messageTokens);
-    const calls = items.filter((item): item is ToolCallItem => item.kind === 'tool_call');
-    for (let index = calls.length - 1; index >= 0; index -= 1) {
-      const call = calls[index];
-      const result = items.find((item): item is ToolResultItem => item.kind === 'tool_result' && item.callId === call.callId);
-      const cost = estimateTokens(JSON.stringify(call.args)) + (result ? estimateTokens(result.output) : 0) + 24;
-      if (allowed.size > 0 && remaining - cost < 0) break;
-      allowed.add(call.callId);
-      remaining -= cost;
-    }
-    return items.filter((item) => {
-      if (item.kind === 'message') return true;
-      if (item.kind === 'tool_call' || item.kind === 'tool_result') return allowed.has(item.callId);
-      return true;
-    });
-  }
-
-  /** Fold older rounds into the short-term summary; emits one visible compaction card. */
-  private async compressShortTerm(doc: ThreadDoc, turn: Turn, stm: ShortTermMemory): Promise<boolean> {
-    const thinking = doc.state.context.thinking === true;
-    const before = tokensOf(stm.messages(thinking));
-    const result = await stm.compress((folded, previous) => this.summarizeRounds(folded, previous));
-    if (!result) return false;
-    await stm.save().catch(() => undefined);
-    doc.state.context.summary = stm.summary;
-    doc.state.context.compacted = stm.compressed;
-    const after = tokensOf(stm.messages(thinking));
-    const compaction: CompactionItem = {
-      id: uid('itm'),
-      threadId: doc.thread.id,
-      turnId: turn.id,
-      kind: 'compaction',
-      at: Date.now(),
-      status: 'done',
-      tokensBefore: before,
-      tokensAfter: after,
-      foldedItems: result.folded,
-      keptItems: result.kept,
-      summary: stm.summary,
-    };
-    doc.items.push(compaction);
-    this.emitItem(compaction);
-    return true;
-  }
-
-  private async summarizeRounds(folded: readonly RoundRecord[], previous: string): Promise<string> {
-    const active = this.deps.store.activeModel();
-    if (!active) return mechanicalRoundSummary(folded);
-    const transcript = folded
-      .map((round) => {
-        const tools = round.tools.map((tool) => `- ${tool.name} · ${tool.ok ? 'ok' : 'failed'} · ${tool.summary}`).join('\n');
-        return `第 ${round.index} 轮（${stamp(round.at)}）\n用户：${round.prompt}\n工具步骤：\n${tools || '（无）'}\n助手：${round.assistant || '（无正文）'}\n下一步：${round.next || '未记录'}`;
-      })
-      .join('\n\n');
-    try {
-      const response = await complete(
-        active,
-        [
-          { role: 'system', content: SHORT_TERM_SUMMARY_PROMPT },
-          { role: 'user', content: `${previous ? `已有摘要：\n${previous}\n\n` : ''}需要压缩的轮次：\n${transcript}` },
-        ],
-        { tools: [], retries: 0 },
-      );
-      const text = response.content.trim();
-      return text || mechanicalRoundSummary(folded);
-    } catch {
-      return mechanicalRoundSummary(folded);
-    }
-  }
-
-  /**
-   * Close the turn's books: append the round to short-term memory, sync the
-   * visible context counters, and leave working memory with a concrete next step
-   * so an interruption is resumable.
-   */
-  private async commitRound(doc: ThreadDoc, turn: Turn): Promise<void> {
-    const threadId = doc.thread.id;
-    const stm = await this.shortTermFor(doc);
-    const items = doc.items.filter((item) => item.turnId === turn.id);
-    const user = items.find((item): item is MessageItem => item.kind === 'message' && item.role === 'user');
-    const assistants = items.filter(
-      (item): item is MessageItem => item.kind === 'message' && item.role === 'assistant' && item.text.trim().length > 0,
-    );
-    const results = new Map(
-      items.filter((item): item is ToolResultItem => item.kind === 'tool_result').map((item) => [item.callId, item]),
-    );
-    const tools = items
-      .filter((item): item is ToolCallItem => item.kind === 'tool_call')
-      .map((call) => {
-        const result = results.get(call.callId);
-        return {
-          name: call.name,
-          summary: result?.summary ?? call.summary,
-          ok: result?.ok !== false,
-        };
-      });
-    const outcome: RoundRecord['outcome'] =
-      turn.status === 'completed' ? 'completed' : turn.status === 'cancelled' ? 'cancelled' : 'failed';
-    const pending = doc.state.plan.find((entry) => entry.status === 'active') ?? doc.state.plan.find((entry) => entry.status === 'pending');
-    const wroteMemory = tools.some((tool) => tool.name === 'memory_write' && tool.ok);
-    const next =
-      turn.status === 'completed'
-        ? pending
-          ? `继续计划：${pending.title}`
-          : wroteMemory
-            ? '本轮计划已走完，长期记忆已写入。'
-            : '本轮计划已走完；如果任务/工程整体完成，用 memory_write 写入长期记忆。'
-        : turn.status === 'cancelled'
-          ? '本轮被用户停止；下一轮先读工作记忆，问用户是否从「下一步」继续。'
-          : '本轮失败；下一轮先读工作记忆和错误信息，修复后再继续。';
-    stm.recordRound(
-      {
-        index: turn.index,
-        at: turn.startedAt,
-        prompt: user?.text ?? turn.prompt,
-        assistant: assistants.at(-1)?.text ?? '',
-        tools,
-        outcome,
-        next,
-      },
-      doc.thread.turnCount,
-    );
-    await stm.save();
-    doc.state.context.summary = stm.summary;
-    doc.state.context.compacted = stm.compressed;
-
-    await this.working
-      .recordStep({
-        threadId,
+  /** One ledger line per model call, priced per workspace and Beijing day. */
+  private async recordUsage(
+    doc: ThreadDoc,
+    turn: Turn,
+    workspace: string,
+    kind: 'chat' | 'context_compress' | 'consolidate',
+    usage: { promptTokens: number; completionTokens: number; cachedTokens?: number },
+  ): Promise<void> {
+    doc.thread.totalTokens += usage.promptTokens + usage.completionTokens;
+    await this.deps.store.usage
+      .append({
+        dayKey: localDayKey(),
+        workspace: normalizeWorkspace(workspace || doc.thread.cwd),
+        sid: doc.thread.id,
         turn: turn.index,
-        step: turn.step,
-        tool: 'turn_end',
-        detail: `第 ${turn.index} 轮结束`,
-        intent: '收起本轮，写下可续接的下一步',
-        result: truncate(assistants.at(-1)?.text ?? outcome, 300),
-        ok: outcome === 'completed',
-        next,
+        kind,
+        input: usage.promptTokens,
+        output: usage.completionTokens,
+        ...(usage.cachedTokens ? { cachedRead: usage.cachedTokens } : {}),
       })
       .catch(() => undefined);
-    await this.working.finish({
-      threadId,
-      status:
-        turn.status === 'completed'
-          ? pending
-            ? 'paused'
-            : 'done'
-          : turn.status === 'cancelled'
-            ? 'interrupted'
-            : 'failed',
-      next,
+  }
+
+  private consolidationTimer: NodeJS.Timeout | null = null;
+  private lastTriggerDay = '';
+
+  /** Tick once a minute; fire the nightly pass at 01:19 Beijing time. */
+  startConsolidationScheduler(): void {
+    if (this.consolidationTimer) return;
+    this.consolidationTimer = setInterval(() => {
+      if (!isConsolidationMinute()) return;
+      const dayKey = beijingParts().dayKey;
+      if (this.lastTriggerDay === dayKey) return;
+      this.lastTriggerDay = dayKey;
+      // Just after midnight: process every day older than today.
+      void this.consolidation.sweep().catch(() => undefined);
+    }, 60_000);
+    this.consolidationTimer.unref?.();
+  }
+
+  stopConsolidationScheduler(): void {
+    if (this.consolidationTimer) clearInterval(this.consolidationTimer);
+    this.consolidationTimer = null;
+  }
+
+  /** Boot catch-up: after 01:19 the missed pass runs (idempotent per day). */
+  catchUpConsolidation(): void {
+    if (!pastConsolidationTime()) return;
+    void this.consolidation.sweep().catch(() => undefined);
+  }
+
+  /**
+   * Exit path. It only writes pending marks — no network, no model — because
+   * quitting must stay reliable. The next boot or the 01:19 tick finishes the
+   * job, and the pending queue is the hand-off.
+   */
+  async consolidateOnExit(): Promise<void> {
+    this.stopConsolidationScheduler();
+    await this.markPendingAtExit('exit').catch(() => undefined);
+    for (const doc of this.deps.store.docs.values()) {
+      await doc.log.flush().catch(() => undefined);
+    }
+  }
+
+  /** Record, per session, the Beijing day its last turn belongs to. */
+  private async markPendingAtExit(reason: 'exit' | 'crash'): Promise<void> {
+    const seen = new Set<string>();
+    for (const doc of this.deps.store.docs.values()) {
+      seen.add(doc.thread.id);
+      await this.markPending(doc.log, reason);
+    }
+    for (const entry of this.deps.store.sessions.list()) {
+      if (seen.has(entry.sid)) continue;
+      const log = await SessionLog.open(this.deps.home, entry.sid, { write: false });
+      if (!log) continue;
+      await this.markPending(log, reason);
+    }
+  }
+
+  private async markPending(log: SessionLog, reason: 'exit' | 'crash' | 'manual'): Promise<void> {
+    const last = [...log.turnEntries()].reverse().find((turn) => turn.status !== 'running');
+    if (!last) return;
+    const dayKey = localDayKey(last.endedAt ?? last.startedAt);
+    await this.consolidation.markPending({
+      workspace: normalizeWorkspace(log.meta.workspace),
+      dayKey,
+      sid: log.sid,
+      lastSeq: log.lastSeq,
+      markedAt: Date.now(),
+      reason,
     });
   }
 
-  /** Ground-truth verification: what actually changed on disk, not what the model said. */
-  private async verification(doc: ThreadDoc): Promise<string> {
-    const lines: string[] = [];
-    const task = this.working.get(doc.thread.id);
-    const writeSteps = (task?.steps ?? []).filter((step) => step.target && step.phase === 'done' && step.ok);
-    if (writeSteps.length > 0) {
-      lines.push(`${writeSteps.length} write steps committed; last: ${writeSteps.at(-1)?.detail ?? ''}`);
+  /** Persist interrupted turns in the ledger and leave a pending mark. */
+  async recordInterruptedTurns(): Promise<void> {
+    for (const doc of this.deps.store.docs.values()) {
+      if (doc.thread.status !== 'running' && doc.thread.status !== 'waiting_approval') continue;
+      await this.deps.store.settleLog(doc.log).catch(() => undefined);
+      await this.markPending(doc.log, 'crash');
     }
-    const shellResults = doc.items.filter((item): item is ToolResultItem => item.kind === 'tool_result' && item.name === 'run_shell');
-    for (const result of shellResults.slice(-2)) {
-      lines.push(`last shell: ${result.summary} (${result.ok ? 'green' : 'red'})`);
-    }
-    const latest = doc.snapshots.at(-1);
-    if (latest) {
-      lines.push(`checkpoint ${latest.id} holds ${latest.files.length} files, ${Math.round(latest.sizeBytes / 1024)} KB`);
-    }
-    const audited = audits(doc, task);
-    lines.push(...audited);
-    return lines.join('\n');
+    await this.deps.store.recoverInterrupted().catch(() => undefined);
   }
 
-  private prepareCall(
+  /**
+   * Distil one day, per workspace. The 50M gate, the daily call limit and
+   * idempotency live in `ConsolidationService`; this method is the agent-facing
+   * entry point used by the scheduler, the boot catch-up and the manual button.
+   */
+  async consolidateDay(dayKey: string): Promise<ConsolidationReport> {
+    const report: ConsolidationReport = { dayKey, considered: 0, consolidated: [], skipped: [], written: 0 };
+    for (const workspace of this.deps.store.trackedWorkspaces()) {
+      report.considered += 1;
+      const result = await this.consolidation.runDay(workspace, dayKey).catch(
+        (error: Error) =>
+          ({ workspace, dayKey, status: 'failed' as const, tokens: 0, written: 0, reason: error.message }),
+      );
+      if (result.status === 'done') {
+        report.consolidated.push(`${result.workspace}@${result.dayKey}`);
+        report.written += result.written;
+      } else {
+        report.skipped.push({ workspace: result.workspace, tokens: result.tokens, reason: result.reason ?? result.status });
+      }
+    }
+    if (report.written > 0) {
+      this.deps.emit({ type: 'memory/updated', threadId: '', facts: memoryFacts(this.memory.all()) });
+    }
+    return report;
+  }
+
+  /** What the settings panel shows: today's spend, pending marks, gate reasons. */
+  async consolidationStatus(): Promise<{
+    dayKey: string;
+    threshold: number;
+    todayTokens: number;
+    pending: Array<{ workspace: string; dayKey: string; sid: string; reason: string }>;
+    days: Array<{ workspace: string; dayKey: string; status: string; tokens: number; reason?: string; completedAt?: number }>;
+  }> {
+    const today = localDayKey();
+    const state = await this.consolidation.allState();
+    const pending = await this.consolidation.pending();
+    let todayTokens = 0;
+    for (const workspace of this.deps.store.trackedWorkspaces()) {
+      todayTokens += (await this.deps.store.usage.totals(workspace, today)).billable;
+    }
+    return {
+      dayKey: today,
+      threshold: CONSOLIDATION_TOKEN_THRESHOLD,
+      todayTokens,
+      pending: pending.map((mark) => ({ workspace: mark.workspace, dayKey: mark.dayKey, sid: mark.sid, reason: mark.reason })),
+      days: Object.entries(state).map(([key, record]) => {
+        const [workspace, dayKey] = key.split('::');
+        return {
+          workspace,
+          dayKey,
+          status: record.status,
+          tokens: record.tokens,
+          ...(record.lastError ? { reason: record.lastError } : {}),
+          ...(record.completedAt ? { completedAt: record.completedAt } : {}),
+        };
+      }),
+    };
+  }
+
+private async prepareCall(
     doc: ThreadDoc,
     turn: Turn,
     call: ToolCall,
     step: number,
     reasoning: string | undefined,
     signal: AbortSignal,
-  ): PreparedCall | null {
+  ): Promise<PreparedCall | null> {
     const threadId = doc.thread.id;
     const tool = toolByName.get(call.function.name);
     const callItem: ToolCallItem = {
@@ -1191,8 +1438,6 @@ export class AgentService {
       risk: (tool?.risk ?? 'read') as ToolCallItem['risk'],
       ...(reasoning && reasoning.trim() ? { reasoning } : {}),
     };
-    doc.items.push(callItem);
-    this.emitItem(callItem);
 
     // Hallucinated tool name: feed back the legal list, not every schema.
     if (!tool) {
@@ -1207,8 +1452,10 @@ export class AgentService {
       };
       callItem.status = 'error';
       callItem.summary = failure.summary;
+      await this.recordToolCall(doc, turn, call, step, callItem, callItem.summary);
+      doc.items.push(callItem);
       this.emitItem(callItem);
-      this.pushResult(doc, turn, call, failure, 0, undefined);
+      await this.pushResult(doc, turn, call, failure, 0, undefined);
       return null;
     }
 
@@ -1216,13 +1463,19 @@ export class AgentService {
     if (!parsed.ok) {
       callItem.status = 'error';
       callItem.summary = parsed.summary;
+      await this.recordToolCall(doc, turn, call, step, callItem, parsed.summary);
+      doc.items.push(callItem);
       this.emitItem(callItem);
-      this.pushResult(doc, turn, call, parsed, 0, undefined);
+      await this.pushResult(doc, turn, call, parsed, 0, undefined);
       return null;
     }
 
     callItem.args = parsed.args;
     callItem.summary = summarizeCall(tool, parsed.args);
+    // The call is on disk before the tool touches anything: a crash here is a
+    // recoverable "unpaired call", not an invisible action.
+    await this.recordToolCall(doc, turn, call, step, callItem, callItem.summary);
+    doc.items.push(callItem);
     this.emitItem(callItem);
 
     return {
@@ -1234,22 +1487,51 @@ export class AgentService {
     };
   }
 
-  private finishCall(
+  /** Append the `tool_call` event (arguments may be a handle, never the raw blob). */
+  private async recordToolCall(
+    doc: ThreadDoc,
+    turn: Turn,
+    call: ToolCall,
+    step: number,
+    item: ToolCallItem,
+    summary: string,
+  ): Promise<void> {
+    const raw = JSON.stringify(item.args ?? {});
+    const args = await this.argsRef(doc, call.function.name, call.id, step, raw);
+    const target = typeof item.args?.path === 'string' ? item.args.path : undefined;
+    await doc.log
+      .append({
+        type: 'tool_call',
+        callId: call.id,
+        name: call.function.name,
+        args,
+        risk: item.risk,
+        phase: 'started',
+        summary,
+        ...(target ? { target } : {}),
+        turn: turn.index,
+        step,
+        itemId: item.id,
+      })
+      .catch(() => undefined);
+  }
+
+  private async finishCall(
     doc: ThreadDoc,
     turn: Turn,
     call: ToolCall,
     prepared: PreparedCall,
-    outcome: Awaited<ReturnType<ToolDefinition['run']>>,
+    outcome: ToolOutcome,
     durationMs: number,
     signal: AbortSignal,
-  ): void {
+  ): Promise<boolean> {
     const { tool, callItem, schemaRetries } = prepared;
 
     if (signal.aborted) {
       callItem.status = 'cancelled';
       callItem.summary = '已停止';
       this.emitItem(callItem);
-      this.pushResult(
+      await this.pushResult(
         doc,
         turn,
         call,
@@ -1258,7 +1540,7 @@ export class AgentService {
         tool,
         'cancelled',
       );
-      return;
+      return false;
     }
 
     if (!outcome.ok && outcome.layer === 'L2-schema') {
@@ -1267,30 +1549,39 @@ export class AgentService {
         callItem.status = 'error';
         callItem.summary = `${outcome.summary} · retry budget exhausted`;
         this.emitItem(callItem);
-        this.pushResult(doc, turn, call, { ...outcome, hint: `${outcome.hint}\n\nThe schema retry budget is exhausted. Ask the user or switch tools.` }, durationMs, undefined);
-        return;
+        await this.pushResult(doc, turn, call, { ...outcome, hint: `${outcome.hint}\n\nThe schema retry budget is exhausted. Ask the user or switch tools.` }, durationMs, undefined);
+        return false;
       }
     }
 
     callItem.status = outcome.ok ? 'done' : 'error';
     if (!outcome.ok) callItem.summary = outcome.summary;
     this.emitItem(callItem);
-    this.pushResult(doc, turn, call, outcome, durationMs, tool);
+    await this.pushResult(doc, turn, call, outcome, durationMs, tool);
+    return outcome.ok && prepared.tool.mutating;
   }
 
-  private async executeTool(doc: ThreadDoc, turn: Turn, call: ToolCall, step: number, reasoning: string | undefined, signal: AbortSignal): Promise<void> {
-    const prepared = this.prepareCall(doc, turn, call, step, reasoning, signal);
-    if (!prepared) return;
+  private async executeTool(
+    doc: ThreadDoc,
+    turn: Turn,
+    call: ToolCall,
+    step: number,
+    reasoning: string | undefined,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    const prepared = await this.prepareCall(doc, turn, call, step, reasoning, signal);
+    if (!prepared) return false;
     const started = Date.now();
     const outcome = await this.invoke(doc, turn, prepared.tool, prepared.args, prepared.context, call.id);
-    this.finishCall(doc, turn, call, prepared, outcome, Date.now() - started, signal);
+    const mutated = await this.finishCall(doc, turn, call, prepared, outcome, Date.now() - started, signal);
     await this.deps.store.save(doc.thread.id);
+    return mutated;
   }
 
   /**
-   * Run a batch of read-only calls together. Items are still created in call
-   * order before any of them runs, so the transcript reads the same as a serial
-   * run; results are finalized in order too, even if they finish out of order.
+   * Run a batch of read-only calls together. Calls are recorded in call order
+   * before any of them runs, so the transcript reads the same as a serial run;
+   * results are finalized in order too, even if they finish out of order.
    */
   private async executeToolGroup(
     doc: ThreadDoc,
@@ -1299,13 +1590,13 @@ export class AgentService {
     step: number,
     reasoning: string | undefined,
     signal: AbortSignal,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const prepared: Array<{ call: ToolCall; prep: PreparedCall }> = [];
     for (const call of calls) {
-      const prep = this.prepareCall(doc, turn, call, step, reasoning, signal);
+      const prep = await this.prepareCall(doc, turn, call, step, reasoning, signal);
       if (prep) prepared.push({ call, prep });
     }
-    if (prepared.length === 0) return;
+    if (prepared.length === 0) return false;
 
     const settled = await Promise.all(
       prepared.map(async ({ call, prep }) => {
@@ -1324,54 +1615,12 @@ export class AgentService {
       }),
     );
 
+    let mutated = false;
     for (const entry of settled) {
-      this.finishCall(doc, turn, entry.call, entry.prep, entry.outcome, entry.durationMs, signal);
+      mutated = (await this.finishCall(doc, turn, entry.call, entry.prep, entry.outcome, entry.durationMs, signal)) || mutated;
     }
     await this.deps.store.save(doc.thread.id);
-  }
-
-  /**
-   * One line per executed tool in working memory: which tool, why, what came
-   * back, and what should happen next. Written immediately so an interrupted
-   * turn is resumable step by step.
-   */
-  private async logToolStep(doc: ThreadDoc, turn: Turn, step: number, call: ToolCall, reasoning?: string): Promise<void> {
-    const callItem = [...doc.items]
-      .reverse()
-      .find((item): item is ToolCallItem => item.kind === 'tool_call' && item.callId === call.id);
-    const resultItem = [...doc.items]
-      .reverse()
-      .find((item): item is ToolResultItem => item.kind === 'tool_result' && item.callId === call.id);
-    const name = callItem?.name ?? call.function.name;
-    const args = callItem?.args ?? {};
-    const purpose = typeof args.purpose === 'string' ? args.purpose.trim() : '';
-    const intent =
-      purpose ||
-      (reasoning?.trim() ? truncate(reasoning.trim().replace(/\s+/g, ' '), 300) : '') ||
-      whyForTool(name, args) ||
-      toolByName.get(name)?.useWhen ||
-      '继续当前步骤';
-    try {
-      await this.working.recordStep({
-        threadId: doc.thread.id,
-        turn: turn.index,
-        step,
-        tool: name,
-        callId: call.id,
-        detail: callItem?.summary ?? '',
-        intent,
-        result: resultItem?.summary ?? callItem?.summary ?? '没有返回结果',
-        ok: resultItem?.ok === true,
-        next: this.nextStep(doc),
-      });
-    } catch {
-      // The progress file is a recovery aid; a write failure must not stop the turn.
-    }
-  }
-
-  private nextStep(doc: ThreadDoc): string {
-    const pending = doc.state.plan.find((entry) => entry.status === 'active') ?? doc.state.plan.find((entry) => entry.status === 'pending');
-    return pending ? `继续计划：${pending.title}` : '继续当前任务';
+    return mutated;
   }
 
   private toolContext(doc: ThreadDoc, turn: Turn, step: number, signal: AbortSignal): ToolExecContext {
@@ -1458,6 +1707,18 @@ export class AgentService {
         };
         doc.items.push(item);
         this.emitItem(item);
+        await doc.log
+          .append({
+            type: 'approval',
+            callId: approval.callId,
+            name,
+            command,
+            reason,
+            turn: turn.index,
+            step,
+            itemId: item.id,
+          })
+          .catch(() => undefined);
         doc.thread.status = 'waiting_approval';
         this.emitThread(doc.thread);
         this.deps.emit({ type: 'approval/requested', approval });
@@ -1479,6 +1740,19 @@ export class AgentService {
         item.decision = decision;
         item.status = signal.aborted ? 'cancelled' : 'done';
         this.emitItem(item);
+        await doc.log
+          .append({
+            type: 'approval',
+            callId: approval.callId,
+            name,
+            command,
+            reason,
+            decision,
+            turn: turn.index,
+            step,
+            itemId: item.id,
+          })
+          .catch(() => undefined);
         doc.thread.status = 'running';
         this.emitThread(doc.thread);
         return decision;
@@ -1512,6 +1786,18 @@ export class AgentService {
         };
         doc.items.push(item);
         this.emitItem(item);
+        await doc.log
+          .append({
+            type: 'question',
+            questionId: id,
+            header,
+            question,
+            options,
+            turn: turn.index,
+            step,
+            itemId: id,
+          })
+          .catch(() => undefined);
         this.deps.emit({
           type: 'runtime/updated',
           runtime: this.status(threadId, 'question', header),
@@ -1526,6 +1812,19 @@ export class AgentService {
         item.answer = answer.answer;
         item.status = answer.cancelled ? 'cancelled' : 'done';
         this.emitItem(item);
+        await doc.log
+          .append({
+            type: 'question',
+            questionId: id,
+            header,
+            question,
+            options,
+            ...(answer.answer ? { answer: answer.answer } : {}),
+            turn: turn.index,
+            step,
+            itemId: id,
+          })
+          .catch(() => undefined);
         if (!answer.cancelled) {
           this.deps.emit({
             type: 'runtime/updated',
@@ -1550,6 +1849,93 @@ export class AgentService {
         this.deps.emit({ type: 'memory/updated', threadId, facts: memoryFacts(this.memory.all()) });
         return result;
       },
+      readHandle: async (handle, offset, limit) => {
+        const read = await doc.log.handles.read(handle, {
+          turn: doc.log.activeTurn,
+          ...(offset !== undefined ? { offset } : {}),
+          ...(limit !== undefined ? { limit } : {}),
+        });
+        if (!read.record || read.expired) {
+          return domainFailure(
+            read.reason ?? 'handle 不存在',
+            'Elided content can expire. Read the file again with read_file — that is the current truth.',
+            read.text,
+          );
+        }
+        if (!read.text) {
+          return domainFailure(read.reason ?? '这次取回没有内容', 'The per-turn fetch budget is spent. Continue with what you have, or fetch it next turn.', '');
+        }
+        const head = read.text;
+        doc.state.evidence.push(`handle:${handle}`);
+        return {
+          ok: true,
+          summary: `read ${handle} · ${read.tokens} tokens${read.truncated ? ` · ${read.total} chars total` : ''}`,
+          output: `${head}${read.truncated ? `\n\n… (${read.total - read.offset - head.length} more characters; continue with offset ${read.offset + head.length})` : ''}`,
+          files: [],
+        };
+      },
+      expandTurn: async (turnNumber, mode) => {
+        const entries = doc.log.turnEntries();
+        const entry = entries.find((candidate) => candidate.turn === turnNumber);
+        if (!entry) {
+          return domainFailure(`第 ${turnNumber} 轮不存在`, `This session has turns 1–${entries.at(-1)?.turn ?? 0}.`);
+        }
+        const digest = await this.compressorFor(doc).ensure(turnNumber, {
+          contextWindow: this.deps.store.activeModel()?.contextWindow || DEFAULT_CONTEXT_WINDOW,
+        });
+        if (mode === 'summary') {
+          if (!digest) return domainFailure('这一轮没有摘要', 'It has no events yet — it may still be running.');
+          return {
+            ok: true,
+            summary: `turn ${turnNumber} · L2 ${digest.degraded ? '(mechanical)' : ''}`.trim(),
+            output: renderTurnDigest(digest.digest),
+            files: [],
+          };
+        }
+        const events = doc.log.eventsForTurn(turnNumber);
+        const raw = events
+          .map((event) => {
+            if (event.type === 'turn_started') return `## 用户\n${event.userText}`;
+            if (event.type === 'assistant_message') return `## assistant\n${event.text}`;
+            if (event.type === 'tool_call') return `## 调用 ${event.name}\n${'text' in event.args ? event.args.text : event.args.preview}`;
+            if (event.type === 'tool_result') return `## 结果 ${event.name} (${event.ok ? 'ok' : 'failed'})\n${'text' in event.content ? event.content.text : event.content.preview}`;
+            return '';
+          })
+          .filter(Boolean)
+          .join('\n\n');
+        const budget = 4000;
+        if (estimateTokens(raw) > budget) {
+          const digestText = digest ? renderTurnDigest(digest.digest) : '';
+          return {
+            ok: true,
+            summary: `turn ${turnNumber} · 原文超出预算，返回 L2 摘要`,
+            output: `${digestText}\n\n(原文约 ${estimateTokens(raw)} tokens；本轮事件范围 ${entry.firstSeq}–${entry.lastSeq})`,
+            files: [],
+          };
+        }
+        return { ok: true, summary: `turn ${turnNumber} · raw`, output: raw, files: [] };
+      },
+      searchSession: async (query, limit) => {
+        const hits = await new SessionSearch(doc.log).search(query, { limit });
+        if (hits.length === 0) {
+          return { ok: true, summary: '没有命中', output: `本会话里没有匹配「${query}」的轮次。`, files: [] };
+        }
+        const lines = hits.map(
+          (hit) =>
+            `- 第 ${hit.turn} 轮（${hit.kind === 'summary' ? 'L2 摘要' : '原始事件'}，${hit.score.toFixed(2)}）${hit.handle ? ` · ${hit.handle}` : ''}\n  ${hit.snippet.replace(/\s+/g, ' ')}`,
+        );
+        return {
+          ok: true,
+          summary: `${hits.length} 处命中 · ${query}`,
+          output: lines.join('\n'),
+          files: [],
+        };
+      },
+      blobText: async (handle) => {
+        const record = doc.log.handles.get(handle);
+        if (!record || record.expired) return null;
+        return doc.log.blobs.get(record.blob).catch(() => null);
+      },
       setPlan: async (steps: PlanStep[]) => {
         doc.state.plan = steps;
         const item: PlanItem = {
@@ -1561,6 +1947,9 @@ export class AgentService {
           status: 'done',
           steps,
         };
+        await doc.log
+          .append({ type: 'plan_updated', steps, source: 'model', turn: turn.index, step, itemId: item.id })
+          .catch(() => undefined);
         doc.items.push(item);
         this.emitItem(item);
       },
@@ -1582,7 +1971,7 @@ export class AgentService {
     };
   }
 
-  /** Schema validation, drift guard, locking, write-ahead working memory and checkpoint for one call. */
+  /** Schema validation, drift guard, locking and checkpoint for one call. */
   private async invoke(
     doc: ThreadDoc,
     turn: Turn,
@@ -1658,20 +2047,6 @@ export class AgentService {
       });
     }
 
-    await this.working
-      .beginStep({
-        threadId,
-        turn: turn.index,
-        step: turn.step,
-        tool: tool.name,
-        callId,
-        detail: summarizeCall(tool, args),
-        intent: typeof args.purpose === 'string' ? args.purpose.trim() : '',
-        target: target ? lockKey : undefined,
-        before: target ? fingerprint : undefined,
-      })
-      .catch(() => undefined);
-
     try {
       // Capture BEFORE the tool touches disk: a snapshot is the state to go
       // back to, and the change card's 撤销 restores it. The diff numbers are
@@ -1681,15 +2056,9 @@ export class AgentService {
         step: turn.step,
         label: `${tool.name} ${target || tool.name}`,
         workspace: context.workspace,
-        state: {
-          items: doc.items,
-          plan: doc.state.plan,
-          memory: doc.state.memory,
-          contract: doc.state.contract,
-          resolution: doc.state.resolution,
-          summary: doc.state.context.summary,
-          foldedItems: doc.state.context.foldedItems,
-        },
+        // A revert restores files and then appends `revert {toSeq}`; storing the
+        // ledger position is what makes "the state before this step" replayable.
+        state: { toSeq: doc.log.lastSeq, plan: doc.state.plan, contract: doc.state.contract, resolution: doc.state.resolution },
         filesTouched: target ? [target] : [],
       });
 
@@ -1699,6 +2068,7 @@ export class AgentService {
         if (outcome.ok && touched.length > 0) {
           const meta = (await this.checkpoints.restat(threadId, pre.id, context.workspace)) ?? pre;
           doc.snapshots = [...doc.snapshots.filter((snapshot) => snapshot.id !== meta.id), meta];
+          doc.view.setSnapshots(doc.snapshots);
           const item: CheckpointItem = {
             id: uid('itm'),
             threadId,
@@ -1713,6 +2083,15 @@ export class AgentService {
             additiveOnly: meta.additiveOnly,
             changeStats: meta.changeStats,
           };
+          await doc.log
+            .append({
+              type: 'checkpoint',
+              snapshot: meta,
+              turn: turn.index,
+              step: turn.step,
+              itemId: item.id,
+            })
+            .catch(() => undefined);
           doc.items.push(item);
           this.emitItem(item);
           this.deps.emit({ type: 'snapshot/updated', threadId, snapshots: doc.snapshots });
@@ -1793,18 +2172,11 @@ export class AgentService {
         step: 0,
         label: '回退前',
         workspace: tree,
-        state: {
-          items: doc.items,
-          plan: doc.state.plan,
-          memory: doc.state.memory,
-          contract: doc.state.contract,
-          resolution: doc.state.resolution,
-          summary: doc.state.context.summary,
-          foldedItems: doc.state.context.foldedItems,
-        },
+        state: { toSeq: doc.log.lastSeq },
         filesTouched: [],
       });
       doc.snapshots = [...doc.snapshots.filter((entry) => entry.id !== pre.id), pre];
+      doc.view.setSnapshots(doc.snapshots);
     } catch {
       // if the pre-snapshot fails, still prefer a correct revert
     }
@@ -1812,56 +2184,38 @@ export class AgentService {
     const result = await this.checkpoints.revert(threadId, snapshotId, tree);
     if (!result.ok) return { ok: false, message: result.message };
 
-    const restored = result.state as
-      | { items?: Item[]; plan?: PlanStep[]; memory?: typeof doc.state.memory; contract?: typeof doc.state.contract; resolution?: typeof doc.state.resolution; summary?: string; foldedItems?: number }
-      | null;
+    const restored = result.state as { toSeq?: number } | null;
+    const toSeq = typeof restored?.toSeq === 'number' ? restored.toSeq : doc.log.lastSeq;
+    const revertedTurns = [
+      ...new Set(
+        doc.log
+          .activeEvents()
+          .filter((event) => event.seq > toSeq && event.turn > 0)
+          .map((event) => event.turn),
+      ),
+    ];
 
-    if (restored?.items) {
-      doc.items = restored.items;
-      doc.state.plan = restored.plan ?? doc.state.plan;
-      doc.state.memory = restored.memory ?? doc.state.memory;
-      doc.state.contract = restored.contract ?? doc.state.contract;
-      doc.state.resolution = restored.resolution ?? doc.state.resolution;
-      doc.state.context.summary = restored.summary ?? '';
-      doc.state.context.foldedItems = restored.foldedItems ?? 0;
+    // Events are never deleted: a revert appends a marker and moves to a new
+    // epoch. The active view is current epoch + ancestors up to their cut.
+    const revertEvent = await doc.log.revertTo(toSeq, `回退到 ${snapshotId}`);
+    const projected = doc.view.project();
+    doc.items = projected.items;
+    doc.turn = projected.turn;
+    doc.state.plan = projected.plan;
+    doc.state.contract = projected.contract;
+    doc.state.resolution = projected.resolution;
+    doc.state.evidence = projected.evidence;
+    doc.thread.status = 'idle';
+    if (revertedTurns.length > 0) {
+      await this.memory.markSourceReverted(threadId, Math.min(...revertedTurns)).catch(() => 0);
     }
-
-    // The short-term window is derived state: rebuild it from the restored
-    // transcript, or the model would keep the rounds the revert just removed.
-    try {
-      const stm = await this.shortTermFor(doc);
-      stm.seedFromItems(doc.thread, doc.items, doc.state.context.summary, true);
-      await stm.save();
-    } catch {
-      // A memory rebuild failure must not block the file revert itself.
-    }
-    await this.working.recordStep({
-      threadId,
-      turn: doc.turn?.index ?? 0,
-      step: 0,
-      tool: 'snapshot_revert',
-      detail: snapshotId,
-      intent: '用户要求回到之前的检查点',
-      result: result.message,
-      ok: result.ok,
-      next: '重新确认当前状态，不要重复被回退掉的改动',
-    }).catch(() => undefined);
 
     const snapshot = doc.snapshots.find((entry) => entry.id === snapshotId);
-    const notice: NoticeItem = {
-      id: uid('itm'),
-      threadId,
-      turnId: doc.turn?.id ?? 'system',
-      kind: 'notice',
-      at: Date.now(),
-      status: 'done',
+    await this.recordNotice(doc, {
       tone: 'warn',
       title: `已回退到 ${snapshotId}`,
-      body: `${result.message}。会话状态换成了快照里的那一份，这次回退涉及的文件：${(snapshot?.files ?? []).slice(0, 8).join(', ') || '没有记录'}。没有新理由就别把这些改动再做一遍。`,
-    };
-    doc.items.push(notice);
-    doc.thread.status = 'idle';
-    this.emitItem(notice);
+      body: `${result.message}。第 ${toSeq} 条之后的事件保留在只读旧分支（epoch ${revertEvent.epoch - 1}），当前分支是 epoch ${revertEvent.epoch}；这次回退涉及的文件：${(snapshot?.files ?? []).slice(0, 8).join(', ') || '没有记录'}。没有新理由就别把这些改动再做一遍。`,
+    });
     this.emitThread(doc.thread);
     await this.deps.store.saveNow(threadId);
     return { ok: true, message: result.message, undoSnapshotId: undoId };
@@ -2030,7 +2384,21 @@ export class AgentService {
    * store failure). Leave no call spinning: give it a terminal result so the
    * transcript matches the turn status even before the turn is re-opened.
    */
-  private closeRunningToolCalls(doc: ThreadDoc, turn: Turn, message: string, cancelled: boolean): void {
+  /**
+   * The last tool result of a turn, when it failed. The loop can stop
+   * "normally" right after an unresolved error, because the model answers
+   * instead of retrying; that ending is a failure, not a completion.
+   */
+  private trailingFailure(doc: ThreadDoc, turn: Turn): ToolResultItem | null {
+    const results = doc.items.filter(
+      (item): item is ToolResultItem =>
+        item.kind === 'tool_result' && item.turnId === turn.id && item.status !== 'cancelled',
+    );
+    const last = results.at(-1);
+    return last && last.ok === false ? last : null;
+  }
+
+  private async closeRunningToolCalls(doc: ThreadDoc, turn: Turn, message: string, cancelled: boolean): Promise<void> {
     const answered = new Set(
       doc.items.filter((item): item is ToolResultItem => item.kind === 'tool_result').map((item) => item.callId),
     );
@@ -2040,36 +2408,52 @@ export class AgentService {
         item.status = cancelled ? 'cancelled' : 'error';
         this.emitItem(item);
       }
-      const result: ToolResultItem = {
-        id: uid('itm'),
-        threadId: doc.thread.id,
-        turnId: turn.id,
-        kind: 'tool_result',
-        at: Date.now(),
-        status: cancelled ? 'cancelled' : 'error',
-        callId: item.callId,
-        name: item.name,
-        ok: false,
-        summary: cancelled ? '已停止' : '工具没有返回结果',
-        output: cancelled ? '本轮已停止，工具没有返回结果。' : message,
-        layer: 'none',
-        retryable: false,
-      };
-      doc.items.push(result);
-      this.emitItem(result);
+      await this.pushResult(
+        doc,
+        turn,
+        { id: item.callId, type: 'function', function: { name: item.name, arguments: '{}' } },
+        {
+          ok: false,
+          layer: 'none',
+          summary: cancelled ? '已停止' : '工具没有返回结果',
+          detail: cancelled ? '本轮已停止，工具没有返回结果。' : message,
+          hint: '',
+          retryable: false,
+        },
+        0,
+        undefined,
+        cancelled ? 'cancelled' : 'error',
+      );
       answered.add(item.callId);
     }
   }
 
-  private pushResult(
+  private async pushResult(
     doc: ThreadDoc,
     turn: Turn,
     call: ToolCall,
-    outcome: Awaited<ReturnType<ToolDefinition['run']>>,
+    outcome: ToolOutcome,
     durationMs: number,
     tool: ToolDefinition | undefined,
     statusOverride?: ToolResultItem['status'],
-  ): void {
+  ): Promise<void> {
+    const body = outcome.ok ? outcome.output : [outcome.detail, outcome.hint].filter(Boolean).join('\n\n');
+    const name = tool?.name ?? call.function.name;
+    // A result over 4k tokens is stored as a blob and represented by a handle;
+    // the row keeps the preview so the UI can still show something useful.
+    // The recovery tools are the exception: the model explicitly asked for this
+    // text, and re-eliding it would hand back the same handle it just used.
+    const keepInline = FETCH_TOOLS.has(name);
+    const content: InlineRef | BlobRef = keepInline
+      ? { text: body || outcome.summary, tokens: estimateTokens(body || outcome.summary) }
+      : await this.refContent(doc, {
+          kind: 'tool_result',
+          text: body || outcome.summary,
+          limit: TOOL_RESULT_TOKENS,
+          step: turn.step,
+          tool: name,
+          callId: call.id,
+        });
     const result: ToolResultItem = {
       id: uid('itm'),
       threadId: doc.thread.id,
@@ -2078,16 +2462,35 @@ export class AgentService {
       at: Date.now(),
       status: statusOverride ?? (outcome.ok ? 'done' : 'error'),
       callId: call.id,
-      name: tool?.name ?? call.function.name,
+      name,
       ok: outcome.ok,
       summary: outcome.summary,
-      output: outcome.ok ? outcome.output : [outcome.detail, outcome.hint].filter(Boolean).join('\n\n'),
+      output: 'text' in content ? content.text : content.preview,
       layer: outcome.ok ? 'none' : outcome.layer,
       retryable: outcome.ok ? false : outcome.retryable,
-      hint: outcome.ok ? undefined : outcome.hint,
-      files: outcome.ok ? outcome.files : undefined,
-      durationMs,
+      ...(outcome.ok ? {} : { hint: outcome.hint }),
+      ...(outcome.ok && outcome.files ? { files: outcome.files } : {}),
+      ...(durationMs > 0 ? { durationMs } : {}),
+      ...('blob' in content ? { elided: { handle: content.handle, tokens: content.tokens } } : {}),
     };
+    await doc.log
+      .append({
+        type: 'tool_result',
+        callId: call.id,
+        name,
+        ok: outcome.ok,
+        content,
+        phase: 'done',
+        summary: outcome.summary,
+        ...(outcome.ok && outcome.files ? { files: outcome.files } : {}),
+        layer: result.layer,
+        ...(outcome.ok ? {} : { hint: outcome.hint, retryable: outcome.retryable }),
+        ...(durationMs > 0 ? { durationMs } : {}),
+        turn: turn.index,
+        step: turn.step,
+        itemId: result.id,
+      })
+      .catch(() => undefined);
     doc.items.push(result);
     this.emitItem(result);
   }
@@ -2106,35 +2509,6 @@ function summarizeCall(tool: ToolDefinition, args: Record<string, unknown>): str
   if (tool.name === 'memory_read') return args.query ? `recall ${truncate(String(args.query), 60)}` : `recall ${args.kind ?? 'all'}`;
   if (tool.name === 'memory_write') return `remember ${args.kind ?? 'memory'}${args.slot ? ` ${String(args.slot)}` : ''}`;
   return tool.summary;
-}
-
-/** A concrete "why" for working memory when the model gave no reasoning. */
-function whyForTool(name: string, args: Record<string, unknown>): string {
-  const path = typeof args.path === 'string' ? args.path : '';
-  switch (name) {
-    case 'read_file':
-      return path ? `读取 ${path}，确认当前内容` : '读取文件确认现状';
-    case 'list_dir':
-      return `查看 ${String(args.path ?? '.')} 里有什么`;
-    case 'glob_files':
-      return `按 ${String(args.pattern ?? '')} 查找文件`;
-    case 'grep_text':
-      return `搜索 ${String(args.pattern ?? '')} 的落点`;
-    case 'write_file':
-      return path ? `写入 ${path} 的完整内容` : '新建文件';
-    case 'edit_file':
-      return path ? `修改 ${path} 的目标片段` : '修改文件';
-    case 'todo_write':
-      return '更新任务计划';
-    case 'memory_read':
-      return args.query ? `召回与「${String(args.query)}」相关的长期记忆` : '回顾长期记忆';
-    case 'memory_write':
-      return `写入${String(args.kind ?? '')}长期记忆`;
-    case 'ask_user':
-      return `向用户确认：${truncate(String(args.question ?? ''), 80)}`;
-    default:
-      return '';
-  }
 }
 
 export { clamp };

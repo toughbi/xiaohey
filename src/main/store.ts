@@ -1,6 +1,15 @@
-import { mkdir, readdir, rm } from 'node:fs/promises';
+import { readdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { Item, ModelProfile, ModelSettings, PlanStep, Settings, SnapshotMeta, Thread, Turn } from '../shared/types.js';
+import type {
+  Item,
+  ModelProfile,
+  ModelSettings,
+  PlanStep,
+  Settings,
+  SnapshotMeta,
+  Thread,
+  Turn,
+} from '../shared/types.js';
 import type { Contract } from './runtime/contract.js';
 import type { MemoryRecord } from './runtime/memory.js';
 import type { ResolutionState } from './runtime/resolve.js';
@@ -8,23 +17,51 @@ import type { ContextState } from './runtime/context.js';
 import type { WorktreeState } from './runtime/worktree.js';
 import { emptyContext } from './runtime/context.js';
 import { emptyResolution } from './runtime/resolve.js';
-import { ensureDir, readJson, uid, writeJsonAtomic } from './util.js';
+import { normalizeWorkspace } from './runtime/commit.js';
+import { Checkpoints } from './runtime/checkpoint.js';
+import {
+  sessionPaths,
+  sessionRoot,
+  SessionIndex,
+  SessionLog,
+  type SessionIndexEntry,
+} from './runtime/sessionlog.js';
+import { SessionView } from './runtime/sessionview.js';
+import { migrateLegacyThreads, migrateLegacyUsage, seedSessionIndex } from './runtime/migration.js';
+import { UsageLedger } from './runtime/usage.js';
+import type { SessionMeta } from './runtime/events.js';
+import { ensureDir, readJson, writeJsonAtomic } from './util.js';
+
+/**
+ * The session registry.
+ *
+ * There is no thread document on disk any more: a session is a directory with
+ * an append-only `events.jsonl`, and everything this class hands to the app is
+ * derived by replaying it (see `sessionview.ts`). The in-memory `ThreadDoc` is
+ * a projection kept hot for the running turn, not a file format.
+ *
+ * `session/index.json` is the sidebar's read path: listing sessions never opens
+ * a ledger. It can be rebuilt from the session directories at any time.
+ */
 
 export interface ThreadState {
   plan: PlanStep[];
   /**
-   * @deprecated Legacy per-thread memory. Kept only so old thread JSON and
-   * checkpoint state still parse; the runtime migrates live records into
-   * `~/.xiaohei/memory.md` on boot and never writes this array again.
+   * @deprecated Legacy per-thread memory. Always empty now; long-term memory
+   * lives in `~/.xiaohei/memory.md` and is never part of a session document.
    */
   memory: MemoryRecord[];
   resolution: ResolutionState;
   contract: Contract | null;
   context: ContextState;
   evidence: string[];
+  /** Hash of the last resolution written, so an unchanged state writes nothing. */
+  resolutionHash?: string;
   /** Isolated checkout while another session holds the main tree; null when none. */
   worktree: WorktreeState | null;
 }
+
+export type SeedDoc = Omit<ThreadDoc, 'log' | 'view'>;
 
 export interface ThreadDoc {
   thread: Thread;
@@ -32,14 +69,15 @@ export interface ThreadDoc {
   items: Item[];
   state: ThreadState;
   snapshots: SnapshotMeta[];
+  /** The ledger this document is a view of. */
+  log: SessionLog;
+  view: SessionView;
 }
 
 export interface AppIndex {
   workspaceRoot: string;
   activeThreadId: string | null;
   threadOrder: string[];
-  /** Tokens spent per local day, `YYYY-MM-DD` → total. */
-  tokenDays?: Record<string, number>;
 }
 
 export const DEFAULT_PROFILE = {
@@ -166,30 +204,35 @@ export function normalizeSettings(raw: unknown): Settings {
 
 export class Store {
   readonly settingsFile: string;
-  readonly indexFile: string;
-  readonly threadsDir: string;
   readonly leasesFile: string;
   readonly snapshotsDir: string;
+  /** The old per-thread JSON directory; only read by the migration. */
+  readonly legacyThreadsDir: string;
+  readonly usage: UsageLedger;
+  readonly checkpoints: Checkpoints;
+  readonly sessions: SessionIndex;
 
-  private index: AppIndex;
   private settings: Settings;
   readonly docs = new Map<string, ThreadDoc>();
   private saveTimers = new Map<string, NodeJS.Timeout>();
-  private indexTimer: NodeJS.Timeout | null = null;
 
-  constructor(readonly home: string, workspaceRoot: string) {
+  constructor(
+    readonly home: string,
+    workspaceRoot: string,
+  ) {
     this.settingsFile = join(home, 'settings.json');
-    this.indexFile = join(home, 'index.json');
-    this.threadsDir = join(home, 'threads');
     this.leasesFile = join(home, 'leases.json');
     this.snapshotsDir = join(home, 'snapshots');
-    this.index = { workspaceRoot, activeThreadId: null, threadOrder: [] };
+    this.legacyThreadsDir = join(home, 'threads');
+    this.usage = new UsageLedger(home);
+    this.checkpoints = new Checkpoints(this.snapshotsDir);
+    this.sessions = new SessionIndex(home, workspaceRoot);
     this.settings = structuredClone(DEFAULT_SETTINGS);
   }
 
   async init(): Promise<void> {
     await ensureDir(this.home);
-    await ensureDir(this.threadsDir);
+    await ensureDir(sessionRoot(this.home));
     await ensureDir(this.snapshotsDir);
     const rawSettings = await readJson<unknown>(join(this.home, 'settings.json'), null);
     this.settings = normalizeSettings(rawSettings);
@@ -198,15 +241,68 @@ export class Store {
     if (JSON.stringify(rawSettings) !== JSON.stringify(this.settings)) {
       await writeJsonAtomic(this.settingsFile, this.settings);
     }
-    this.index = await readJson(join(this.home, 'index.json'), this.index);
+    await this.sessions.load();
+    // P0: existing sessions must open after the upgrade. Migration is idempotent
+    // (meta.migratedAt is the marker) and never deletes the legacy file.
+    await migrateLegacyThreads(this.home).catch(() => ({ migrated: [], skipped: 0, failed: [] }));
+    await seedSessionIndex(this.home, this.sessions);
+    await this.reconcileIndex();
+    await migrateLegacyUsage(this.home, async (workspace, dayKey, tokens) => {
+      await this.usage.append({
+        dayKey,
+        workspace,
+        sid: 'legacy',
+        turn: 0,
+        kind: 'chat',
+        input: tokens,
+        output: 0,
+        estimated: true,
+      });
+    }).catch(() => undefined);
+    await this.sessions.save();
+  }
+
+  /**
+   * Meta.json is authoritative for a session's state, the index is its cache:
+   * a crash can leave the index a debounce behind, so every boot re-reads the
+   * sessions on disk and merges them back in.
+   */
+  private async reconcileIndex(): Promise<void> {
+    const dir = sessionRoot(this.home);
+    const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const meta = await readJson<SessionMeta | null>(sessionPaths(this.home, entry.name).meta, null);
+      if (!meta) continue;
+      this.sessions.upsert(this.entryOf(meta));
+    }
+  }
+
+  private entryOf(meta: SessionMeta): SessionIndexEntry {
+    const existing = this.sessions.get(meta.sid);
+    return {
+      sid: meta.sid,
+      workspace: meta.workspace,
+      title: meta.title,
+      createdAt: meta.createdAt,
+      updatedAt: meta.updatedAt,
+      turnCount: meta.turnCount,
+      status: meta.status,
+      ...(existing?.pinned ? { pinned: true } : {}),
+      steps: meta.steps,
+      totalTokens: meta.totalTokens,
+      model: meta.model,
+      lastPrompt: meta.lastPrompt,
+    };
   }
 
   get workspaceRoot(): string {
-    return this.index.workspaceRoot;
+    return this.sessions.workspaceRoot;
   }
 
   set workspaceRoot(next: string) {
-    this.index.workspaceRoot = next;
+    this.sessions.workspaceRoot = next;
+    void this.sessions.save();
   }
 
   getSettings(): Settings {
@@ -232,159 +328,222 @@ export class Store {
     const doc = await this.load(threadId);
     if (!doc) throw new Error(`unknown thread ${threadId}`);
     doc.thread.pinned = pinned;
-    await this.saveNow(threadId);
+    this.sessions.setPinned(threadId, pinned);
+    await this.sessions.save();
     return doc.thread;
   }
 
   async saveIndex(): Promise<void> {
-    await writeJsonAtomic(this.indexFile, this.index);
+    await this.sessions.save();
   }
 
-  tokenDays(): Record<string, number> {
-    return this.index.tokenDays ?? {};
-  }
-
-  /** Accumulate tokens for one local day; the index is flushed shortly after. */
-  addTokens(date: string, tokens: number): void {
-    if (!Number.isFinite(tokens) || tokens <= 0) return;
-    const days = this.index.tokenDays ?? (this.index.tokenDays = {});
-    days[date] = (days[date] ?? 0) + Math.round(tokens);
-    if (this.indexTimer) clearTimeout(this.indexTimer);
-    this.indexTimer = setTimeout(() => {
-      this.indexTimer = null;
-      void this.saveIndex();
-    }, 600);
-  }
-
-  /** Give every unanswered tool call an explicit interrupted result. */
-  closeOpenToolCalls(doc: ThreadDoc): void {
-    const answered = new Set(doc.items.filter((item) => item.kind === 'tool_result').map((item) => item.callId));
-    for (const item of doc.items) {
-      if (item.kind !== 'tool_call' || answered.has(item.callId)) continue;
-      doc.items.push({
-        id: uid('itm'),
-        threadId: doc.thread.id,
-        turnId: item.turnId,
-        at: Date.now(),
-        status: 'done',
-        kind: 'tool_result',
-        callId: item.callId,
-        name: item.name,
-        ok: false,
-        summary: '已中断',
-        output: '应用退出，工具没有返回结果。',
-        layer: 'none',
-        retryable: true,
-      });
-      answered.add(item.callId);
+  /** Tokens per local day across every workspace, for the activity heatmap. */
+  async tokenDays(): Promise<Record<string, number>> {
+    const totals: Record<string, number> = {};
+    for (const workspace of await this.usage.workspaces()) {
+      for (const record of await this.usage.recordsOf(workspace)) {
+        if (record.kind === 'consolidate') continue;
+        totals[record.dayKey] = (totals[record.dayKey] ?? 0) + record.input + record.output;
+      }
     }
+    return totals;
+  }
+
+  /** Legacy shim: record a chat spend without a full usage record. */
+  addTokens(day: string, tokens: number, workspace?: string): void {
+    if (!Number.isFinite(tokens) || tokens <= 0) return;
+    void this.usage.append({
+      dayKey: day,
+      workspace: workspace?.trim() ? normalizeWorkspace(workspace) : this.workspaceRoot,
+      sid: '',
+      turn: 0,
+      kind: 'chat',
+      input: Math.round(tokens),
+      output: 0,
+      estimated: true,
+    });
+  }
+
+  async workspaceTokens(workspace: string, date: string): Promise<number> {
+    return (await this.usage.totals(workspace, date)).billable;
+  }
+
+  /** Every workspace that has a token tally, for the consolidation sweep. */
+  trackedWorkspaces(): string[] {
+    return [...new Set(this.sessions.list().map((entry) => normalizeWorkspace(entry.workspace)).filter(Boolean))];
   }
 
   activeThreadId(): string | null {
-    return this.index.activeThreadId;
+    return this.sessions.active;
   }
 
   async setActive(threadId: string | null): Promise<void> {
-    this.index.activeThreadId = threadId;
-    await this.saveIndex();
+    this.sessions.setActive(threadId);
+    await this.sessions.save();
   }
 
   /**
-   * A turn cannot survive the app process. Anything still marked running at
-   * boot is a leftover from a quit or a crash: close it so the UI never shows
-   * a spinner for a turn that no longer exists.
+   * A turn cannot survive the app process. Anything the ledger still shows as
+   * running is a leftover from a quit or a crash: close it in the ledger (not by
+   * editing a file), give every orphaned tool call an explicit `interrupted`
+   * result, and record what a resumed turn should know.
    */
   async recoverInterrupted(): Promise<void> {
-    const threads = await this.listThreads();
-    for (const thread of threads) {
-      const doc = await this.load(thread.id);
-      if (!doc) continue;
-      const turnRunning = doc.turn?.status === 'running';
-      const threadRunning = doc.thread.status === 'running' || doc.thread.status === 'waiting_approval';
-      if (!turnRunning && !threadRunning) continue;
-      doc.thread.status = 'idle';
-      const turnId = doc.turn?.id ?? [...doc.items].reverse().find((item) => item.turnId)?.turnId ?? 'system';
-      if (doc.turn && doc.turn.status === 'running') {
-        doc.turn.status = 'cancelled';
-        doc.turn.endedAt = Date.now();
+    for (const entry of this.sessions.list()) {
+      if (entry.status !== 'running' && entry.status !== 'waiting_approval') continue;
+      const log = await SessionLog.open(this.home, entry.sid);
+      if (!log) continue;
+      try {
+        await this.settleLog(log);
+        this.sessions.upsert(this.entryOf(log.meta));
+      } finally {
+        await log.release();
       }
-      if (!doc.items.some((item) => item.kind === 'notice' && item.title === '应用已退出')) {
-        doc.items.push({
-          id: uid('itm'),
-          threadId: thread.id,
-          turnId,
-          at: Date.now(),
-          status: 'done',
-          kind: 'notice',
-          tone: 'warn',
-          title: '应用已退出',
-          body: '上一轮在应用关闭时中断，没有完成。',
-        });
-      }
-      for (const item of doc.items) {
-        if (item.status === 'running') item.status = 'cancelled';
-      }
-      this.closeOpenToolCalls(doc);
-      await this.saveNow(thread.id);
     }
+    await this.sessions.save().catch(() => undefined);
+  }
+
+  /** Mark every unfinished turn and orphaned call in one ledger as interrupted. */
+  async settleLog(log: SessionLog): Promise<void> {
+    const unfinished = log.unfinishedTurns();
+    const orphans = log.orphanToolCalls();
+    if (unfinished.length === 0 && orphans.length === 0) {
+      if (log.meta.status !== 'idle') await log.patchMeta({ status: 'idle' });
+      return;
+    }
+    for (const call of orphans) {
+      await log.append({
+        type: 'tool_result',
+        turn: call.turn,
+        step: call.step,
+        callId: call.callId,
+        name: call.name,
+        ok: false,
+        content: { text: '应用中断，工具没有返回结果。', tokens: 12 },
+        phase: 'done',
+        summary: '已中断',
+        interrupted: true,
+        applied: 'unknown',
+        layer: 'none',
+        retryable: true,
+      });
+    }
+    for (const turn of unfinished) {
+      await log.append({
+        type: 'recovered',
+        turn: turn.turn,
+        detail: `第 ${turn.turn} 轮在应用退出时中断，补记结束状态。`,
+        turnId: turn.turnId,
+      });
+      await log.append({
+        type: 'turn_finished',
+        turn: turn.turn,
+        status: 'interrupted',
+        stopReason: '应用已退出，本轮没有完成',
+      });
+    }
+    await log.patchMeta({ status: 'idle', recoveredAt: Date.now() });
+    await log.flush();
   }
 
   async listThreads(): Promise<Thread[]> {
-    const threads: Thread[] = [];
-    for (const id of this.index.threadOrder) {
-      const doc = await this.load(id);
-      if (doc) threads.push(doc.thread);
-    }
-    return threads;
+    return this.sessions
+      .list()
+      .sort((a, b) => Number(!!b.pinned) - Number(!!a.pinned) || b.updatedAt - a.updatedAt)
+      .map((entry) => this.threadOf(entry));
+  }
+
+  private threadOf(entry: SessionIndexEntry): Thread {
+    return {
+      id: entry.sid,
+      title: entry.title,
+      cwd: entry.workspace,
+      createdAt: entry.createdAt,
+      updatedAt: entry.updatedAt,
+      status:
+        entry.status === 'running' || entry.status === 'waiting_approval' || entry.status === 'failed'
+          ? entry.status
+          : 'idle',
+      ...(entry.pinned ? { pinned: true } : {}),
+      turnCount: entry.turnCount,
+      steps: entry.steps ?? 0,
+      totalTokens: entry.totalTokens ?? 0,
+      itemCount: 0,
+      lastPrompt: entry.lastPrompt ?? '',
+      model: entry.model ?? this.activeModel()?.name ?? '',
+    };
   }
 
   async createThread(title: string, cwd?: string): Promise<ThreadDoc> {
-    const now = Date.now();
-    const thread: Thread = {
-      id: uid('thr'),
+    const log = await SessionLog.create(this.home, {
+      workspace: cwd ?? this.workspaceRoot,
       title: title.trim() || 'New session',
-      cwd: cwd ?? this.workspaceRoot,
-      createdAt: now,
-      updatedAt: now,
-      status: 'idle',
-      pinned: false,
-      turnCount: 0,
-      steps: 0,
-      totalTokens: 0,
-      itemCount: 0,
-      lastPrompt: '',
-      model: this.activeModel()?.model ?? '',
-    };
-    const doc: ThreadDoc = { thread, turn: null, items: [], state: emptyState(), snapshots: [] };
-    this.docs.set(thread.id, doc);
-    this.index.threadOrder.unshift(thread.id);
-    this.index.activeThreadId = thread.id;
-    await this.saveIndex();
-    await this.saveNow(thread.id);
+    });
+    this.sessions.upsert(this.entryOf(log.meta));
+    this.sessions.setActive(log.sid);
+    await this.sessions.save();
+    const doc = this.docOf(log, [], null);
+    this.docs.set(log.sid, doc);
     return doc;
+  }
+
+  private docOf(log: SessionLog, snapshots: SnapshotMeta[], cachedItems?: Item[] | null): ThreadDoc {
+    const entry = this.sessions.get(log.sid) ?? this.entryOf(log.meta);
+    const view = new SessionView({
+      log,
+      entry,
+      snapshots,
+      model: this.activeModel()?.name ?? '',
+    });
+    const projected = view.project();
+    if (cachedItems) {
+      projected.items = cachedItems;
+      projected.thread.itemCount = cachedItems.length;
+    }
+    const thinking = log.all().some((event) => event.type === 'assistant_message' && !!event.reasoning);
+    const compacted = log.all().filter((event) => event.type === 'compact').length;
+    return {
+      thread: projected.thread,
+      turn: projected.turn,
+      items: projected.items,
+      state: {
+        plan: projected.plan,
+        memory: [],
+        resolution: projected.resolution,
+        contract: projected.contract,
+        context: { ...emptyContext(), thinking, compacted },
+        evidence: projected.evidence,
+        worktree: (log.meta.worktree as WorktreeState | undefined) ?? null,
+      },
+      snapshots,
+      log,
+      view,
+    };
   }
 
   async load(threadId: string): Promise<ThreadDoc | null> {
     const cached = this.docs.get(threadId);
     if (cached) return cached;
-    const doc = await readJson<ThreadDoc | null>(join(this.threadsDir, `${threadId}.json`), null);
-    if (!doc) return null;
-    doc.thread.steps ??= 0;
-    doc.thread.totalTokens ??= 0;
-    doc.state = { ...emptyState(), ...doc.state };
-    doc.state.resolution = { ...emptyResolution(), ...doc.state.resolution };
-    doc.state.context = { ...emptyContext(), ...doc.state.context };
+    const log = await SessionLog.open(this.home, threadId, { write: false });
+    if (!log) {
+      // A session directory that vanished is not a session any more.
+      this.sessions.remove(threadId);
+      return null;
+    }
+    const snapshots = await this.checkpoints.list(threadId).catch(() => []);
+    const doc = this.docOf(log, snapshots);
     this.docs.set(threadId, doc);
     return doc;
   }
 
+  /** Debounced index/meta flush; the ledger itself is written eagerly. */
   async save(threadId: string): Promise<void> {
     const existing = this.saveTimers.get(threadId);
     if (existing) clearTimeout(existing);
     const timer = setTimeout(() => {
       this.saveTimers.delete(threadId);
       void this.saveNow(threadId);
-    }, 350);
+    }, 250);
     this.saveTimers.set(threadId, timer);
   }
 
@@ -393,8 +552,37 @@ export class Store {
     if (!doc) return;
     doc.thread.updatedAt = Date.now();
     doc.thread.itemCount = doc.items.length;
-    doc.thread.turnCount = doc.thread.turnCount;
-    await writeJsonAtomic(join(this.threadsDir, `${threadId}.json`), doc);
+    doc.thread.turnCount = Math.max(doc.thread.turnCount, doc.log.meta.turnCount);
+    this.sessions.upsert({
+      sid: threadId,
+      workspace: doc.thread.cwd,
+      title: doc.thread.title,
+      createdAt: doc.thread.createdAt,
+      updatedAt: doc.thread.updatedAt,
+      turnCount: doc.thread.turnCount,
+      status: doc.log.meta.status,
+      steps: doc.thread.steps,
+      totalTokens: doc.thread.totalTokens,
+      model: doc.thread.model,
+      lastPrompt: doc.thread.lastPrompt,
+      ...(doc.thread.pinned ? { pinned: true } : {}),
+    });
+    await doc.log.patchMeta({
+      workspace: doc.thread.cwd,
+      root: doc.thread.cwd,
+      title: doc.thread.title,
+      status: doc.log.meta.status,
+      turnCount: doc.thread.turnCount,
+      steps: doc.thread.steps,
+      totalTokens: doc.thread.totalTokens,
+      lastPrompt: doc.thread.lastPrompt,
+      model: doc.thread.model,
+      worktree: doc.state.worktree,
+    });
+    await doc.log.flush();
+    // Status and turn count are read back at boot to decide what needs
+    // recovery, so the index is written eagerly rather than debounced.
+    await this.sessions.save().catch(() => undefined);
   }
 
   async flushAll(): Promise<void> {
@@ -406,33 +594,70 @@ export class Store {
     }
   }
 
+  /** Flush, then close every ledger handle: the process is going away. */
+  async close(): Promise<void> {
+    await this.flushAll();
+    for (const doc of this.docs.values()) {
+      await doc.log.release().catch(() => undefined);
+    }
+    this.docs.clear();
+    await this.sessions.save().catch(() => undefined);
+  }
+
   async deleteThread(threadId: string): Promise<void> {
+    const doc = this.docs.get(threadId);
+    if (doc) await doc.log.release().catch(() => undefined);
     this.docs.delete(threadId);
-    this.index.threadOrder = this.index.threadOrder.filter((id) => id !== threadId);
-    if (this.index.activeThreadId === threadId) this.index.activeThreadId = this.index.threadOrder[0] ?? null;
-    await this.saveIndex();
-    await rm(join(this.threadsDir, `${threadId}.json`), { force: true });
+    this.sessions.remove(threadId);
+    await this.sessions.save();
+    await rm(sessionPaths(this.home, threadId).dir, { recursive: true, force: true });
     await rm(join(this.snapshotsDir, threadId), { recursive: true, force: true });
   }
 
-  async seedDemo(doc: ThreadDoc): Promise<void> {
-    this.docs.set(doc.thread.id, doc);
-    this.index.threadOrder = [doc.thread.id, ...this.index.threadOrder.filter((id) => id !== doc.thread.id)];
-    this.index.activeThreadId = doc.thread.id;
-    await this.saveIndex();
-    await this.saveNow(doc.thread.id);
+  /**
+   * Demo mode builds a transcript in memory; importing it through the same
+   * mapping the migration uses keeps one code path for "items become events".
+   */
+  async seedDemo(doc: SeedDoc): Promise<void> {
+    await this.importDoc(doc);
+    const loaded = await this.load(doc.thread.id);
+    if (loaded) {
+      this.sessions.setActive(loaded.thread.id);
+      await this.sessions.save();
+    }
+  }
+
+  private async importDoc(doc: SeedDoc): Promise<void> {
+    const { importLegacyDoc } = await import('./runtime/migration.js');
+    await importLegacyDoc(this.home, {
+      thread: {
+        id: doc.thread.id,
+        title: doc.thread.title,
+        cwd: doc.thread.cwd,
+        createdAt: doc.thread.createdAt,
+        updatedAt: doc.thread.updatedAt,
+        turnCount: doc.thread.turnCount,
+        steps: doc.thread.steps,
+        totalTokens: doc.thread.totalTokens,
+        lastPrompt: doc.thread.lastPrompt,
+        model: doc.thread.model,
+        status: doc.thread.status,
+      },
+      turn: doc.turn,
+      items: doc.items,
+      state: {
+        plan: doc.state.plan,
+        contract: doc.state.contract,
+        resolution: doc.state.resolution,
+      },
+      snapshots: doc.snapshots,
+    });
+    const meta = await readJson<SessionMeta | null>(sessionPaths(this.home, doc.thread.id).meta, null);
+    if (meta) this.sessions.upsert(this.entryOf(meta));
   }
 
   async pruneEmpty(): Promise<void> {
-    try {
-      const files = await readdir(this.threadsDir);
-      for (const file of files) {
-        if (!file.endsWith('.json')) continue;
-        const id = file.replace(/\.json$/, '');
-        if (!this.index.threadOrder.includes(id)) await mkdir(this.threadsDir, { recursive: true });
-      }
-    } catch {
-      // best effort only
-    }
+    // A session exists only once `session_created` is on disk, so there is no
+    // empty thread file to prune; the signature stays for call-site stability.
   }
 }

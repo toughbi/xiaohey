@@ -20,12 +20,15 @@ import type {
   SnapshotMeta,
   Thread,
   ToolDescriptor,
+  TurnLevel,
 } from '../shared/types.js';
 import { Store, type ThreadDoc } from './store.js';
 import { AgentService } from './runtime/agent.js';
-import { DEFAULT_CONTEXT_WINDOW } from './runtime/context.js';
+import { gaugeOf, toMessages, tokensOf } from './runtime/context.js';
+import { Terminals } from './runtime/terminal.js';
+import { localDayKey, previousDayKey } from './runtime/consolidate.js';
 import { memoryFacts } from './runtime/longterm.js';
-import { truncate } from './util.js';
+import { estimateTokens, truncate } from './util.js';
 import { toolDescriptors } from './runtime/tools.js';
 import { testModel } from './runtime/llm.js';
 import { listModels } from './runtime/models.js';
@@ -35,7 +38,18 @@ import { relativeTo, resolveInside } from './util.js';
 const TEXT_EXTENSIONS = new Set([
   '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.json', '.css', '.scss', '.html', '.md', '.txt',
   '.yml', '.yaml', '.toml', '.py', '.rs', '.go', '.java', '.sql', '.sh', '.ps1', '.env', '.gitignore',
+  '.mod', '.sum', '.proto', '.graphql', '.gql', '.csv', '.ini', '.conf', '.xml', '.svg', '.tmpl', '.lock',
+  '.editorconfig', '.gitattributes', '.nvmrc',
 ]);
+
+/** Files with no extension (or a dotted name) that are still text. */
+const TEXT_NAMES = new Set(['makefile', 'dockerfile', 'license', 'procfile', 'justfile']);
+
+function isTextFile(path: string): boolean {
+  const ext = extname(path).toLowerCase();
+  if (TEXT_EXTENSIONS.has(ext)) return true;
+  return TEXT_NAMES.has(basename(path).toLowerCase());
+}
 
 const MAX_DOC_BYTES = 400_000;
 
@@ -53,6 +67,7 @@ function languageOf(path: string): string {
   const ext = extname(path).toLowerCase();
   const map: Record<string, string> = {
     '.ts': 'typescript', '.tsx': 'tsx', '.js': 'javascript', '.jsx': 'jsx', '.json': 'json',
+    '.mod': 'go', '.sum': 'go', '.proto': 'proto', '.graphql': 'graphql', '.gql': 'graphql',
     '.css': 'css', '.html': 'html', '.md': 'markdown', '.py': 'python', '.rs': 'rust', '.go': 'go',
     '.yml': 'yaml', '.yaml': 'yaml', '.toml': 'toml', '.sh': 'shell', '.ps1': 'powershell', '.sql': 'sql',
   };
@@ -62,6 +77,7 @@ function languageOf(path: string): string {
 export class AppServer {
   readonly store: Store;
   readonly agent: AgentService;
+  readonly terminals: Terminals;
 
   constructor(
     home: string,
@@ -77,6 +93,7 @@ export class AppServer {
       // Demo mode must never write the real `~/.xiaohey` memory files.
       memoryHome: demo ? join(home, 'memory') : undefined,
     });
+    this.terminals = new Terminals(emit);
   }
 
   async init(): Promise<void> {
@@ -85,36 +102,15 @@ export class AppServer {
     await this.store.recoverInterrupted();
   }
 
-  /** Close running turns before the process exits, then flush them. */
+  /** Close running turns before the process exits, leave pending marks, flush. */
   async shutdown(): Promise<void> {
-    for (const [threadId, doc] of this.store.docs) {
-      if (doc.thread.status !== 'running' && doc.thread.status !== 'waiting_approval') continue;
-      doc.thread.status = 'idle';
-      if (doc.turn && doc.turn.status === 'running') {
-        doc.turn.status = 'cancelled';
-        doc.turn.endedAt = Date.now();
-      }
-      const turnId = doc.turn?.id ?? [...doc.items].reverse().find((item) => item.turnId)?.turnId ?? 'system';
-      if (!doc.items.some((item) => item.kind === 'notice' && item.title === '应用已退出')) {
-        doc.items.push({
-          id: `itm_shutdown_${threadId}`,
-          threadId,
-          turnId,
-          at: Date.now(),
-          status: 'done',
-          kind: 'notice',
-          tone: 'warn',
-          title: '应用已退出',
-          body: '上一轮在应用关闭时中断，没有完成。',
-        });
-      }
-      for (const item of doc.items) {
-        if (item.status === 'running') item.status = 'cancelled';
-      }
-      this.store.closeOpenToolCalls(doc);
-    }
+    // Terminal shells own console handles: drop them before the process exits.
+    this.terminals.disposeAll();
+    // The ledger is settled where it lives: no in-memory rewriting at exit.
+    await this.agent.recordInterruptedTurns().catch(() => undefined);
+    await this.agent.consolidateOnExit().catch(() => undefined);
     await this.agent.memory.flush().catch(() => undefined);
-    await this.store.flushAll();
+    await this.store.close();
     await this.store.saveIndex();
   }
 
@@ -184,6 +180,11 @@ export class AppServer {
               }
             : null,
           plan: doc.state.plan,
+          turns: doc.log.turnEntries().map((entry) => ({
+            turn: entry.turn,
+            level: entry.level,
+            status: entry.status,
+          })) satisfies TurnLevel[],
         } as RequestResult<K>;
       }
 
@@ -260,7 +261,42 @@ export class AppServer {
       case 'context/get': {
         const doc = await this.store.load((params as { threadId: string }).threadId);
         if (!doc) throw new Error('unknown thread');
-        return this.gaugeOf(doc) as RequestResult<K>;
+        return (await this.gaugeOf(doc)) as RequestResult<K>;
+      }
+
+      case 'usage/thread': {
+        const { threadId } = params as { threadId: string };
+        return (await this.store.usage.cacheOf(threadId)) as RequestResult<K>;
+      }
+
+      case 'terminal/create': {
+        const { cwd, cols, rows, shell: kind } = params as {
+          cwd: string;
+          cols: number;
+          rows: number;
+          shell?: 'cmd' | 'powershell';
+        };
+        const shell = this.terminals.create(cwd || this.store.workspaceRoot, cols || 80, rows || 24, kind);
+        return { id: shell.id, cwd: shell.cwd, shell: shell.shell, kind: shell.kind } as RequestResult<K>;
+      }
+
+      case 'terminal/input': {
+        const { id, data } = params as { id: string; data: string };
+        const shell = this.terminals.get(id);
+        if (!shell) throw new Error('unknown terminal');
+        shell.write(Buffer.from(data, 'base64'));
+        return { ok: true } as RequestResult<K>;
+      }
+
+      case 'terminal/resize': {
+        const { id, cols, rows } = params as { id: string; cols: number; rows: number };
+        this.terminals.get(id)?.resize(cols, rows);
+        return { ok: true } as RequestResult<K>;
+      }
+
+      case 'terminal/close': {
+        this.terminals.close((params as { id: string }).id);
+        return { ok: true } as RequestResult<K>;
       }
 
       case 'tools/list':
@@ -310,6 +346,11 @@ export class AppServer {
       case 'fs/read': {
         const { threadId, path } = params as { threadId: string; path: string };
         return (await this.readDocument(threadId, path)) as RequestResult<K>;
+      }
+
+      case 'fs/write': {
+        const { threadId, path, text } = params as { threadId: string; path: string; text: string };
+        return (await this.writeDocument(threadId, path, text)) as RequestResult<K>;
       }
 
       case 'fs/read-image': {
@@ -519,6 +560,37 @@ export class AppServer {
         return (await listModels(baseUrl ?? '', apiKey ?? '')) as RequestResult<K>;
       }
 
+      case 'session/handle': {
+        const { threadId, handle, offset, limit } = params as {
+          threadId: string;
+          handle: string;
+          offset?: number;
+          limit?: number;
+        };
+        const doc = await this.threadDoc(threadId);
+        const record = doc.log.handles.get(handle);
+        if (!record || record.expired) return null as RequestResult<K>;
+        const chars = Math.max(400, Math.floor((limit ?? 4000) * 3.6));
+        const range = await doc.log.blobs.getRange(record.blob, offset ?? 0, chars).catch(() => null);
+        if (!range) return null as RequestResult<K>;
+        return {
+          text: range.text,
+          total: range.total,
+          offset: range.offset,
+          tokens: estimateTokens(range.text),
+          truncated: range.offset + range.text.length < range.total,
+        } as RequestResult<K>;
+      }
+
+      case 'memory/usage':
+        return (await this.agent.consolidationStatus()) as RequestResult<K>;
+
+      case 'memory/consolidate': {
+        const requested = (params as { dayKey?: string }).dayKey;
+        const dayKey = requested && /^\d{4}-\d{2}-\d{2}$/.test(requested) ? requested : previousDayKey(localDayKey());
+        return (await this.agent.consolidateDay(dayKey)) as RequestResult<K>;
+      }
+
       case 'app/open-external': {
         const { url } = params as { url: string };
         if (!/^https?:\/\//i.test(url ?? '')) throw new Error('only http(s) links can be opened');
@@ -573,7 +645,7 @@ export class AppServer {
       }
     }
 
-    const tokensByDay = this.store.tokenDays();
+    const tokensByDay = await this.store.tokenDays();
     const days: ActivityDay[] = [];
     for (const cursor = new Date(start); cursor <= today; cursor.setDate(cursor.getDate() + 1)) {
       const key = dayKey(cursor);
@@ -622,15 +694,49 @@ export class AppServer {
     }
   }
 
-  private gaugeOf(doc: ThreadDoc) {
-    return {
-      tokensUsed: doc.state.context.tokensUsed,
-      tokensBudget: this.store.activeModel()?.contextWindow || DEFAULT_CONTEXT_WINDOW,
-      compacted: doc.state.context.compacted,
+  /**
+   * A cheap, honest gauge: the live turn's messages are counted exactly, and
+   * history is estimated from its sticky level (L2/L3 cost about one digest,
+   * L0/L1 about one summary line). The exact number appears once a turn runs,
+   * when the assembler reports it.
+   */
+  private async gaugeOf(doc: ThreadDoc) {
+    const turnId = doc.turn?.id ?? [...doc.items].reverse().find((item) => item.turnId)?.turnId;
+    const current = toMessages(turnId ? doc.items.filter((item) => item.turnId === turnId) : [], '', false);
+    const manifest = await doc.log.manifestFile();
+    const entries = doc.log.turnEntries();
+    let historyTokens = 0;
+    for (const entry of entries) {
+      const level = manifest.levels[entry.turn] ?? entry.level ?? 0;
+      historyTokens += level >= 2 ? 1200 : level === 1 ? 320 : 120;
+    }
+    const compacted = entries.filter((entry) => (manifest.levels[entry.turn] ?? entry.level ?? 0) >= 2).length;
+    const counters = {
+      compacted,
       memoryFacts: this.agent.memory.activeCount(),
       evidence: doc.state.evidence.length,
       toolCalls: doc.items.filter((item) => item.kind === 'tool_call').length,
     };
+    // A live turn measured the real assembly; reuse it instead of guessing, and
+    // only refresh the counters that can have moved since.
+    const cached = this.agent.cachedGauge(doc.thread.id);
+    if (cached) return { ...cached, ...counters };
+    const { parts: prefix, budget } = this.agent.contextLayout(doc);
+    return gaugeOf({
+      messages: current,
+      budget: budget.window,
+      ...counters,
+      window: budget.window,
+      outputReserve: budget.outputReserve,
+      safetyMargin: budget.safetyMargin,
+      parts: [
+        { id: 'system', tokens: prefix.system },
+        { id: 'tools', tokens: prefix.tools },
+        { id: 'memory', tokens: prefix.memory },
+        { id: 'history', tokens: historyTokens },
+        { id: 'working', tokens: tokensOf(current) },
+      ],
+    });
   }
 
   private facts(): MemoryFact[] {
@@ -708,7 +814,7 @@ export class AppServer {
           continue;
         }
         if (!entry.isFile()) continue;
-        if (!TEXT_EXTENSIONS.has(extname(entry.name).toLowerCase())) continue;
+        if (!isTextFile(entry.name)) continue;
         const info = await stat(full).catch(() => null);
         if (!info) continue;
         found.push({ path: rel, name: entry.name, dir: false, size: info.size, updatedAt: info.mtimeMs });
@@ -801,12 +907,23 @@ export class AppServer {
     return { path: relativeTo(root, join(folder, file)) };
   }
 
+  /** Save an edit from the document panel: text only, resolved inside the thread's workspace. */
+  private async writeDocument(threadId: string, path: string, text: string): Promise<{ ok: boolean; size: number }> {
+    const doc = await this.threadDoc(threadId);
+    const full = resolveInside(this.sessionRoot(doc), path);
+    if (Buffer.byteLength(text, 'utf8') > MAX_DOC_BYTES * 4) throw new Error(`${path} is too large to save from the panel`);
+    await mkdir(dirname(full), { recursive: true });
+    await writeFile(full, text, 'utf8');
+    const info = await stat(full).catch(() => null);
+    return { ok: true, size: info?.size ?? Buffer.byteLength(text, 'utf8') };
+  }
+
   private async readDocument(threadId: string, path: string): Promise<DocumentPayload> {
     const doc = await this.threadDoc(threadId);
     const full = resolveInside(this.sessionRoot(doc), path);
     const info = await stat(full);
     if (!info.isFile()) throw new Error(`${path} is not a file`);
-    if (!TEXT_EXTENSIONS.has(extname(full).toLowerCase())) {
+    if (!isTextFile(full)) {
       return {
         path,
         language: 'binary',

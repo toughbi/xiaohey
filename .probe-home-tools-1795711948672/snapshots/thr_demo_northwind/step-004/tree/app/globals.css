@@ -1,0 +1,14 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --slop-violet: #8b5cf6;
+  --slop-fuchsia: #d946ef;
+  --slop-glow: 0 0 40px rgba(139, 92, 246, 0.55);
+}
+
+body {
+  background: radial-gradient(circle at 20% 0%, #2a1052 0%, #0b0714 55%);
+  color: #e7e2f5;
+}

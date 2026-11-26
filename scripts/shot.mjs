@@ -133,12 +133,6 @@ async function main() {
   await page.locator('.rail-menu-backdrop').click();
   await page.waitForTimeout(150);
 
-  await page.locator('.foot-actions button').first().click();
-  await page.waitForTimeout(280);
-  await page.screenshot({ path: join(shots, '20-usage.png') });
-  await page.locator('.rail-menu-backdrop').click();
-  await page.waitForTimeout(150);
-
   // Model switcher: only the models already added, clicking switches.
   await page.locator('.model-wrap .tb-chip').click();
   await page.waitForTimeout(280);

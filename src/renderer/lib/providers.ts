@@ -76,18 +76,39 @@ export const PROVIDERS: ModelProvider[] = [
     contextWindow: 245_760,
     maxOutputTokens: 8_192,
   },
-  { id: 'custom', name: 'OpenAI Compatible', baseUrl: '', group: '自定义', color: '#6b7280', apiKeyUrl: '', billingUrl: '' },
+  {
+    id: 'custom',
+    // The protocol is not a vendor. Custom models carry their own provenance in
+    // `provider`, so the catalogue only has to say "you configure this yourself".
+    name: '自定义',
+    baseUrl: '',
+    group: '自定义',
+    color: '#6b7280',
+    apiKeyUrl: '',
+    billingUrl: '',
+  },
 ];
 
-export const PROVIDER_GROUPS: Array<{ label: ProviderGroup; items: ModelProvider[] }> = [
+export const PROVIDER_GROUPS: Array<{ label: string; items: ModelProvider[] }> = [
   { label: '推荐', items: PROVIDERS.filter((provider) => provider.group === '推荐') },
   { label: '更多', items: PROVIDERS.filter((provider) => provider.group === '更多') },
-  { label: '自定义', items: PROVIDERS.filter((provider) => provider.group === '自定义') },
+  { label: '手动配置', items: PROVIDERS.filter((provider) => provider.group === '自定义') },
 ];
 
 export const BILLING_TYPES = ['Token plan', '按量付费'] as const;
 export type BillingType = (typeof BILLING_TYPES)[number];
 
+const CUSTOM = PROVIDERS[PROVIDERS.length - 1];
+
+/**
+ * A profile may carry a vendor string the catalogue does not know: the user typed
+ * it in the add dialog and it is stored as `provider`. Show it as typed — falling
+ * back to the first catalogue entry would relabel every custom model "DeepSeek".
+ */
 export function providerById(id: string): ModelProvider {
-  return PROVIDERS.find((provider) => provider.id === id) ?? PROVIDERS[0];
+  const trimmed = id.trim();
+  if (!trimmed) return CUSTOM;
+  const known = PROVIDERS.find((provider) => provider.id === trimmed);
+  if (known) return known;
+  return { ...CUSTOM, id: trimmed, name: trimmed };
 }
